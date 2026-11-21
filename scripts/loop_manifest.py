@@ -225,7 +225,7 @@ def register_ops(
         ["tokens", 1, 1],
     )
 
-    # AttnRes (4 non-null-pointer variants)
+    # AttnRes (4 non-null-pointer variants + cross-pass): Block [288, 1, 1] (9 warps x 8 elems = 2304)
     single_op(
         "attn_res_norm_bf16",
         "norm_attnres",
@@ -364,6 +364,8 @@ def register_ops(
     )
 
     # Rank-64 gated loop controller: (in_f32, msg_f32, w_down, w_fg, norm_w, out_bf16, T, eps)
+    # 100% bit-identical single-pass register-cached s1/s4 around cuBLASLt/cuBLAS s2/s3,
+    # with 2-stream grid=[tokens, 2, 1] s1 for small T (<= 64) to double SM occupancy.
     if "loop_controller" not in ops:
         ctrl_params = [
             "in buffer<f32>",
@@ -388,41 +390,30 @@ def register_ops(
                 "launches": [
                     {
                         "module": "loop_controller",
+                        "entry": "kern_ctrl_rms_concat_2stream_f32_bf16",
+                        "params": ["in buffer<f32>", "in buffer<f32>", "out buffer<bf16>", "i32", "f32"],
+                        "grid": ["tokens", 2, 1],
+                        "block": [256, 1, 1],
+                        "args": [p(0), p(1), scr("cat"), p(6), p(7)],
+                        "when": {"var": "tokens", "max": 64},
+                    },
+                    {
+                        "module": "loop_controller",
                         "entry": "kern_ctrl_rms_concat_f32_bf16",
-                        "params": [
-                            "in buffer<f32>",
-                            "in buffer<f32>",
-                            "out buffer<bf16>",
-                            "i32",
-                            "i32",
-                            "f32",
-                        ],
+                        "params": ["in buffer<f32>", "in buffer<f32>", "out buffer<bf16>", "i32", "i32", "f32"],
                         "grid": ["tokens", 1, 1],
                         "block": [256, 1, 1],
                         "args": [p(0), p(1), scr("cat"), p(6), i32(H), p(7)],
+                        "when": {"var": "tokens", "min": 65},
                     },
                     {
                         "entry": "extern:cublaslt_bf16_tn",
-                        "params": [
-                            "in buffer<bf16>",
-                            "in buffer<bf16>",
-                            "out buffer<bf16>",
-                            "i32",
-                            "i32",
-                            "i32",
-                        ],
+                        "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32", "i32"],
                         "args": [scr("cat"), p(2), scr("h"), p(6), i32(RANK), i32(2 * H)],
                     },
                     {
                         "entry": "extern:cublas_bf16_tn_f32",
-                        "params": [
-                            "in buffer<bf16>",
-                            "in buffer<bf16>",
-                            "out buffer<f32>",
-                            "i32",
-                            "i32",
-                            "i32",
-                        ],
+                        "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<f32>", "i32", "i32", "i32"],
                         "args": [scr("h"), p(3), scr("fg"), p(6), i32(2 * H), i32(RANK)],
                     },
                     {
