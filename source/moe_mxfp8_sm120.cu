@@ -265,7 +265,7 @@ namespace {
 
 __device__ __forceinline__ uint4 mxfp8_ld_w_cs(const void* ptr) {
   uint4 v;
-  asm volatile("ld.global.cs.v4.u32 {%0, %1, %2, %3}, [%4];"
+  asm volatile("ld.global.nc.L1::no_allocate.L2::256B.v4.u32 {%0, %1, %2, %3}, [%4];"
                : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
                : "l"(ptr));
   return v;

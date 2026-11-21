@@ -318,6 +318,14 @@ __device__ __forceinline__ void mxfp8_half_block(
   exponent_out = uint8_t(exponent);
 }
 
+__device__ __forceinline__ uint4 sq_ld_cs(const void* ptr) {
+  uint4 v;
+  asm volatile("ld.global.cs.v4.u32 {%0, %1, %2, %3}, [%4];"
+               : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+               : "l"(ptr));
+  return v;
+}
+
 }  // namespace
 
 // Derive kernel: swizzle [experts, n, scale_k] row-major scales into SM120 128x4 layout.
@@ -401,10 +409,9 @@ extern "C" __global__ void __launch_bounds__(576) moe_quant_nvfp4(
 }
 
 // 8x-deduplicated NVFP4 quantization: quantizes each unique token t in [0, T) ONCE and
-// scatters packed NVFP4, 128x4 swizzled E4M3 scales, and x_amax to its 8 routed destinations.
-// K=2304 -> 144 blocks of 16, split=4 -> 576 threads (18 warps) per CTA, E=4 values/thread.
-// Grid: (min(T, 2048), 1, 1), Block: (576, 1, 1)
-extern "C" __global__ void __launch_bounds__(576) moe_quant_nvfp4_v2(
+// scatters 8B-coalesced NVFP4 values, 4B-packed 128x4 swizzled E4M3 scales, and x_amax.
+template <bool kZeroTails>
+__device__ __forceinline__ void moe_quant_nvfp4_v2_impl(
     const __nv_bfloat16* __restrict__ x,
     const int* __restrict__ ids,
     const int* __restrict__ src2dst,
@@ -414,7 +421,6 @@ extern "C" __global__ void __launch_bounds__(576) moe_quant_nvfp4_v2(
     float* __restrict__ x_amax,
     int T) {
   constexpr int kThreads = 576;
-  constexpr int kSplit = 4;
   constexpr int kE = 4;
   constexpr int kScaleK = kHidden / 16;  // 144
 
@@ -428,9 +434,14 @@ extern "C" __global__ void __launch_bounds__(576) moe_quant_nvfp4_v2(
 #if (__CUDA_ARCH__ >= 900)
   asm volatile("griddepcontrol.wait;" ::: "memory");
 #endif
-  int const n_tail = load_offsets_and_tails(m_indptr, s_offsets, s_tail_exp);
-  int const block = threadIdx.x / kSplit;
-  int const part = threadIdx.x % kSplit;
+  int n_tail = 0;
+  if constexpr (kZeroTails) {
+    n_tail = load_offsets_and_tails(m_indptr, s_offsets, s_tail_exp);
+  } else {
+    load_offsets(m_indptr, s_offsets);
+  }
+  int const block = threadIdx.x >> 2;
+  int const part = threadIdx.x & 3;
   int const scale_col_off = (block >> 2) * 512 + (block & 3);
   int const val_col_off = block * 8 + part * 2;
   int parity = 0;
@@ -474,11 +485,40 @@ extern "C" __global__ void __launch_bounds__(576) moe_quant_nvfp4_v2(
       }
     }
   }
-  zero_tails_fast(s_offsets, s_tail_exp, n_tail, x_scales, kScaleK);
+  if constexpr (kZeroTails) {
+    zero_tails_fast(s_offsets, s_tail_exp, n_tail, x_scales, kScaleK);
+  }
 #if (__CUDA_ARCH__ >= 900)
   __syncthreads();
   asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 #endif
+}
+
+// Grid: (min(n, 2048), 1, 1), Block: (576, 1, 1)
+extern "C" __global__ void __launch_bounds__(576) moe_quant_nvfp4_v2(
+    const __nv_bfloat16* __restrict__ x,
+    const int* __restrict__ ids,
+    const int* __restrict__ src2dst,
+    const int* __restrict__ m_indptr,
+    uint8_t* __restrict__ values,
+    uint8_t* __restrict__ x_scales,
+    float* __restrict__ x_amax,
+    int T) {
+  moe_quant_nvfp4_v2_impl<true>(x, ids, src2dst, m_indptr, values, x_scales, x_amax, T);
+}
+
+// Low-M NVFP4 quant (T <= 32): skips tail-scale zeroing since moe_nvfp4_gemm_lowm predicates rows.
+// Grid: (T, 1, 1), Block: (576, 1, 1)
+extern "C" __global__ void __launch_bounds__(576) moe_quant_nvfp4_v2_nozero(
+    const __nv_bfloat16* __restrict__ x,
+    const int* __restrict__ ids,
+    const int* __restrict__ src2dst,
+    const int* __restrict__ m_indptr,
+    uint8_t* __restrict__ values,
+    uint8_t* __restrict__ x_scales,
+    float* __restrict__ x_amax,
+    int T) {
+  moe_quant_nvfp4_v2_impl<false>(x, ids, src2dst, m_indptr, values, x_scales, x_amax, T);
 }
 
 // Softcapped SwiGLU (interleaved [gate, up]) + NVFP4 fouroversix_mae quantization (N=1152).
@@ -552,10 +592,9 @@ extern "C" __global__ void __launch_bounds__(288) moe_swiglu_quant_nvfp4(
 }
 
 // Softcapped SwiGLU (interleaved [gate, up] BF16, pre-scaled by NVFP4 EVT epilogue)
-// + NVFP4 fouroversix_mae quantization (N=1152).
-// N=1152 -> 72 blocks of 16, split=4 -> 288 threads (9 warps) per CTA, E=4 values/thread.
-// Grid: (min(n, 2048), 1, 1), Block: (288, 1, 1)
-extern "C" __global__ void __launch_bounds__(288) moe_swiglu_quant_nvfp4_bf16(
+// + NVFP4 fouroversix_mae quantization (N=1152), 8B-coalesced values & 4B-packed scales.
+template <bool kZeroTails>
+__device__ __forceinline__ void moe_swiglu_quant_nvfp4_bf16_impl(
     const __nv_bfloat16* __restrict__ w13_bf16,
     const float* __restrict__ gammas,
     const int* __restrict__ m_indptr,
@@ -564,7 +603,6 @@ extern "C" __global__ void __launch_bounds__(288) moe_swiglu_quant_nvfp4_bf16(
     float* __restrict__ act_amax,
     int n) {
   constexpr int kThreads = 288;
-  constexpr int kSplit = 4;
   constexpr int kE = 4;
   constexpr int kScaleK = kInter / 16;  // 72
 
@@ -572,19 +610,36 @@ extern "C" __global__ void __launch_bounds__(288) moe_swiglu_quant_nvfp4_bf16(
   __shared__ uint8_t s_tail_exp[kNumExperts];
   __shared__ float red[2][kThreads / 32];
   __shared__ float s_enc[2][4];
+  __shared__ int64_t s_scale_row_off[2];
 
 #if (__CUDA_ARCH__ >= 900)
   asm volatile("griddepcontrol.wait;" ::: "memory");
 #endif
-  int const n_tail = load_offsets_and_tails(m_indptr, s_offsets, s_tail_exp);
-  int const block = threadIdx.x / kSplit;
-  int const part = threadIdx.x % kSplit;
+  int n_tail = 0;
+  if constexpr (kZeroTails) {
+    n_tail = load_offsets_and_tails(m_indptr, s_offsets, s_tail_exp);
+  } else {
+    load_offsets(m_indptr, s_offsets);
+  }
+  int const block = threadIdx.x >> 2;
+  int const part = threadIdx.x & 3;
+  int const scale_atom_off = (block >> 2) * 512;
+  int const val_block_off = block * 8;
+  bool const write_scale4 = ((threadIdx.x & 15) == 0);
   int const total_rows = s_offsets[kNumExperts];
   int parity = 0;
 
   for (int row = blockIdx.x; row < total_rows; row += gridDim.x, parity ^= 1) {
-    uint4 raw = *reinterpret_cast<const uint4*>(
-        w13_bf16 + int64_t(row) * (2 * kInter) + block * 32 + part * 8);
+    if (threadIdx.x == 0) {
+      int expert = row_expert(s_offsets, row);
+      int local_r = row - s_offsets[expert];
+      s_scale_row_off[parity] =
+          scale_base(s_offsets, expert, kScaleK) +
+          int64_t(local_r >> 7) * (kScaleK / 4) * 512 +
+          (local_r & 31) * 16 + ((local_r >> 5) & 3) * 4;
+    }
+
+    uint4 raw = sq_ld_cs(w13_bf16 + int64_t(row) * (2 * kInter) + block * 32 + part * 8);
     const __nv_bfloat16* h = reinterpret_cast<const __nv_bfloat16*>(&raw);
     float gamma = gammas[row];
 
@@ -603,20 +658,58 @@ extern "C" __global__ void __launch_bounds__(288) moe_swiglu_quant_nvfp4_bf16(
     quantize_part_fast<kE>(
         v, s_enc[parity][1], s_enc[parity][2], s_enc[parity][3], block_max, packed, scale_bits);
 
+    uint32_t p0 = packed & 0xFFFFu;
+    uint32_t p1 = __shfl_down_sync(0xFFFFFFFFu, p0, 1);
+    uint32_t lo32 = p0 | (p1 << 16);
+    uint32_t hi32 = __shfl_down_sync(0xFFFFFFFFu, lo32, 2);
+    uint2 packed64 = make_uint2(lo32, hi32);
+
+    uint32_t s0 = uint32_t(scale_bits);
+    uint32_t s1 = __shfl_down_sync(0xFFFFFFFFu, s0, 4);
+    uint32_t s2 = __shfl_down_sync(0xFFFFFFFFu, s0, 8);
+    uint32_t s3 = __shfl_down_sync(0xFFFFFFFFu, s0, 12);
+    uint32_t scale4 = s0 | (s1 << 8) | (s2 << 16) | (s3 << 24);
+
     if (threadIdx.x == 0) act_amax[row] = amax;
-    uint8_t* dst = values + int64_t(row) * (kInter / 2) + block * 8 + part * 2;
-    *reinterpret_cast<uint16_t*>(dst) = uint16_t(packed);
     if (part == 0) {
-      int expert = row_expert(s_offsets, row);
-      x_scales[scale_base(s_offsets, expert, kScaleK) +
-               scale_offset(row - s_offsets[expert], block, kScaleK)] = scale_bits;
+      *reinterpret_cast<uint2*>(values + int64_t(row) * (kInter / 2) + val_block_off) = packed64;
+      if (write_scale4) {
+        *reinterpret_cast<uint32_t*>(x_scales + s_scale_row_off[parity] + scale_atom_off) = scale4;
+      }
     }
   }
-  zero_tails_fast(s_offsets, s_tail_exp, n_tail, x_scales, kScaleK);
+  if constexpr (kZeroTails) {
+    zero_tails_fast(s_offsets, s_tail_exp, n_tail, x_scales, kScaleK);
+  }
 #if (__CUDA_ARCH__ >= 900)
   __syncthreads();
   asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 #endif
+}
+
+// Grid: (min(n, 2048), 1, 1), Block: (288, 1, 1)
+extern "C" __global__ void __launch_bounds__(288) moe_swiglu_quant_nvfp4_bf16(
+    const __nv_bfloat16* __restrict__ w13_bf16,
+    const float* __restrict__ gammas,
+    const int* __restrict__ m_indptr,
+    uint8_t* __restrict__ values,
+    uint8_t* __restrict__ x_scales,
+    float* __restrict__ act_amax,
+    int n) {
+  moe_swiglu_quant_nvfp4_bf16_impl<true>(w13_bf16, gammas, m_indptr, values, x_scales, act_amax, n);
+}
+
+// Low-M SwiGLU NVFP4 quant (T <= 32): skips tail-scale zeroing since moe_nvfp4_gemm_lowm predicates rows.
+// Grid: (n, 1, 1), Block: (288, 1, 1)
+extern "C" __global__ void __launch_bounds__(288) moe_swiglu_quant_nvfp4_bf16_nozero(
+    const __nv_bfloat16* __restrict__ w13_bf16,
+    const float* __restrict__ gammas,
+    const int* __restrict__ m_indptr,
+    uint8_t* __restrict__ values,
+    uint8_t* __restrict__ x_scales,
+    float* __restrict__ act_amax,
+    int n) {
+  moe_swiglu_quant_nvfp4_bf16_impl<false>(w13_bf16, gammas, m_indptr, values, x_scales, act_amax, n);
 }
 
 // Gather & quantize BF16 x [T, 2304] into MXFP8 [n, 2304] + 128x4 swizzled UE8M0 scales.
@@ -675,9 +768,8 @@ extern "C" __global__ void __launch_bounds__(160) moe_quant_mxfp8(
 
 // 8x-deduplicated MXFP8 quantization: quantizes each unique token t in [0, T) ONCE and
 // scatters FP8 values + 128x4 swizzled UE8M0 scales to its 8 routed destinations.
-// K=2304 -> 144 half-blocks of 16 -> 160 threads (5 warps), active block < 144.
-// Grid: (min(T, 2048), 1, 1), Block: (160, 1, 1)
-extern "C" __global__ void __launch_bounds__(160) moe_quant_mxfp8_v2(
+template <bool kZeroTails>
+__device__ __forceinline__ void moe_quant_mxfp8_v2_impl(
     const __nv_bfloat16* __restrict__ x,
     const int* __restrict__ ids,
     const int* __restrict__ src2dst,
@@ -685,7 +777,7 @@ extern "C" __global__ void __launch_bounds__(160) moe_quant_mxfp8_v2(
     uint8_t* __restrict__ values,
     uint8_t* __restrict__ x_scales,
     int T) {
-  constexpr int kScaleK = kHidden / 32;  // 72
+  constexpr int kScaleK = kHidden / 32;      // 72
   constexpr int kHalfBlocks = kHidden / 16;  // 144
 
   __shared__ int s_offsets[kNumExperts + 1];
@@ -695,7 +787,12 @@ extern "C" __global__ void __launch_bounds__(160) moe_quant_mxfp8_v2(
 #if (__CUDA_ARCH__ >= 900)
   asm volatile("griddepcontrol.wait;" ::: "memory");
 #endif
-  int const n_tail = load_offsets_and_tails(m_indptr, s_offsets, s_tail_exp);
+  int n_tail = 0;
+  if constexpr (kZeroTails) {
+    n_tail = load_offsets_and_tails(m_indptr, s_offsets, s_tail_exp);
+  } else {
+    load_offsets(m_indptr, s_offsets);
+  }
   int const block = threadIdx.x;
   bool const active = (block < kHalfBlocks);
   int const scale_col = block >> 1;
@@ -740,31 +837,63 @@ extern "C" __global__ void __launch_bounds__(160) moe_quant_mxfp8_v2(
     }
     __syncthreads();
   }
-  zero_tails_fast(s_offsets, s_tail_exp, n_tail, x_scales, kScaleK);
+  if constexpr (kZeroTails) {
+    zero_tails_fast(s_offsets, s_tail_exp, n_tail, x_scales, kScaleK);
+  }
 #if (__CUDA_ARCH__ >= 900)
   __syncthreads();
   asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 #endif
 }
 
+// Grid: (min(n, 2048), 1, 1), Block: (160, 1, 1)
+extern "C" __global__ void __launch_bounds__(160) moe_quant_mxfp8_v2(
+    const __nv_bfloat16* __restrict__ x,
+    const int* __restrict__ ids,
+    const int* __restrict__ src2dst,
+    const int* __restrict__ m_indptr,
+    uint8_t* __restrict__ values,
+    uint8_t* __restrict__ x_scales,
+    int T) {
+  moe_quant_mxfp8_v2_impl<true>(x, ids, src2dst, m_indptr, values, x_scales, T);
+}
+
+// Low-M MXFP8 quant (T <= 32): skips tail-scale zeroing since moe_mxfp8_gemm_lowm predicates rows.
+// Grid: (T, 1, 1), Block: (160, 1, 1)
+extern "C" __global__ void __launch_bounds__(160) moe_quant_mxfp8_v2_nozero(
+    const __nv_bfloat16* __restrict__ x,
+    const int* __restrict__ ids,
+    const int* __restrict__ src2dst,
+    const int* __restrict__ m_indptr,
+    uint8_t* __restrict__ values,
+    uint8_t* __restrict__ x_scales,
+    int T) {
+  moe_quant_mxfp8_v2_impl<false>(x, ids, src2dst, m_indptr, values, x_scales, T);
+}
+
 // Softcapped SwiGLU (interleaved [gate, up] BF16) + MXFP8 quantization (N=1152) + 128x4 scales.
-// N=1152 -> 72 half-blocks of 16 -> 96 threads (3 warps), active block < 72.
-// Grid: (min(n, 2048), 1, 1), Block: (96, 1, 1)
-extern "C" __global__ void __launch_bounds__(96) moe_swiglu_quant_mxfp8(
+template <bool kZeroTails>
+__device__ __forceinline__ void moe_swiglu_quant_mxfp8_impl(
     const __nv_bfloat16* __restrict__ w13_bf16,
     const float* __restrict__ gammas,
     const int* __restrict__ m_indptr,
     uint8_t* __restrict__ values,
     uint8_t* __restrict__ x_scales,
     int n) {
-  constexpr int kScaleK = kInter / 32;  // 36
+  constexpr int kScaleK = kInter / 32;      // 36
   constexpr int kHalfBlocks = kInter / 16;  // 72
 
   __shared__ int s_offsets[kNumExperts + 1];
+  __shared__ uint8_t s_tail_exp[kNumExperts];
 #if (__CUDA_ARCH__ >= 900)
   asm volatile("griddepcontrol.wait;" ::: "memory");
 #endif
-  load_offsets(m_indptr, s_offsets);
+  int n_tail = 0;
+  if constexpr (kZeroTails) {
+    n_tail = load_offsets_and_tails(m_indptr, s_offsets, s_tail_exp);
+  } else {
+    load_offsets(m_indptr, s_offsets);
+  }
   int const block = threadIdx.x;
   bool const active = (block < kHalfBlocks);
   int const total_rows = s_offsets[kNumExperts];
@@ -772,9 +901,8 @@ extern "C" __global__ void __launch_bounds__(96) moe_swiglu_quant_mxfp8(
   for (int row = blockIdx.x; row < total_rows; row += gridDim.x) {
     float v[16];
     if (active) {
-      const uint4* src =
-          reinterpret_cast<const uint4*>(w13_bf16 + int64_t(row) * (2 * kInter) + block * 32);
-      uint4 raw[4] = {src[0], src[1], src[2], src[3]};
+      const __nv_bfloat16* src = w13_bf16 + int64_t(row) * (2 * kInter) + block * 32;
+      uint4 raw[4] = {sq_ld_cs(src), sq_ld_cs(src + 8), sq_ld_cs(src + 16), sq_ld_cs(src + 24)};
       const __nv_bfloat16* h = reinterpret_cast<const __nv_bfloat16*>(raw);
       float gamma = gammas[row];
 #pragma unroll
@@ -798,9 +926,34 @@ extern "C" __global__ void __launch_bounds__(96) moe_swiglu_quant_mxfp8(
       }
     }
   }
-  zero_tails(s_offsets, x_scales, kScaleK);
+  if constexpr (kZeroTails) {
+    zero_tails_fast(s_offsets, s_tail_exp, n_tail, x_scales, kScaleK);
+  }
 #if (__CUDA_ARCH__ >= 900)
   __syncthreads();
   asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 #endif
+}
+
+// Grid: (min(n, 2048), 1, 1), Block: (96, 1, 1)
+extern "C" __global__ void __launch_bounds__(96) moe_swiglu_quant_mxfp8(
+    const __nv_bfloat16* __restrict__ w13_bf16,
+    const float* __restrict__ gammas,
+    const int* __restrict__ m_indptr,
+    uint8_t* __restrict__ values,
+    uint8_t* __restrict__ x_scales,
+    int n) {
+  moe_swiglu_quant_mxfp8_impl<true>(w13_bf16, gammas, m_indptr, values, x_scales, n);
+}
+
+// Low-M SwiGLU MXFP8 quant (T <= 32): skips tail-scale zeroing since moe_mxfp8_gemm_lowm predicates rows.
+// Grid: (n, 1, 1), Block: (96, 1, 1)
+extern "C" __global__ void __launch_bounds__(96) moe_swiglu_quant_mxfp8_nozero(
+    const __nv_bfloat16* __restrict__ w13_bf16,
+    const float* __restrict__ gammas,
+    const int* __restrict__ m_indptr,
+    uint8_t* __restrict__ values,
+    uint8_t* __restrict__ x_scales,
+    int n) {
+  moe_swiglu_quant_mxfp8_impl<false>(w13_bf16, gammas, m_indptr, values, x_scales, n);
 }

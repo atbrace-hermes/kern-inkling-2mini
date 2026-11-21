@@ -11,6 +11,14 @@
 namespace {
 constexpr int kHidden = 2304;
 constexpr int kTopK = 8;
+__device__ __forceinline__ uint4 combine_ld_cs(const void* ptr) {
+  uint4 v;
+  asm volatile("ld.global.cs.v4.u32 {%0, %1, %2, %3}, [%4];"
+               : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+               : "l"(ptr));
+  return v;
+}
+
 }  // namespace
 
 // Grid: (T, 1, 1), Block: (288, 1, 1) — 288 * 8 = 2304 columns.
@@ -76,7 +84,7 @@ extern "C" __global__ void __launch_bounds__(288) moe_combine_nvfp4(
 #endif
 }
 
-// Grid: (T, 1, 1), Block: (288, 1, 1)
+// Grid: (T, 1, 1), Block: (288, 1, 1) — cached L2 loads for low-M (T <= 64), bit-exact k=0..7 sum.
 extern "C" __global__ void __launch_bounds__(288) moe_combine_bf16(
     const __nv_bfloat16* __restrict__ down_bf16,
     const int* __restrict__ src2dst,
@@ -106,6 +114,60 @@ extern "C" __global__ void __launch_bounds__(288) moe_combine_bf16(
       const __nv_bfloat16* h = reinterpret_cast<const __nv_bfloat16*>(&raw);
 #pragma unroll
       for (int i = 0; i < 8; ++i) acc[i] += __bfloat162float(h[i]);
+    }
+  }
+
+  __nv_bfloat16 out8[8];
+#pragma unroll
+  for (int i = 0; i < 8; ++i) out8[i] = __float2bfloat16_rn(acc[i]);
+  *reinterpret_cast<uint4*>(out + int64_t(t) * kHidden + col) =
+      *reinterpret_cast<const uint4*>(out8);
+
+#if (__CUDA_ARCH__ >= 900)
+  __syncthreads();
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
+}
+
+// Grid: (T, 1, 1), Block: (288, 1, 1) — 4-wide streaming prefetch for prefill (T >= 65), bit-exact.
+extern "C" __global__ void __launch_bounds__(288) moe_combine_bf16_stream(
+    const __nv_bfloat16* __restrict__ down_bf16,
+    const int* __restrict__ src2dst,
+    __nv_bfloat16* __restrict__ out,
+    int T) {
+  int const t = blockIdx.x;
+  if (t >= T) return;
+
+#if (__CUDA_ARCH__ >= 900)
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+
+  __shared__ int s_dst[kTopK];
+  if (threadIdx.x < kTopK) {
+    s_dst[threadIdx.x] = src2dst[int64_t(t) * kTopK + threadIdx.x];
+  }
+  __syncthreads();
+
+  int const col = threadIdx.x * 8;
+  float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+#pragma unroll
+  for (int base = 0; base < kTopK; base += 4) {
+    uint4 raw[4];
+    int d[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      d[j] = s_dst[base + j];
+      raw[j] = (d[j] >= 0) ? combine_ld_cs(down_bf16 + int64_t(d[j]) * kHidden + col)
+                           : make_uint4(0, 0, 0, 0);
+    }
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      if (d[j] >= 0) {
+        const __nv_bfloat16* h = reinterpret_cast<const __nv_bfloat16*>(&raw[j]);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) acc[i] += __bfloat162float(h[i]);
+      }
     }
   }
 

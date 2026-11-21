@@ -100,9 +100,8 @@ namespace moe_nvfp4 {
 
 using namespace cute;
 
-template <int TileN>
+template <int TileM, int TileN>
 struct Nvfp4Traits {
-  static constexpr int TileM = 128;
   static constexpr int TileK = 128;
   static constexpr bool SwapAB = true;
 
@@ -175,11 +174,11 @@ struct Nvfp4Traits {
                                            void>;
 };
 
-struct Nvfp4KernelN32 : public Nvfp4Traits<32>::BaseKernel {};
-struct Nvfp4KernelN64 : public Nvfp4Traits<64>::BaseKernel {};
-struct Nvfp4KernelN128 : public Nvfp4Traits<128>::BaseKernel {};
+struct Nvfp4KernelN32 : public Nvfp4Traits<128, 32>::BaseKernel {};
+struct Nvfp4KernelN64 : public Nvfp4Traits<128, 64>::BaseKernel {};
+struct Nvfp4KernelN128 : public Nvfp4Traits<256, 128>::BaseKernel {};
 
-using TraitsRef = Nvfp4Traits<64>;
+using TraitsRef = Nvfp4Traits<128, 64>;
 using ProblemShape = typename TraitsRef::ProblemShape;
 using UnderlyingProblemShape = typename ProblemShape::UnderlyingProblemShape;
 using StrideA = typename TraitsRef::BaseKernel::InternalStrideA;
@@ -189,23 +188,23 @@ using ScaleConfig = typename TraitsRef::BaseKernel::CollectiveMainloop::Sm1xxBlk
 using LayoutSFA = typename TraitsRef::BaseKernel::CollectiveMainloop::InternalLayoutSFA;
 using LayoutSFB = typename TraitsRef::BaseKernel::CollectiveMainloop::InternalLayoutSFB;
 
-static_assert(std::is_same_v<typename Nvfp4Traits<32>::BaseKernel::InternalStrideA, StrideA>);
-static_assert(std::is_same_v<typename Nvfp4Traits<32>::BaseKernel::InternalStrideB, StrideB>);
-static_assert(std::is_same_v<typename Nvfp4Traits<32>::BaseKernel::InternalStrideD, StrideD>);
-static_assert(std::is_same_v<typename Nvfp4Traits<128>::BaseKernel::InternalStrideA, StrideA>);
-static_assert(std::is_same_v<typename Nvfp4Traits<128>::BaseKernel::InternalStrideB, StrideB>);
-static_assert(std::is_same_v<typename Nvfp4Traits<128>::BaseKernel::InternalStrideD, StrideD>);
+static_assert(std::is_same_v<typename Nvfp4Traits<128, 32>::BaseKernel::InternalStrideA, StrideA>);
+static_assert(std::is_same_v<typename Nvfp4Traits<128, 32>::BaseKernel::InternalStrideB, StrideB>);
+static_assert(std::is_same_v<typename Nvfp4Traits<128, 32>::BaseKernel::InternalStrideD, StrideD>);
+static_assert(std::is_same_v<typename Nvfp4Traits<256, 128>::BaseKernel::InternalStrideA, StrideA>);
+static_assert(std::is_same_v<typename Nvfp4Traits<256, 128>::BaseKernel::InternalStrideB, StrideB>);
+static_assert(std::is_same_v<typename Nvfp4Traits<256, 128>::BaseKernel::InternalStrideD, StrideD>);
 static_assert(
-    std::is_same_v<typename Nvfp4Traits<32>::BaseKernel::CollectiveMainloop::InternalLayoutSFA,
+    std::is_same_v<typename Nvfp4Traits<128, 32>::BaseKernel::CollectiveMainloop::InternalLayoutSFA,
                    LayoutSFA>);
 static_assert(
-    std::is_same_v<typename Nvfp4Traits<32>::BaseKernel::CollectiveMainloop::InternalLayoutSFB,
+    std::is_same_v<typename Nvfp4Traits<128, 32>::BaseKernel::CollectiveMainloop::InternalLayoutSFB,
                    LayoutSFB>);
 static_assert(
-    std::is_same_v<typename Nvfp4Traits<128>::BaseKernel::CollectiveMainloop::InternalLayoutSFA,
+    std::is_same_v<typename Nvfp4Traits<256, 128>::BaseKernel::CollectiveMainloop::InternalLayoutSFA,
                    LayoutSFA>);
 static_assert(
-    std::is_same_v<typename Nvfp4Traits<128>::BaseKernel::CollectiveMainloop::InternalLayoutSFB,
+    std::is_same_v<typename Nvfp4Traits<256, 128>::BaseKernel::CollectiveMainloop::InternalLayoutSFB,
                    LayoutSFB>);
 static_assert(TraitsRef::BaseKernel::CollectiveMainloop::TiledMma::SFVecSize == 16);
 static_assert(Nvfp4KernelN32::SharedStorageSize <= 101376, "N32 exceeds SM120 99KiB SMEM");
@@ -596,7 +595,7 @@ template __global__ void cutlass::device_kernel<moe_nvfp4::Nvfp4KernelN128>(
 #include <vector>
 
 template <class Kernel>
-static void emit_variant(const char* name, int tile_n, int sm_count) {
+static void emit_variant(const char* name, int tile_m, int tile_n, int sm_count) {
   using Params = typename Kernel::Params;
   using Arguments = typename Kernel::Arguments;
   using CollectiveMainloop = typename Kernel::CollectiveMainloop;
@@ -692,7 +691,7 @@ static void emit_variant(const char* name, int tile_n, int sm_count) {
       CollectiveMainloop::get_workspace_size(p0.problem_shape, {}, 1);
 
   printf("\"%s\":{\n", name);
-  printf("  \"tile_m\":128,\"tile_n\":%d,\"tile_k\":128,\n", tile_n);
+  printf("  \"tile_m\":%d,\"tile_n\":%d,\"tile_k\":128,\n", tile_m, tile_n);
   printf("  \"shared_mem\":%d,\"max_threads\":%u,\n",
          int(Kernel::SharedStorageSize), unsigned(Kernel::MaxThreadsPerBlock));
   printf("  \"sm_count_default\":%d,\n", sm_count);
@@ -756,11 +755,11 @@ static void emit_variant(const char* name, int tile_n, int sm_count) {
 int main(int argc, char** argv) {
   int sm_count = (argc > 1) ? atoi(argv[1]) : 110;
   printf("{\n");
-  emit_variant<moe_nvfp4::Nvfp4KernelN32>("n32", 32, sm_count);
+  emit_variant<moe_nvfp4::Nvfp4KernelN32>("n32", 128, 32, sm_count);
   printf(",\n");
-  emit_variant<moe_nvfp4::Nvfp4KernelN64>("n64", 64, sm_count);
+  emit_variant<moe_nvfp4::Nvfp4KernelN64>("n64", 128, 64, sm_count);
   printf(",\n");
-  emit_variant<moe_nvfp4::Nvfp4KernelN128>("n128", 128, sm_count);
+  emit_variant<moe_nvfp4::Nvfp4KernelN128>("n128", 256, 128, sm_count);
   printf("\n}\n");
   return 0;
 }

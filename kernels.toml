@@ -50,35 +50,35 @@ includes = []
 
 # M2 CUDA modules
 [kernels."moe_route"]
-sha256 = "0883a5f399832d80813b4553ebce07b584ef53fa30ef8c60945e6f89114f6aea"
+sha256 = "41c844cec44bb2e6124c9b7257fd2841ccd442ded3d605cba3817eddecb77b6c"
 milestone = "M2"
 source = "source/moe_route.cu"
 flags = "plain"
 includes = []
 
 [kernels."moe_swiglu_quant"]
-sha256 = "36e5fc69003ed844aee055191d6c876b60c326f3945c6c22b4c6371aab33973c"
+sha256 = "b6d05919719ef1412f5996c702b30aae5c1e252a14e66e44f628df3411ea4cc0"
 milestone = "M2"
 source = "source/moe_swiglu_quant.cu"
 flags = "plain"
 includes = []
 
 [kernels."moe_combine"]
-sha256 = "1feeb7f4bed6424a1a44eefc046e9ed68c0eaa1fb8cfa6a0f0810b9eacbdc568"
+sha256 = "b987b859b34d90ff91323c7845f4c4041bf052e6afb52d42cee6ee4ec12bef11"
 milestone = "M2"
 source = "source/moe_combine.cu"
 flags = "plain"
 includes = []
 
 [kernels."moe_nvfp4_sm120"]
-sha256 = "51df9d394b25d71f61272c08b551f08ee69ed09e682e671876b38d8d2671bca9"
+sha256 = "1026aea151d9602a1e547f00a4f3b9116f34a74018481054aa287a601bb3cce1"
 milestone = "M2"
 source = "source/moe_nvfp4_sm120.cu"
 flags = "cutlass_sm120"
 includes = ["cutlass"]
 
 [kernels."moe_mxfp8_sm120"]
-sha256 = "5be5203c9cf77d56321b4ee8fe33a5cc5fd4cb4f43bad4c7250177c40ee53db4"
+sha256 = "7e84b652b74548ae267792daed723c74a47ac71332088b0583cad210d1492dfe"
 milestone = "M2"
 source = "source/moe_mxfp8_sm120.cu"
 flags = "cutlass_sm120"

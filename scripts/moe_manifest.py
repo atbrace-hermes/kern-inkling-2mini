@@ -322,6 +322,7 @@ def _build_gemm_pack(
     """Assemble `kern` Pack dict for SM120 CUTLASS NVFP4 or MXFP8 grouped GEMM."""
     abi = variant["abi"]
     off = abi["offsets"]
+    tile_m = int(variant.get("tile_m", 128))
     tile_n = int(variant["tile_n"])
 
     # Patch sm_count into template byte image cleanly via structured fields
@@ -356,15 +357,16 @@ def _build_gemm_pack(
     # 5 initial TMA descriptors (dims/strides overwritten on device per expert,
     # while format, box, swizzle, l2_promotion are preserved from these templates).
     if is_nvfp4:
+        m_sf_tiles = tile_m // 128
         add_field(
             off["tma_load_a"],
             128,
             tensormap={
                 "param": 1,  # B_weights (>= 150 MB)
                 "dtype": "u4packed",
-                "dims": [128, 128],
+                "dims": [128, tile_m],
                 "strides": [64],
-                "box": [128, 128],
+                "box": [128, tile_m],
                 "swizzle": 64,
                 "l2_promotion": 128,
             },
@@ -388,9 +390,9 @@ def _build_gemm_pack(
             tensormap={
                 "param": 3,  # SFB_weights (>= 20 MB)
                 "dtype": "u16",
-                "dims": [256, 2, 1, 1],
-                "strides": [512, 1024, 1024],
-                "box": [256, 2, 1, 1],
+                "dims": [256, 2, m_sf_tiles, 1],
+                "strides": [512 * m_sf_tiles, 512, 1024 * m_sf_tiles] if m_sf_tiles > 1 else [512, 1024, 1024],
+                "box": [256, 2, m_sf_tiles, 1],
                 "swizzle": 0,
                 "l2_promotion": 128,
             },
@@ -401,8 +403,8 @@ def _build_gemm_pack(
             tensormap={
                 "param": 3,
                 "dtype": "u16",
-                "dims": [256, 2, 1, 1],
-                "strides": [512, 1024, 1024],
+                "dims": [256, 2, m_sf_tiles, 1],
+                "strides": [512, 1024, 1024 * m_sf_tiles],
                 "box": [256, 2, 1, 1],
                 "swizzle": 0,
                 "l2_promotion": 128,
@@ -414,8 +416,8 @@ def _build_gemm_pack(
             tensormap={
                 "param": 4,  # D_out bf16 (>= 36,864 B at tokens=1)
                 "dtype": "bf16",
-                "dims": [128, tile_n],
-                "strides": [256],
+                "dims": [tile_m, tile_n],
+                "strides": [tile_m * 2],
                 "box": [64, 32],
                 "swizzle": 128,
                 "l2_promotion": 128,
@@ -711,48 +713,33 @@ def register_ops(
     p = lambda idx: {"param": idx}
     n_expr = _mul(token_axis, TOP_K)
 
-    # 1. Router GEMM (BF16 -> FP32 logits)
-    ops.setdefault(
-        "moe_router_gemm",
-        {
-            "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<f32>", "i32", "i32", "i32"],
-            "impl": {
-                "launches": [
-                    {
-                        "entry": "extern:cublas_bf16_tn_f32",
-                        "args": [p(0), p(1), p(2), p(3), p(4), p(5)],
-                    }
-                ]
-            },
-        },
-    )
-
-    # 2. Router top-8 + deterministic tie-break + log-sigmoid softmax * 8.0
-    ops.setdefault(
-        "moe_router_topk",
-        {
-            "params": ["in buffer<f32>", "in buffer<f32>", "out buffer<i32>", "out buffer<f32>", "i32"],
-            "impl": {
-                "launches": [
-                    {
-                        "module": "moe_route",
-                        "entry": "moe_router_topk",
-                        "params": ["in buffer<f32>", "in buffer<f32>", "out buffer<i32>", "out buffer<f32>", "i32"],
-                        "grid": [_ceil_div(token_axis, 8), 1, 1],
-                        "block": [256, 1, 1],
-                        "pdl": True,
-                        "args": [p(0), p(1), p(2), p(3), p(4)],
-                    }
-                ]
-            },
-        },
-    )
-
-    # 3. Counting sort metadata (single-CTA <= 1024 tokens, multi-CTA > 1024 tokens)
-    if "moe_route_metadata" not in ops:
-        meta_params = [
-            "in buffer<i32>",
+    # 1. Bit-exact MoE Router (cuBLAS BF16 GEMM + fused single-CTA topk/metadata for T <= 32,
+    #    static-SMEM metadata_t64 for 33..64, standard metadata for >= 65)
+    if "moe_route_fused" not in ops:
+        rf_params = [
+            "in buffer<bf16>",   # 0: x
+            "in buffer<bf16>",   # 1: gate_weight
+            "in buffer<f32>",    # 2: gate_bias
+            "out buffer<f32>",   # 3: logits
+            "out buffer<i32>",   # 4: ids
+            "out buffer<f32>",   # 5: weights
+            "out buffer<i32>",   # 6: sorted_ids
+            "out buffer<i32>",   # 7: src2dst
+            "out buffer<i32>",   # 8: dst2src
+            "out buffer<f32>",   # 9: gammas
+            "out buffer<i32>",   # 10: counts
+            "out buffer<i32>",   # 11: m_indptr
+            "i32",               # 12: T
+            "i32",               # 13: n = T * 8
+            "i32",               # 14: E = 128
+            "i32",               # 15: H = 2304
+        ]
+        rf_scratch: dict[str, Any] = {}
+        tm_params = [
             "in buffer<f32>",
+            "in buffer<f32>",
+            "out buffer<i32>",
+            "out buffer<f32>",
             "out buffer<i32>",
             "out buffer<i32>",
             "out buffer<i32>",
@@ -761,45 +748,134 @@ def register_ops(
             "out buffer<i32>",
             "i32",
         ]
-        small_smem = _add(_mul(_ceil_div(_clamp(token_axis, 0, 1024), 4), 256), 1024)
-        small_launch: dict[str, Any] = {
+        tm_args = [p(3), p(2), p(4), p(5), p(6), p(7), p(8), p(9), p(10), p(11), p(12)]
+        rf_launches: list[dict[str, Any]] = [
+            {
+                "entry": "extern:cublas_bf16_tn_f32",
+                "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<f32>", "i32", "i32", "i32"],
+                "args": [p(0), p(1), p(3), p(12), p(14), p(15)],
+            }
+        ]
+
+        t8_launch: dict[str, Any] = {
             "module": "moe_route",
-            "entry": "moe_route_metadata_small",
-            "params": meta_params,
+            "entry": "moe_router_topk_meta_t8",
+            "params": tm_params,
             "grid": [1, 1, 1],
-            "block": [1024, 1, 1],
-            "shared_mem": small_smem,
+            "block": [256, 1, 1],
             "pdl": True,
-            "args": [p(i) for i in range(9)],
+            "args": tm_args,
         }
-        if max_tokens <= 1024:
-            ops["moe_route_metadata"] = {
-                "params": meta_params,
-                "impl": {"launches": [small_launch]},
-            }
-        else:
-            small_launch["when"] = {"var": token_axis, "max": 1024}
-            max_blocks = ceil_div(max_tokens * TOP_K, 256)
-            scr = {
-                "block_counts": {"dtype": "i32", "shape": [max_blocks, NUM_EXPERTS]},
-                "block_offsets": {"dtype": "i32", "shape": [max_blocks, NUM_EXPERTS]},
-            }
-            num_blocks_expr = _ceil_div(n_expr, 256)
-            ops["moe_route_metadata"] = {
-                "params": meta_params,
-                "impl": {
-                    "scratch": scr,
-                    "launches": [
-                        small_launch,
+        if max_tokens > 8:
+            t8_launch["when"] = {"var": token_axis, "max": 8}
+        rf_launches.append(t8_launch)
+
+        if max_tokens >= 9:
+            meta_params_rf = [
+                "in buffer<i32>",
+                "in buffer<f32>",
+                "out buffer<i32>",
+                "out buffer<i32>",
+                "out buffer<i32>",
+                "out buffer<f32>",
+                "out buffer<i32>",
+                "out buffer<i32>",
+                "i32",
+            ]
+            topk_params_rf = ["in buffer<f32>", "in buffer<f32>", "out buffer<i32>", "out buffer<f32>", "i32"]
+            topk_1w_when: dict[str, Any] = {"var": token_axis, "min": 9}
+            if max_tokens > 128:
+                topk_1w_when["max"] = 128
+            rf_launches.append(
+                {
+                    "module": "moe_route",
+                    "entry": "moe_router_topk_1w",
+                    "params": topk_params_rf,
+                    "grid": [token_axis, 1, 1],
+                    "block": [32, 1, 1],
+                    "pdl": True,
+                    "when": topk_1w_when,
+                    "args": [p(3), p(2), p(4), p(5), p(12)],
+                }
+            )
+            if max_tokens > 128:
+                rf_launches.append(
+                    {
+                        "module": "moe_route",
+                        "entry": "moe_router_topk",
+                        "params": topk_params_rf,
+                        "grid": [_ceil_div(token_axis, 8), 1, 1],
+                        "block": [256, 1, 1],
+                        "pdl": True,
+                        "when": {"var": token_axis, "min": 129},
+                        "args": [p(3), p(2), p(4), p(5), p(12)],
+                    }
+                )
+            t32_when_rf: dict[str, Any] = {"var": token_axis, "min": 9}
+            if max_tokens > 32:
+                t32_when_rf["max"] = 32
+            rf_launches.append(
+                {
+                    "module": "moe_route",
+                    "entry": "moe_route_metadata_t32",
+                    "params": meta_params_rf,
+                    "grid": [1, 1, 1],
+                    "block": [256, 1, 1],
+                    "pdl": True,
+                    "when": t32_when_rf,
+                    "args": [p(4), p(5), p(6), p(7), p(8), p(9), p(10), p(11), p(13)],
+                }
+            )
+            if max_tokens > 32:
+                t64_when_rf: dict[str, Any] = {"var": token_axis, "min": 33}
+                if max_tokens > 64:
+                    t64_when_rf["max"] = 64
+                rf_launches.append(
+                    {
+                        "module": "moe_route",
+                        "entry": "moe_route_metadata_t64",
+                        "params": meta_params_rf,
+                        "grid": [1, 1, 1],
+                        "block": [512, 1, 1],
+                        "pdl": True,
+                        "when": t64_when_rf,
+                        "args": [p(4), p(5), p(6), p(7), p(8), p(9), p(10), p(11), p(13)],
+                    }
+                )
+            if max_tokens > 64:
+                small_smem_rf = _add(_mul(_ceil_div(_clamp(token_axis, 0, 1024), 4), 256), 1024)
+                small_when_rf: dict[str, Any] = {"var": token_axis, "min": 65}
+                if max_tokens > 1024:
+                    small_when_rf["max"] = 1024
+                rf_launches.append(
+                    {
+                        "module": "moe_route",
+                        "entry": "moe_route_metadata_small",
+                        "params": meta_params_rf,
+                        "grid": [1, 1, 1],
+                        "block": [1024, 1, 1],
+                        "shared_mem": small_smem_rf,
+                        "pdl": True,
+                        "when": small_when_rf,
+                        "args": [p(4), p(5), p(6), p(7), p(8), p(9), p(10), p(11), p(13)],
+                    }
+                )
+            if max_tokens > 1024:
+                max_blocks_rf = ceil_div(max_tokens * TOP_K, 256)
+                rf_scratch["block_counts"] = {"dtype": "i32", "shape": [max_blocks_rf, NUM_EXPERTS]}
+                rf_scratch["block_offsets"] = {"dtype": "i32", "shape": [max_blocks_rf, NUM_EXPERTS]}
+                num_blocks_rf = _ceil_div(n_expr, 256)
+                rf_launches.extend(
+                    [
                         {
                             "module": "moe_route",
                             "entry": "moe_route_count",
                             "params": ["in buffer<i32>", "out buffer<i32>", "i32"],
-                            "grid": [num_blocks_expr, 1, 1],
+                            "grid": [num_blocks_rf, 1, 1],
                             "block": [256, 1, 1],
                             "pdl": True,
                             "when": {"var": token_axis, "min": 1025},
-                            "args": [p(0), {"scratch": "block_counts"}, p(8)],
+                            "args": [p(4), {"scratch": "block_counts"}, p(13)],
                         },
                         {
                             "module": "moe_route",
@@ -818,9 +894,9 @@ def register_ops(
                             "args": [
                                 {"scratch": "block_counts"},
                                 {"scratch": "block_offsets"},
-                                p(6),
-                                p(7),
-                                p(8),
+                                p(10),
+                                p(11),
+                                p(13),
                             ],
                         },
                         {
@@ -836,24 +912,31 @@ def register_ops(
                                 "out buffer<f32>",
                                 "i32",
                             ],
-                            "grid": [num_blocks_expr, 1, 1],
+                            "grid": [num_blocks_rf, 1, 1],
                             "block": [256, 1, 1],
                             "pdl": True,
                             "when": {"var": token_axis, "min": 1025},
                             "args": [
-                                p(0),
-                                p(1),
-                                {"scratch": "block_offsets"},
-                                p(2),
-                                p(3),
                                 p(4),
                                 p(5),
+                                {"scratch": "block_offsets"},
+                                p(6),
+                                p(7),
                                 p(8),
+                                p(9),
+                                p(13),
                             ],
                         },
-                    ],
-                },
-            }
+                    ]
+                )
+
+        rf_impl: dict[str, Any] = {"launches": rf_launches}
+        if rf_scratch:
+            rf_impl["scratch"] = rf_scratch
+        ops["moe_route_fused"] = {
+            "params": rf_params,
+            "impl": rf_impl,
+        }
 
     # 4. Derive weight-scale swizzles (NVFP4 fp8e4m3 and MXFP8 u8)
     derive_swizzle_specs = []
@@ -906,10 +989,50 @@ def register_ops(
             },
         }
 
+    def split_lowm_op(
+        name: str,
+        mod: str,
+        lowm_entry: str,
+        highm_entry: str,
+        params: list[str],
+        lowm_grid: list[Any],
+        lowm_block: int,
+        highm_grid: list[Any],
+        highm_block: int,
+        cutoff: int,
+    ) -> None:
+        if name in ops:
+            return
+        low_l: dict[str, Any] = {
+            "module": mod,
+            "entry": lowm_entry,
+            "params": params,
+            "grid": lowm_grid,
+            "block": [lowm_block, 1, 1],
+            "pdl": True,
+            "args": [p(i) for i in range(len(params))],
+        }
+        if max_tokens <= cutoff:
+            ops[name] = {"params": params, "impl": {"launches": [low_l]}}
+            return
+        low_l["when"] = {"var": token_axis, "max": cutoff}
+        high_l: dict[str, Any] = {
+            "module": mod,
+            "entry": highm_entry,
+            "params": params,
+            "grid": highm_grid,
+            "block": [highm_block, 1, 1],
+            "pdl": True,
+            "when": {"var": token_axis, "min": cutoff + 1},
+            "args": [p(i) for i in range(len(params))],
+        }
+        ops[name] = {"params": params, "impl": {"launches": [low_l, high_l]}}
+
     if include_nvfp4:
-        simple_op(
+        split_lowm_op(
             "moe_quant_nvfp4",
             "moe_swiglu_quant",
+            "moe_quant_nvfp4_v2_nozero",
             "moe_quant_nvfp4_v2",
             [
                 "in buffer<bf16>",
@@ -921,12 +1044,16 @@ def register_ops(
                 "out buffer<f32>",
                 "i32",
             ],
+            [token_axis, 1, 1],
+            576,
             row_grid,
             576,
+            32,
         )
-        simple_op(
+        split_lowm_op(
             "moe_swiglu_quant_nvfp4",
             "moe_swiglu_quant",
+            "moe_swiglu_quant_nvfp4_bf16_nozero",
             "moe_swiglu_quant_nvfp4_bf16",
             [
                 "in buffer<bf16>",
@@ -937,13 +1064,17 @@ def register_ops(
                 "out buffer<f32>",
                 "i32",
             ],
+            [n_expr, 1, 1],
+            288,
             row_grid,
             288,
+            32,
         )
     if include_mxfp8:
-        simple_op(
+        split_lowm_op(
             "moe_quant_mxfp8",
             "moe_swiglu_quant",
+            "moe_quant_mxfp8_v2_nozero",
             "moe_quant_mxfp8_v2",
             [
                 "in buffer<bf16>",
@@ -954,12 +1085,16 @@ def register_ops(
                 "out buffer<u8>",
                 "i32",
             ],
+            [token_axis, 1, 1],
+            160,
             row_grid,
             160,
+            32,
         )
-        simple_op(
+        split_lowm_op(
             "moe_swiglu_quant_mxfp8",
             "moe_swiglu_quant",
+            "moe_swiglu_quant_mxfp8_nozero",
             "moe_swiglu_quant_mxfp8",
             [
                 "in buffer<bf16>",
@@ -969,8 +1104,11 @@ def register_ops(
                 "out buffer<u8>",
                 "i32",
             ],
+            [n_expr, 1, 1],
+            96,
             row_grid,
             96,
+            32,
         )
 
     # 6. SM120 CUTLASS Grouped GEMMs (NVFP4 + MXFP8)
@@ -983,15 +1121,19 @@ def register_ops(
             ops, "moe_mxfp8_gemm", "moe_mxfp8_sm120", mods["moe_mxfp8_sm120"], False, max_tokens, sm_count, token_axis
         )
 
-    # 7. Combine kernels
+    # 7. Combine kernels (cached L2 loads for T <= 64, 4-wide streaming prefetch for T >= 65)
     if include_nvfp4 or include_mxfp8:
-        simple_op(
+        split_lowm_op(
             "moe_combine_bf16",
             "moe_combine",
             "moe_combine_bf16",
+            "moe_combine_bf16_stream",
             ["in buffer<bf16>", "in buffer<i32>", "out buffer<bf16>", "i32"],
             [token_axis, 1, 1],
             288,
+            [token_axis, 1, 1],
+            288,
+            64,
         )
 
 
@@ -1099,19 +1241,13 @@ def emit_moe_layer_calls(
 
     calls: list[dict[str, Any]] = [
         {
-            "label": f"{pfx}.router_gemm",
-            "op": "moe_router_gemm",
-            "args": [_b(input_buf), _b(w["gate_weight"]), _b("moe.logits"), t_var, _i32(NUM_EXPERTS), _i32(HIDDEN_SIZE)],
-        },
-        {
-            "label": f"{pfx}.router_topk",
-            "op": "moe_router_topk",
-            "args": [_b("moe.logits"), _b(w["gate_bias"]), _b("moe.ids"), _b("moe.weights"), t_var],
-        },
-        {
-            "label": f"{pfx}.route_metadata",
-            "op": "moe_route_metadata",
+            "label": f"{pfx}.route_fused",
+            "op": "moe_route_fused",
             "args": [
+                _b(input_buf),
+                _b(w["gate_weight"]),
+                _b(w["gate_bias"]),
+                _b("moe.logits"),
                 _b("moe.ids"),
                 _b("moe.weights"),
                 _b("moe.sorted_ids"),
@@ -1120,7 +1256,10 @@ def emit_moe_layer_calls(
                 _b("moe.gammas"),
                 _b("moe.counts"),
                 _b("moe.m_indptr"),
+                t_var,
                 n_expr,
+                _i32(NUM_EXPERTS),
+                _i32(HIDDEN_SIZE),
             ],
         },
     ]

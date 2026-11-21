@@ -385,3 +385,498 @@ extern "C" __global__ void __launch_bounds__(256) moe_route_scatter(
   asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 #endif
 }
+
+// Bit-exact fused Router TopK + Single-CTA Counting Sort for T <= 32 (reads cuBLAS logits directly).
+// Eliminates global write/read roundtrip of ids & weights and merges two launches into one.
+template <int kBlockThreads, int kMaxTokens>
+__device__ __forceinline__ void moe_router_topk_meta_impl(
+    const float* __restrict__ logits,
+    const float* __restrict__ bias,
+    int* __restrict__ ids,
+    float* __restrict__ weights,
+    int* __restrict__ sorted_ids,
+    int* __restrict__ src2dst,
+    int* __restrict__ dst2src,
+    float* __restrict__ gammas,
+    int* __restrict__ counts,
+    int* __restrict__ m_indptr,
+    int T) {
+  constexpr int kMaxN = kMaxTokens * kTopK;
+  constexpr int kMaxChunks = (kMaxN + 31) >> 5;
+
+  __shared__ int s_ids[kMaxN];
+  __shared__ float s_w[kMaxN];
+  __shared__ uint16_t s_chunk_counts[kMaxChunks][kNumExperts];
+  __shared__ int s_expert_start[kNumExperts + 1];
+  __shared__ int s_warp_sums[4];
+
+  int const warp = threadIdx.x >> 5;
+  int const lane = threadIdx.x & 31;
+  int const n = T * kTopK;
+  int const chunks = (n + 31) >> 5;
+
+  // Zero chunk_counts and prefetch static bias BEFORE PDL wait
+  int const zero_u4 = chunks * (kNumExperts / 8);
+  for (int i = threadIdx.x; i < zero_u4; i += kBlockThreads) {
+    reinterpret_cast<uint4*>(&s_chunk_counts[0][0])[i] = make_uint4(0, 0, 0, 0);
+  }
+  const float4 bv = *reinterpret_cast<const float4*>(bias + lane * 4);
+  const float b4[4] = {bv.x, bv.y, bv.z, bv.w};
+
+#if (__CUDA_ARCH__ >= 900)
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+
+  if (warp < T) {
+    int const t = warp;
+    const float4 lv = *reinterpret_cast<const float4*>(logits + int64_t(t) * kNumExperts + lane * 4);
+    const float l4[4] = {lv.x, lv.y, lv.z, lv.w};
+
+    uint64_t keys[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      int e = lane * 4 + j;
+      float sig = __fdiv_rn(1.0f, 1.0f + expf(-l4[j]));
+      float sel = sig + b4[j];
+      keys[j] = (uint64_t(ord_f32(sel)) << 16) | uint64_t(kNumExperts - e);
+    }
+
+    int pick_e = 0;
+    float pick_z = 0.0f;
+#pragma unroll
+    for (int k = 0; k < kTopK; ++k) {
+      uint64_t m = max(max(keys[0], keys[1]), max(keys[2], keys[3]));
+#pragma unroll
+      for (int s = 16; s >= 1; s >>= 1) {
+        uint64_t peer = __shfl_xor_sync(0xFFFFFFFFu, m, s);
+        if (peer > m) m = peer;
+      }
+      int my_e = -1;
+      float my_z = 0.0f;
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        if (keys[j] == m) {
+          my_e = lane * 4 + j;
+          my_z = l4[j];
+          keys[j] = 0ULL;
+        }
+      }
+      int winner_lane = __ffs(__ballot_sync(0xFFFFFFFFu, my_e >= 0)) - 1;
+      int chosen_e = __shfl_sync(0xFFFFFFFFu, my_e, winner_lane);
+      float chosen_z = __shfl_sync(0xFFFFFFFFu, my_z, winner_lane);
+      if (lane == k) {
+        pick_e = chosen_e;
+        pick_z = chosen_z;
+      }
+    }
+
+    float log_p = -INFINITY;
+    if (lane < kTopK) {
+      log_p = fminf(pick_z, 0.0f) - log1pf(expf(-fabsf(pick_z)));
+    }
+    float max_lp = log_p;
+    max_lp = fmaxf(max_lp, __shfl_xor_sync(0xFFFFFFFFu, max_lp, 1));
+    max_lp = fmaxf(max_lp, __shfl_xor_sync(0xFFFFFFFFu, max_lp, 2));
+    max_lp = fmaxf(max_lp, __shfl_xor_sync(0xFFFFFFFFu, max_lp, 4));
+
+    float s = (lane < kTopK) ? expf(log_p - max_lp) : 0.0f;
+    s += __shfl_xor_sync(0xFFFFFFFFu, s, 2);
+    s += __shfl_xor_sync(0xFFFFFFFFu, s, 1);
+    s += __shfl_xor_sync(0xFFFFFFFFu, s, 4);
+    float total = __shfl_sync(0xFFFFFFFFu, s, 0);
+
+    if (lane < kTopK) {
+      float logsumexp = max_lp + logf(total);
+      float w = expf(log_p - logsumexp) * kRouteScale;
+      int p = t * kTopK + lane;
+      ids[p] = pick_e;
+      weights[p] = w;
+      s_ids[p] = pick_e;
+      s_w[p] = w;
+    }
+  }
+  __syncthreads();
+
+  int const p = threadIdx.x;
+  int const e = (p < n) ? s_ids[p] : kNumExperts;
+  float const w = (p < n) ? s_w[p] : 0.0f;
+  int rank = 0;
+  if (warp < chunks) {
+    unsigned same = same_lanes(e);
+    rank = __popc(same & ((1u << lane) - 1));
+    if (e < kNumExperts && lane == __ffs(same) - 1) {
+      s_chunk_counts[warp][e] = uint16_t(__popc(same));
+    }
+  }
+  __syncthreads();
+
+  if (threadIdx.x < kNumExperts) {
+    int ex = threadIdx.x;
+    int sum = 0;
+    for (int c = 0; c < chunks; ++c) {
+      int cnt = s_chunk_counts[c][ex];
+      s_chunk_counts[c][ex] = uint16_t(sum);
+      sum += cnt;
+    }
+    int x = sum;
+#pragma unroll
+    for (int s = 1; s < 32; s *= 2) {
+      int y = __shfl_up_sync(0xFFFFFFFFu, x, s);
+      if (lane >= s) x += y;
+    }
+    if (lane == 31) s_warp_sums[warp] = x;
+    counts[ex] = sum;
+    s_expert_start[ex] = x - sum;
+  }
+  __syncthreads();
+
+  if (warp == 0 && lane < 4) {
+    int ws = s_warp_sums[lane];
+#pragma unroll
+    for (int s = 1; s < 4; s *= 2) {
+      int y = __shfl_up_sync(0xFu, ws, s);
+      if (lane >= s) ws += y;
+    }
+    s_warp_sums[lane] = ws;
+  }
+  __syncthreads();
+
+  if (threadIdx.x < kNumExperts) {
+    int base = s_expert_start[threadIdx.x] + (warp ? s_warp_sums[warp - 1] : 0);
+    s_expert_start[threadIdx.x] = base;
+    m_indptr[threadIdx.x] = base;
+    if (threadIdx.x == 0) {
+      s_expert_start[kNumExperts] = s_warp_sums[3];
+      m_indptr[kNumExperts] = s_warp_sums[3];
+    }
+  }
+  __syncthreads();
+
+  if (p < n) {
+    int dst = s_expert_start[e] + s_chunk_counts[warp][e] + rank;
+    sorted_ids[dst] = e;
+    dst2src[dst] = p;
+    gammas[dst] = w;
+    src2dst[p] = dst;
+  }
+#if (__CUDA_ARCH__ >= 900)
+  __syncthreads();
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
+}
+
+// Grid: (1, 1, 1), Block: (256, 1, 1) — T <= 8 (n <= 64, 8 warps = 1 warp/token)
+extern "C" __global__ void __launch_bounds__(256) moe_router_topk_meta_t8(
+    const float* __restrict__ logits,
+    const float* __restrict__ bias,
+    int* __restrict__ ids,
+    float* __restrict__ weights,
+    int* __restrict__ sorted_ids,
+    int* __restrict__ src2dst,
+    int* __restrict__ dst2src,
+    float* __restrict__ gammas,
+    int* __restrict__ counts,
+    int* __restrict__ m_indptr,
+    int T) {
+  moe_router_topk_meta_impl<256, 8>(
+      logits, bias, ids, weights, sorted_ids, src2dst, dst2src, gammas, counts, m_indptr, T);
+}
+
+// Grid: (1, 1, 1), Block: (512, 1, 1) — 9 <= T <= 16 (n <= 128, 16 warps = 1 warp/token)
+extern "C" __global__ void __launch_bounds__(512) moe_router_topk_meta_t16(
+    const float* __restrict__ logits,
+    const float* __restrict__ bias,
+    int* __restrict__ ids,
+    float* __restrict__ weights,
+    int* __restrict__ sorted_ids,
+    int* __restrict__ src2dst,
+    int* __restrict__ dst2src,
+    float* __restrict__ gammas,
+    int* __restrict__ counts,
+    int* __restrict__ m_indptr,
+    int T) {
+  moe_router_topk_meta_impl<512, 16>(
+      logits, bias, ids, weights, sorted_ids, src2dst, dst2src, gammas, counts, m_indptr, T);
+}
+
+// 1-warp-per-CTA Router TopK for 17 <= T <= 128 (distributes SFU work across T SMs in parallel).
+// Prefetches static bias BEFORE PDL wait; bit-exact vs moe_router_topk.
+// Grid: (T, 1, 1), Block: (32, 1, 1)
+extern "C" __global__ void __launch_bounds__(32) moe_router_topk_1w(
+    const float* __restrict__ logits,
+    const float* __restrict__ bias,
+    int* __restrict__ ids,
+    float* __restrict__ weights,
+    int T) {
+  int const t = blockIdx.x;
+  int const lane = threadIdx.x;
+  if (t >= T) return;
+
+  const float4 bv = *reinterpret_cast<const float4*>(bias + lane * 4);
+  const float b4[4] = {bv.x, bv.y, bv.z, bv.w};
+
+#if (__CUDA_ARCH__ >= 900)
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+
+  const float4 lv = *reinterpret_cast<const float4*>(logits + int64_t(t) * kNumExperts + lane * 4);
+  const float l4[4] = {lv.x, lv.y, lv.z, lv.w};
+
+  uint64_t keys[4];
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    int e = lane * 4 + j;
+    float sig = __fdiv_rn(1.0f, 1.0f + expf(-l4[j]));
+    float sel = sig + b4[j];
+    keys[j] = (uint64_t(ord_f32(sel)) << 16) | uint64_t(kNumExperts - e);
+  }
+
+  int pick_e = 0;
+  float pick_z = 0.0f;
+#pragma unroll
+  for (int k = 0; k < kTopK; ++k) {
+    uint64_t m = max(max(keys[0], keys[1]), max(keys[2], keys[3]));
+#pragma unroll
+    for (int s = 16; s >= 1; s >>= 1) {
+      uint64_t peer = __shfl_xor_sync(0xFFFFFFFFu, m, s);
+      if (peer > m) m = peer;
+    }
+    int my_e = -1;
+    float my_z = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      if (keys[j] == m) {
+        my_e = lane * 4 + j;
+        my_z = l4[j];
+        keys[j] = 0ULL;
+      }
+    }
+    int winner_lane = __ffs(__ballot_sync(0xFFFFFFFFu, my_e >= 0)) - 1;
+    int chosen_e = __shfl_sync(0xFFFFFFFFu, my_e, winner_lane);
+    float chosen_z = __shfl_sync(0xFFFFFFFFu, my_z, winner_lane);
+    if (lane == k) {
+      pick_e = chosen_e;
+      pick_z = chosen_z;
+    }
+  }
+
+  float log_p = -INFINITY;
+  if (lane < kTopK) {
+    log_p = fminf(pick_z, 0.0f) - log1pf(expf(-fabsf(pick_z)));
+  }
+  float max_lp = log_p;
+  max_lp = fmaxf(max_lp, __shfl_xor_sync(0xFFFFFFFFu, max_lp, 1));
+  max_lp = fmaxf(max_lp, __shfl_xor_sync(0xFFFFFFFFu, max_lp, 2));
+  max_lp = fmaxf(max_lp, __shfl_xor_sync(0xFFFFFFFFu, max_lp, 4));
+
+  float s = (lane < kTopK) ? expf(log_p - max_lp) : 0.0f;
+  s += __shfl_xor_sync(0xFFFFFFFFu, s, 2);
+  s += __shfl_xor_sync(0xFFFFFFFFu, s, 1);
+  s += __shfl_xor_sync(0xFFFFFFFFu, s, 4);
+  float total = __shfl_sync(0xFFFFFFFFu, s, 0);
+
+  if (lane < kTopK) {
+    float logsumexp = max_lp + logf(total);
+    float w = expf(log_p - logsumexp) * kRouteScale;
+    ids[int64_t(t) * kTopK + lane] = pick_e;
+    weights[int64_t(t) * kTopK + lane] = w;
+  }
+#if (__CUDA_ARCH__ >= 900)
+  __syncwarp();
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
+}
+
+// Fast single-CTA counting sort for n = T * 8 <= 256 (17 <= T <= 32):
+// 1 element/thread, 2 KiB static SMEM, 4-warp exclusive scan (bit-exact vs moe_route_metadata_small).
+// Grid: (1, 1, 1), Block: (256, 1, 1)
+extern "C" __global__ void __launch_bounds__(256) moe_route_metadata_t32(
+    const int* __restrict__ ids,
+    const float* __restrict__ weights,
+    int* __restrict__ sorted_ids,
+    int* __restrict__ src2dst,
+    int* __restrict__ dst2src,
+    float* __restrict__ gammas,
+    int* __restrict__ counts,
+    int* __restrict__ m_indptr,
+    int n) {
+  __shared__ uint16_t s_chunk_counts[8][kNumExperts];
+  __shared__ int s_expert_start[kNumExperts + 1];
+  __shared__ int s_warp_sums[4];
+
+  int const warp = threadIdx.x >> 5;
+  int const lane = threadIdx.x & 31;
+  int const chunks = (n + 31) >> 5;
+
+  if (threadIdx.x < chunks * (kNumExperts / 8)) {
+    reinterpret_cast<uint4*>(&s_chunk_counts[0][0])[threadIdx.x] = make_uint4(0, 0, 0, 0);
+  }
+#if (__CUDA_ARCH__ >= 900)
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+  int p = threadIdx.x;
+  int e = (p < n) ? ids[p] : kNumExperts;
+  float w = (p < n) ? weights[p] : 0.0f;
+  __syncthreads();
+
+  int rank = 0;
+  if (warp < chunks) {
+    unsigned same = same_lanes(e);
+    rank = __popc(same & ((1u << lane) - 1));
+    if (e < kNumExperts && lane == __ffs(same) - 1) {
+      s_chunk_counts[warp][e] = uint16_t(__popc(same));
+    }
+  }
+  __syncthreads();
+
+  if (threadIdx.x < kNumExperts) {
+    int ex = threadIdx.x;
+    int sum = 0;
+    for (int c = 0; c < chunks; ++c) {
+      int cnt = s_chunk_counts[c][ex];
+      s_chunk_counts[c][ex] = uint16_t(sum);
+      sum += cnt;
+    }
+    int x = sum;
+#pragma unroll
+    for (int s = 1; s < 32; s *= 2) {
+      int y = __shfl_up_sync(0xFFFFFFFFu, x, s);
+      if (lane >= s) x += y;
+    }
+    if (lane == 31) s_warp_sums[warp] = x;
+    counts[ex] = sum;
+    s_expert_start[ex] = x - sum;
+  }
+  __syncthreads();
+
+  if (warp == 0 && lane < 4) {
+    int ws = s_warp_sums[lane];
+#pragma unroll
+    for (int s = 1; s < 4; s *= 2) {
+      int y = __shfl_up_sync(0xFu, ws, s);
+      if (lane >= s) ws += y;
+    }
+    s_warp_sums[lane] = ws;
+  }
+  __syncthreads();
+
+  if (threadIdx.x < kNumExperts) {
+    int base = s_expert_start[threadIdx.x] + (warp ? s_warp_sums[warp - 1] : 0);
+    s_expert_start[threadIdx.x] = base;
+    m_indptr[threadIdx.x] = base;
+    if (threadIdx.x == 0) {
+      s_expert_start[kNumExperts] = s_warp_sums[3];
+      m_indptr[kNumExperts] = s_warp_sums[3];
+    }
+  }
+  __syncthreads();
+
+  if (p < n) {
+    int dst = s_expert_start[e] + s_chunk_counts[warp][e] + rank;
+    sorted_ids[dst] = e;
+    dst2src[dst] = p;
+    gammas[dst] = w;
+    src2dst[p] = dst;
+  }
+#if (__CUDA_ARCH__ >= 900)
+  __syncthreads();
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
+}
+
+// Fast single-CTA counting sort for n = T * 8 <= 512 (33 <= T <= 64):
+// 1 element/thread, static SMEM, 4-warp exclusive scan (bit-exact vs moe_route_metadata_small).
+// Grid: (1, 1, 1), Block: (512, 1, 1)
+extern "C" __global__ void __launch_bounds__(512) moe_route_metadata_t64(
+    const int* __restrict__ ids,
+    const float* __restrict__ weights,
+    int* __restrict__ sorted_ids,
+    int* __restrict__ src2dst,
+    int* __restrict__ dst2src,
+    float* __restrict__ gammas,
+    int* __restrict__ counts,
+    int* __restrict__ m_indptr,
+    int n) {
+  __shared__ uint16_t s_chunk_counts[16][kNumExperts];
+  __shared__ int s_expert_start[kNumExperts + 1];
+  __shared__ int s_warp_sums[4];
+
+  int const warp = threadIdx.x >> 5;
+  int const lane = threadIdx.x & 31;
+  int const chunks = (n + 31) >> 5;
+
+  if (threadIdx.x < chunks * (kNumExperts / 8)) {
+    reinterpret_cast<uint4*>(&s_chunk_counts[0][0])[threadIdx.x] = make_uint4(0, 0, 0, 0);
+  }
+#if (__CUDA_ARCH__ >= 900)
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+  int p = threadIdx.x;
+  int e = (p < n) ? ids[p] : kNumExperts;
+  float w = (p < n) ? weights[p] : 0.0f;
+  __syncthreads();
+
+  int rank = 0;
+  if (warp < chunks) {
+    unsigned same = same_lanes(e);
+    rank = __popc(same & ((1u << lane) - 1));
+    if (e < kNumExperts && lane == __ffs(same) - 1) {
+      s_chunk_counts[warp][e] = uint16_t(__popc(same));
+    }
+  }
+  __syncthreads();
+
+  if (threadIdx.x < kNumExperts) {
+    int ex = threadIdx.x;
+    int sum = 0;
+    for (int c = 0; c < chunks; ++c) {
+      int cnt = s_chunk_counts[c][ex];
+      s_chunk_counts[c][ex] = uint16_t(sum);
+      sum += cnt;
+    }
+    int x = sum;
+#pragma unroll
+    for (int s = 1; s < 32; s *= 2) {
+      int y = __shfl_up_sync(0xFFFFFFFFu, x, s);
+      if (lane >= s) x += y;
+    }
+    if (lane == 31) s_warp_sums[warp] = x;
+    counts[ex] = sum;
+    s_expert_start[ex] = x - sum;
+  }
+  __syncthreads();
+
+  if (warp == 0 && lane < 4) {
+    int ws = s_warp_sums[lane];
+#pragma unroll
+    for (int s = 1; s < 4; s *= 2) {
+      int y = __shfl_up_sync(0xFu, ws, s);
+      if (lane >= s) ws += y;
+    }
+    s_warp_sums[lane] = ws;
+  }
+  __syncthreads();
+
+  if (threadIdx.x < kNumExperts) {
+    int base = s_expert_start[threadIdx.x] + (warp ? s_warp_sums[warp - 1] : 0);
+    s_expert_start[threadIdx.x] = base;
+    m_indptr[threadIdx.x] = base;
+    if (threadIdx.x == 0) {
+      s_expert_start[kNumExperts] = s_warp_sums[3];
+      m_indptr[kNumExperts] = s_warp_sums[3];
+    }
+  }
+  __syncthreads();
+
+  if (p < n) {
+    int dst = s_expert_start[e] + s_chunk_counts[warp][e] + rank;
+    sorted_ids[dst] = e;
+    dst2src[dst] = p;
+    gammas[dst] = w;
+    src2dst[p] = dst;
+  }
+#if (__CUDA_ARCH__ >= 900)
+  __syncthreads();
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
+}
