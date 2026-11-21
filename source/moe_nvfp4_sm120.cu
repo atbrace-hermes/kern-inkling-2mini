@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SM120 NVFP4 Grouped GEMM adapter for Inkling-2-Mini MoE (Layers 0..19):
-//   - SwapAB=true, TileM=128, TileN in {32, 64}, TileK=128
-//   - DTypeOut = float (FP32 accumulators, alpha = 1.0f) so per-row x_amax scaling
-//     runs without premature BF16 truncation in moe_swiglu_quant_nvfp4 / moe_combine_nvfp4.
+//   - SwapAB=true, TileM=128, TileN in {32, 64, 128}, TileK=128
+//   - Fused EVT epilogue: D_bf16 = bf16(acc_f32 * (x_amax[row] * (w_amax[expert] / (1536 * w_denom))))
+//     eliminating FP32 intermediate buffers (2x less output/input DRAM traffic, half epilogue SMEM,
+//     +1 mainloop pipeline stage for N32/N64, and bit-exact BF16 output).
 //   - Compile with -DMOE_METADATA_PROBE as host binary to emit build/sm_120/moe_nvfp4_sm120.json
 //     (zero GPU calls!).
 
@@ -59,9 +60,14 @@ extern "C" CUresult CUDAAPI cuTensorMapEncodeTiled(
 #endif
 
 #include <cstdint>
+#include <cuda_bf16.h>
 #include <cute/tensor.hpp>
 #include <cutlass/cutlass.h>
 #include <cutlass/epilogue/collective/collective_builder.hpp>
+#include <cutlass/epilogue/fusion/operations.hpp>
+#include <cutlass/epilogue/fusion/sm90_visitor_compute_tma_warpspecialized.hpp>
+#include <cutlass/epilogue/fusion/sm90_visitor_load_tma_warpspecialized.hpp>
+#include <cutlass/epilogue/fusion/sm90_visitor_tma_warpspecialized.hpp>
 #include <cutlass/gemm/collective/collective_builder.hpp>
 #include <cutlass/gemm/device/gemm_universal_adapter.h>
 #include <cutlass/gemm/dispatch_policy.hpp>
@@ -108,9 +114,9 @@ struct Nvfp4Traits {
   using ElementSFB = cutlass::float_ue4m3_t;
   static constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;  // 32
 
-  using ElementD = float;
+  using ElementD = cutlass::bfloat16_t;
   using ElementC = void;
-  static constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;  // 4
+  static constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;  // 8
 
   using ElementAccumulator = float;
   using ElementCompute = float;
@@ -125,11 +131,35 @@ struct Nvfp4Traits {
   using EpilogueSchedule = cutlass::epilogue::collective::EpilogueScheduleAuto;
   using ThreadBlockShape = Shape<Int<TileM>, Int<TileN>, Int<TileK>>;
 
+  // Fused exact-order scaling: D_bf16 = bf16(acc * ((x_amax[row] * w_amax[expert]) * rcp))
+  // Matches baseline `__fmul_rn(__fmul_rn(x_amax[row], w_amax[expert]), rcp)` bit-for-bit!
+  using RowScaleNode = cutlass::epilogue::fusion::Sm90RowBroadcast<
+      0, ThreadBlockShape, float*, float, Stride<_0, _1, _0>, 1, false>;
+  using GroupAmaxNode = cutlass::epilogue::fusion::Sm90ScalarBroadcast<
+      float, Stride<_0, _0, _1>>;
+  using RcpNode = cutlass::epilogue::fusion::Sm90ScalarBroadcast<
+      float, Stride<_0, _0, _1>>;
+  using AmaxMul = cutlass::epilogue::fusion::Sm90EVT<
+      cutlass::epilogue::fusion::Sm90Compute<
+          cutlass::multiplies, float, float, cutlass::FloatRoundStyle::round_to_nearest>,
+      RowScaleNode,
+      GroupAmaxNode>;
+  using ScaleMul = cutlass::epilogue::fusion::Sm90EVT<
+      cutlass::epilogue::fusion::Sm90Compute<
+          cutlass::multiplies, float, float, cutlass::FloatRoundStyle::round_to_nearest>,
+      AmaxMul,
+      RcpNode>;
+  using EpilogueEVT = cutlass::epilogue::fusion::Sm90EVT<
+      cutlass::epilogue::fusion::Sm90Compute<
+          cutlass::multiplies, ElementD, float, cutlass::FloatRoundStyle::round_to_nearest>,
+      cutlass::epilogue::fusion::Sm90AccFetch,
+      ScaleMul>;
+
   using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
       cutlass::arch::Sm120, cutlass::arch::OpClassBlockScaledTensorOp, ThreadBlockShape,
       ClusterShape, cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator,
       ElementCompute, ElementC, LayoutD*, AlignmentD, ElementD, LayoutD*, AlignmentD,
-      EpilogueSchedule>::CollectiveOp;
+      EpilogueSchedule, EpilogueEVT>::CollectiveOp;
 
   using MainloopSchedule = cutlass::gemm::collective::KernelScheduleAuto;
   using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
@@ -147,6 +177,7 @@ struct Nvfp4Traits {
 
 struct Nvfp4KernelN32 : public Nvfp4Traits<32>::BaseKernel {};
 struct Nvfp4KernelN64 : public Nvfp4Traits<64>::BaseKernel {};
+struct Nvfp4KernelN128 : public Nvfp4Traits<128>::BaseKernel {};
 
 using TraitsRef = Nvfp4Traits<64>;
 using ProblemShape = typename TraitsRef::ProblemShape;
@@ -161,29 +192,43 @@ using LayoutSFB = typename TraitsRef::BaseKernel::CollectiveMainloop::InternalLa
 static_assert(std::is_same_v<typename Nvfp4Traits<32>::BaseKernel::InternalStrideA, StrideA>);
 static_assert(std::is_same_v<typename Nvfp4Traits<32>::BaseKernel::InternalStrideB, StrideB>);
 static_assert(std::is_same_v<typename Nvfp4Traits<32>::BaseKernel::InternalStrideD, StrideD>);
+static_assert(std::is_same_v<typename Nvfp4Traits<128>::BaseKernel::InternalStrideA, StrideA>);
+static_assert(std::is_same_v<typename Nvfp4Traits<128>::BaseKernel::InternalStrideB, StrideB>);
+static_assert(std::is_same_v<typename Nvfp4Traits<128>::BaseKernel::InternalStrideD, StrideD>);
 static_assert(
     std::is_same_v<typename Nvfp4Traits<32>::BaseKernel::CollectiveMainloop::InternalLayoutSFA,
                    LayoutSFA>);
 static_assert(
     std::is_same_v<typename Nvfp4Traits<32>::BaseKernel::CollectiveMainloop::InternalLayoutSFB,
                    LayoutSFB>);
+static_assert(
+    std::is_same_v<typename Nvfp4Traits<128>::BaseKernel::CollectiveMainloop::InternalLayoutSFA,
+                   LayoutSFA>);
+static_assert(
+    std::is_same_v<typename Nvfp4Traits<128>::BaseKernel::CollectiveMainloop::InternalLayoutSFB,
+                   LayoutSFB>);
 static_assert(TraitsRef::BaseKernel::CollectiveMainloop::TiledMma::SFVecSize == 16);
 static_assert(Nvfp4KernelN32::SharedStorageSize <= 101376, "N32 exceeds SM120 99KiB SMEM");
 static_assert(Nvfp4KernelN64::SharedStorageSize <= 101376, "N64 exceeds SM120 99KiB SMEM");
+static_assert(Nvfp4KernelN128::SharedStorageSize <= 101376, "N128 exceeds SM120 99KiB SMEM");
 
 }  // namespace moe_nvfp4
 
 #ifndef MOE_METADATA_PROBE
 
-// Device arg-prep kernel for SwapAB=true NVFP4 grouped GEMM.
-// Note: A_acts [m, k/2] u8, B_weights [E, n, k/2] u8, SFA_acts u8, SFB_weights u8, D_out f32 [m, n].
+// Device arg-prep kernel for SwapAB=true NVFP4 grouped GEMM with fused BF16 scaling.
+// Note: A_acts [m, k/2] u8, B_weights [E, n, k/2] u8, SFA_acts u8, SFB_weights u8,
+//       D_out bf16 [m, n], x_amax f32 [m], w_amax f32 [E], w_denom f32 [1].
 extern "C" __global__ void __launch_bounds__(128) moe_nvfp4_prepare_args(
     const uint8_t* __restrict__ A_acts,
     const uint8_t* __restrict__ B_weights,
     const uint8_t* __restrict__ SFA_acts,
     const uint8_t* __restrict__ SFB_weights,
-    float* __restrict__ D_out,
+    __nv_bfloat16* __restrict__ D_out,
     const int* __restrict__ m_indptr,
+    const float* __restrict__ x_amax,
+    const float* __restrict__ w_amax,
+    const float* __restrict__ w_denom,
     int n,
     int k,
     int num_groups,
@@ -193,6 +238,8 @@ extern "C" __global__ void __launch_bounds__(128) moe_nvfp4_prepare_args(
     void* SFA_ptr_out,
     void* SFB_ptr_out,
     void* D_ptr_out,
+    void* x_amax_ptr_out,
+    float* group_scale_out,
     void* stride_A_out,
     void* stride_B_out,
     void* stride_D_out,
@@ -204,6 +251,7 @@ extern "C" __global__ void __launch_bounds__(128) moe_nvfp4_prepare_args(
   using ElementB = typename moe_nvfp4::TraitsRef::ElementB;      // float_e2m1_t (acts)
   using ElementSFA = typename moe_nvfp4::TraitsRef::ElementSFA;  // float_ue4m3_t (weights)
   using ElementSFB = typename moe_nvfp4::TraitsRef::ElementSFB;  // float_ue4m3_t (acts)
+  using ElementD = typename moe_nvfp4::TraitsRef::ElementD;      // cutlass::bfloat16_t
 
   constexpr size_t ScaleGranularity = 16;
   constexpr size_t alignment_swizzled_mn = 128;
@@ -229,7 +277,8 @@ extern "C" __global__ void __launch_bounds__(128) moe_nvfp4_prepare_args(
     auto** B_ptr = reinterpret_cast<const ElementB**>(B_ptr_out);
     auto** SFA_ptr = reinterpret_cast<const ElementSFA**>(SFA_ptr_out);
     auto** SFB_ptr = reinterpret_cast<const ElementSFB**>(SFB_ptr_out);
-    auto** D_ptr = reinterpret_cast<float**>(D_ptr_out);
+    auto** D_ptr = reinterpret_cast<ElementD**>(D_ptr_out);
+    auto** x_amax_ptr = reinterpret_cast<const float**>(x_amax_ptr_out);
     auto* stride_A = reinterpret_cast<moe_nvfp4::StrideA*>(stride_A_out);
     auto* stride_B = reinterpret_cast<moe_nvfp4::StrideB*>(stride_B_out);
     auto* stride_D = reinterpret_cast<moe_nvfp4::StrideD*>(stride_D_out);
@@ -244,7 +293,10 @@ extern "C" __global__ void __launch_bounds__(128) moe_nvfp4_prepare_args(
     // Packed 2x E2M1 per byte -> divide element offset by 2.
     A_ptr[i] = reinterpret_cast<const ElementA*>(B_weights + (size_t(i) * size_t(n) * size_t(k)) / 2);
     B_ptr[i] = reinterpret_cast<const ElementB*>(A_acts + (size_t(m_offset) * size_t(k)) / 2);
-    D_ptr[i] = D_out + size_t(m_offset) * size_t(n);
+    D_ptr[i] = reinterpret_cast<ElementD*>(D_out) + size_t(m_offset) * size_t(n);
+
+    x_amax_ptr[i] = (m > 0) ? (x_amax + m_offset) : x_amax;
+    group_scale_out[i] = __frcp_rn(__fmul_rn(1536.0f, *w_denom));
 
     layout_SFA[i] = moe_nvfp4::ScaleConfig::tile_atom_to_shape_SFA(
         cute::make_shape(int(sf_n), int(m), int(swizzled_k), 1));
@@ -265,6 +317,8 @@ template __global__ void cutlass::device_kernel<moe_nvfp4::Nvfp4KernelN32>(
     CUTLASS_GRID_CONSTANT typename moe_nvfp4::Nvfp4KernelN32::Params const);
 template __global__ void cutlass::device_kernel<moe_nvfp4::Nvfp4KernelN64>(
     CUTLASS_GRID_CONSTANT typename moe_nvfp4::Nvfp4KernelN64::Params const);
+template __global__ void cutlass::device_kernel<moe_nvfp4::Nvfp4KernelN128>(
+    CUTLASS_GRID_CONSTANT typename moe_nvfp4::Nvfp4KernelN128::Params const);
 
 #else  // MOE_METADATA_PROBE
 
@@ -276,7 +330,6 @@ template __global__ void cutlass::device_kernel<moe_nvfp4::Nvfp4KernelN64>(
 
 template <class Kernel>
 static void emit_variant(const char* name, int tile_n, int sm_count) {
-  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
   using Params = typename Kernel::Params;
   using Arguments = typename Kernel::Arguments;
   using CollectiveMainloop = typename Kernel::CollectiveMainloop;
@@ -290,10 +343,12 @@ static void emit_variant(const char* name, int tile_n, int sm_count) {
         {{}, nullptr, nullptr, nullptr, nullptr},
         cutlass::KernelHardwareInfo{0, sm, 0},
     };
-    args.epilogue.thread.alpha = 1.0f;
-    args.epilogue.thread.beta = 0.0f;
-    args.epilogue.thread.alpha_ptr = nullptr;
-    args.epilogue.thread.dAlpha = {cute::_0{}, cute::_0{}, 0};
+    args.epilogue.thread.op_1.op_0.op_0.ptr_row = nullptr;
+    args.epilogue.thread.op_1.op_0.op_0.dRow = cute::Stride<cute::_0, cute::_1, cute::_0>{};
+    args.epilogue.thread.op_1.op_0.op_1.scalar_ptrs[0] = nullptr;
+    args.epilogue.thread.op_1.op_0.op_1.dScalar[0] = cute::Stride<cute::_0, cute::_0, cute::_1>{};
+    args.epilogue.thread.op_1.op_1.scalar_ptrs[0] = nullptr;
+    args.epilogue.thread.op_1.op_1.dScalar[0] = cute::Stride<cute::_0, cute::_0, cute::_1>{};
     return Kernel::to_underlying_arguments(args, ws_base);
   };
 
@@ -397,6 +452,10 @@ static void emit_variant(const char* name, int tile_n, int sm_count) {
          off(&p0.mainloop.ptr_SFB), off(&p0.mainloop.layout_SFB));
   printf("      \"ptr_D\":%zu,\"dD\":%zu,\n",
          off(&p0.epilogue.ptr_D), off(&p0.epilogue.dD));
+  printf("      \"evt_row_scale_ptrs\":%zu,\"evt_group_amax_ptr\":%zu,\"evt_rcp_ptr\":%zu,\n",
+         off(&p0.epilogue.thread.op_1.op_0.op_0.ptr_row),
+         off(&p0.epilogue.thread.op_1.op_0.op_1.scalar_ptrs[0]),
+         off(&p0.epilogue.thread.op_1.op_1.scalar_ptrs[0]));
   printf("      \"mainloop_tensormaps\":%zu,\"epilogue_tensormaps\":%zu,\n", off_mtm, off_etm);
   printf("      \"tma_load_a\":%zu,\"tma_load_b\":%zu,\"tma_load_sfa\":%zu,\"tma_load_sfb\":%zu,\"tma_store_d\":%zu,\n",
          off(&p0.mainloop.tma_load_a.tma_desc_),
@@ -433,6 +492,8 @@ int main(int argc, char** argv) {
   emit_variant<moe_nvfp4::Nvfp4KernelN32>("n32", 32, sm_count);
   printf(",\n");
   emit_variant<moe_nvfp4::Nvfp4KernelN64>("n64", 64, sm_count);
+  printf(",\n");
+  emit_variant<moe_nvfp4::Nvfp4KernelN128>("n128", 128, sm_count);
   printf("\n}\n");
   return 0;
 }

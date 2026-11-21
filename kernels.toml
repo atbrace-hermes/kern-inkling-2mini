@@ -57,7 +57,7 @@ flags = "plain"
 includes = []
 
 [kernels."moe_swiglu_quant"]
-sha256 = "03987cfa9e028979114819344dc613b3ed9ce3155380847b0acec9301f5c93c1"
+sha256 = "1352afb8ea57ee16e2934e5512051883d99488c86f199c72ee8a1362a235296d"
 milestone = "M2"
 source = "source/moe_swiglu_quant.cu"
 flags = "plain"
@@ -71,7 +71,7 @@ flags = "plain"
 includes = []
 
 [kernels."moe_nvfp4_sm120"]
-sha256 = "65c74133f646ed6f40e45ef9c14b8a349ebb2622c0b4b6e3dd3466bbea363fb9"
+sha256 = "b61a97b5f018236f3a8787b28b347bf1635f2308c2a039f6f14661f264ba35c4"
 milestone = "M2"
 source = "source/moe_nvfp4_sm120.cu"
 flags = "cutlass_sm120"

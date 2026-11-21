@@ -348,6 +348,71 @@ extern "C" __global__ void __launch_bounds__(288) moe_swiglu_quant_nvfp4(
 #endif
 }
 
+// Softcapped SwiGLU (interleaved [gate, up] BF16, pre-scaled by NVFP4 EVT epilogue)
+// + NVFP4 fouroversix_mae quantization (N=1152).
+// N=1152 -> 72 blocks of 16, split=4 -> 288 threads (9 warps) per CTA, E=4 values/thread.
+// Grid: (min(n, 2048), 1, 1), Block: (288, 1, 1)
+extern "C" __global__ void __launch_bounds__(288) moe_swiglu_quant_nvfp4_bf16(
+    const __nv_bfloat16* __restrict__ w13_bf16,
+    const float* __restrict__ gammas,
+    const int* __restrict__ m_indptr,
+    uint8_t* __restrict__ values,
+    uint8_t* __restrict__ x_scales,
+    float* __restrict__ act_amax,
+    int n) {
+  constexpr int kThreads = 288;
+  constexpr int kSplit = 4;
+  constexpr int kE = 4;
+  constexpr int kScaleK = kInter / 16;  // 72
+
+  __shared__ int s_offsets[kNumExperts + 1];
+  __shared__ float red[2][kThreads / 32];
+
+#if (__CUDA_ARCH__ >= 900)
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+  load_offsets(m_indptr, s_offsets);
+  int const block = threadIdx.x / kSplit;
+  int const part = threadIdx.x % kSplit;
+  int const total_rows = s_offsets[kNumExperts];
+  int parity = 0;
+
+  for (int row = blockIdx.x; row < total_rows; row += gridDim.x, parity ^= 1) {
+    uint4 raw = *reinterpret_cast<const uint4*>(
+        w13_bf16 + int64_t(row) * (2 * kInter) + block * 32 + part * 8);
+    const __nv_bfloat16* h = reinterpret_cast<const __nv_bfloat16*>(&raw);
+    float gamma = gammas[row];
+
+    float v[kE];
+#pragma unroll
+    for (int i = 0; i < kE; ++i) {
+      float gate = __bfloat162float(h[2 * i]);
+      float up = __bfloat162float(h[2 * i + 1]);
+      v[i] = __bfloat162float(__float2bfloat16_rn(capped_swiglu(gate, up, gamma)));
+    }
+
+    float block_max = part_max<kE>(v);
+    float amax = block_max_reduce<kThreads>(block_max, red[parity]);
+    uint32_t packed;
+    uint8_t scale_bits;
+    quantize_part<kE>(v, amax, block_max, packed, scale_bits);
+
+    if (threadIdx.x == 0) act_amax[row] = amax;
+    uint8_t* dst = values + int64_t(row) * (kInter / 2) + block * 8 + part * 2;
+    *reinterpret_cast<uint16_t*>(dst) = uint16_t(packed);
+    if (part == 0) {
+      int expert = row_expert(s_offsets, row);
+      x_scales[scale_base(s_offsets, expert, kScaleK) +
+               scale_offset(row - s_offsets[expert], block, kScaleK)] = scale_bits;
+    }
+  }
+  zero_tails(s_offsets, x_scales, kScaleK);
+#if (__CUDA_ARCH__ >= 900)
+  __syncthreads();
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
+}
+
 // Gather & quantize BF16 x [T, 2304] into MXFP8 [n, 2304] + 128x4 swizzled UE8M0 scales.
 // K=2304 -> 144 half-blocks of 16 -> 160 threads (5 warps), active block < 144.
 // Grid: (min(n, 2048), 1, 1), Block: (160, 1, 1)

@@ -184,25 +184,25 @@ def register_buffers(
         put("moe.counts", "i32", [NUM_EXPERTS])
         put("moe.m_indptr", "i32", [NUM_EXPERTS + 1])
 
+        if use_nvfp4 or use_mxfp8:
+            put("moe.w13_out_bf16", "bf16", [token_axis, TOP_K, 2 * INTER_SIZE])
+            put("moe.w2_out_bf16", "bf16", [token_axis, TOP_K, HIDDEN_SIZE])
+
         if use_nvfp4:
             # Shared NVFP4 workspaces (Layers 0..19)
             put("moe.xq_nvfp4", "u8", [token_axis, TOP_K, HIDDEN_SIZE // 2])
             put("moe.xsf_nvfp4", "fp8e4m3", [sf_rows, HIDDEN_SIZE // NVFP4_GROUP])
             put("moe.x_amax", "f32", [token_axis, TOP_K])
-            put("moe.w13_out_f32", "f32", [token_axis, TOP_K, 2 * INTER_SIZE])
             put("moe.act_nvfp4", "u8", [token_axis, TOP_K, INTER_SIZE // 2])
             put("moe.act_sf_nvfp4", "fp8e4m3", [sf_rows, INTER_SIZE // NVFP4_GROUP])
             put("moe.act_amax", "f32", [token_axis, TOP_K])
-            put("moe.w2_out_f32", "f32", [token_axis, TOP_K, HIDDEN_SIZE])
 
         if use_mxfp8:
             # Shared MXFP8 workspaces (Layers 20..23)
             put("moe.xq_mxfp8", "fp8e4m3", [token_axis, TOP_K, HIDDEN_SIZE])
             put("moe.xsf_mxfp8", "u8", [sf_rows, HIDDEN_SIZE // MXFP8_GROUP])
-            put("moe.w13_out_bf16", "bf16", [token_axis, TOP_K, 2 * INTER_SIZE])
             put("moe.act_mxfp8", "fp8e4m3", [token_axis, TOP_K, INTER_SIZE])
             put("moe.act_sf_mxfp8", "u8", [sf_rows, INTER_SIZE // MXFP8_GROUP])
-            put("moe.w2_out_bf16", "bf16", [token_axis, TOP_K, HIDDEN_SIZE])
 
     layer_weights: dict[int, dict[str, str]] = {}
     for phys_idx in phys_range:
@@ -344,6 +344,10 @@ def _build_gemm_pack(
     add_field(off["layout_SFB"], 8, scratch="layout_SFB")
     add_field(off["ptr_D"], 8, scratch="D_ptr")
     add_field(off["dD"], 8, scratch="stride_D")
+    if is_nvfp4:
+        add_field(off["evt_row_scale_ptrs"], 8, scratch="x_amax_ptr")
+        add_field(off["evt_group_amax_ptr"], 8, param=7)  # w_amax [E]
+        add_field(off["evt_rcp_ptr"], 8, scratch="group_scale")  # rcp scalar [1]
     add_field(off["mainloop_tensormaps"], 8, scratch="main_ws")
     add_field(off["epilogue_tensormaps"], 8, scratch="epi_ws")
     add_field(off["hw_info_sm_count"], 4, i32=int(sm_count))
@@ -408,11 +412,11 @@ def _build_gemm_pack(
             off["tma_store_d"],
             128,
             tensormap={
-                "param": 4,  # D_out (>= 73,728 B at tokens=1)
-                "dtype": "f32",
+                "param": 4,  # D_out bf16 (>= 36,864 B at tokens=1)
+                "dtype": "bf16",
                 "dims": [128, tile_n],
-                "strides": [512],
-                "box": [32, 32],
+                "strides": [256],
+                "box": [64, 32],
                 "swizzle": 128,
                 "l2_promotion": 128,
             },
@@ -510,8 +514,11 @@ def _register_gemm_op(
             "in buffer<u8>",
             "in buffer<fp8e4m3>",
             "in buffer<fp8e4m3>",
-            "out buffer<f32>",
+            "out buffer<bf16>",
             "in buffer<i32>",
+            "in buffer<f32>",
+            "in buffer<f32>",
+            "in buffer<f32>",
             "i32",
             "i32",
             "i32",
@@ -550,24 +557,52 @@ def _register_gemm_op(
         "epi_ws": {"dtype": "u8", "shape": [epi_ws_bytes]},
         "main_ws": {"dtype": "u8", "shape": [main_ws_bytes]},
     }
-
-    prep_params = params + ["out buffer<u8>"] + ["out buffer<u64>"] * 5 + ["out buffer<u8>"] * 5
-    prep_args = [{"param": i} for i in range(len(params))] + [
-        {"scratch": s}
-        for s in (
-            "problem_sizes",
-            "A_ptr",
-            "B_ptr",
-            "SFA_ptr",
-            "SFB_ptr",
-            "D_ptr",
-            "stride_A",
-            "stride_B",
-            "stride_D",
-            "layout_SFA",
-            "layout_SFB",
+    if is_nvfp4:
+        scratch["x_amax_ptr"] = {"dtype": "u64", "shape": [NUM_EXPERTS]}
+        scratch["group_scale"] = {"dtype": "f32", "shape": [NUM_EXPERTS]}
+        prep_params = (
+            params
+            + ["out buffer<u8>"]
+            + ["out buffer<u64>"] * 6
+            + ["out buffer<f32>"]
+            + ["out buffer<u8>"] * 5
         )
-    ]
+        prep_args = [{"param": i} for i in range(len(params))] + [
+            {"scratch": s}
+            for s in (
+                "problem_sizes",
+                "A_ptr",
+                "B_ptr",
+                "SFA_ptr",
+                "SFB_ptr",
+                "D_ptr",
+                "x_amax_ptr",
+                "group_scale",
+                "stride_A",
+                "stride_B",
+                "stride_D",
+                "layout_SFA",
+                "layout_SFB",
+            )
+        ]
+    else:
+        prep_params = params + ["out buffer<u8>"] + ["out buffer<u64>"] * 5 + ["out buffer<u8>"] * 5
+        prep_args = [{"param": i} for i in range(len(params))] + [
+            {"scratch": s}
+            for s in (
+                "problem_sizes",
+                "A_ptr",
+                "B_ptr",
+                "SFA_ptr",
+                "SFB_ptr",
+                "D_ptr",
+                "stride_A",
+                "stride_B",
+                "stride_D",
+                "layout_SFA",
+                "layout_SFB",
+            )
+        ]
 
     launches: list[dict[str, Any]] = [
         {
@@ -599,11 +634,22 @@ def _register_gemm_op(
             entry_launch["when"] = when
         return entry_launch
 
-    if max_tokens <= 32:
-        launches.append(gemm_launch("n32", None))
+    if is_nvfp4 and "n128" in variants:
+        if max_tokens <= 256:
+            launches.append(gemm_launch("n32", None))
+        elif max_tokens <= 768:
+            launches.append(gemm_launch("n32", {"var": token_axis, "max": 256}))
+            launches.append(gemm_launch("n64", {"var": token_axis, "min": 257}))
+        else:
+            launches.append(gemm_launch("n32", {"var": token_axis, "max": 256}))
+            launches.append(gemm_launch("n64", {"var": token_axis, "min": 257, "max": 768}))
+            launches.append(gemm_launch("n128", {"var": token_axis, "min": 769}))
     else:
-        launches.append(gemm_launch("n32", {"var": token_axis, "max": 32}))
-        launches.append(gemm_launch("n64", {"var": token_axis, "min": 33}))
+        if max_tokens <= 32:
+            launches.append(gemm_launch("n32", None))
+        else:
+            launches.append(gemm_launch("n32", {"var": token_axis, "max": 32}))
+            launches.append(gemm_launch("n64", {"var": token_axis, "min": 33}))
 
     ops[op_name] = {
         "params": params,
@@ -858,12 +904,9 @@ def register_ops(
         simple_op(
             "moe_swiglu_quant_nvfp4",
             "moe_swiglu_quant",
-            "moe_swiglu_quant_nvfp4",
+            "moe_swiglu_quant_nvfp4_bf16",
             [
-                "in buffer<f32>",
-                "in buffer<f32>",
-                "in buffer<f32>",
-                "in buffer<f32>",
+                "in buffer<bf16>",
                 "in buffer<f32>",
                 "in buffer<i32>",
                 "out buffer<u8>",
@@ -917,25 +960,7 @@ def register_ops(
         )
 
     # 7. Combine kernels
-    if include_nvfp4:
-        simple_op(
-            "moe_combine_nvfp4",
-            "moe_combine",
-            "moe_combine_nvfp4",
-            [
-                "in buffer<f32>",
-                "in buffer<i32>",
-                "in buffer<f32>",
-                "in buffer<f32>",
-                "in buffer<f32>",
-                "in buffer<i32>",
-                "out buffer<bf16>",
-                "i32",
-            ],
-            [token_axis, 1, 1],
-            288,
-        )
-    if include_mxfp8:
+    if include_nvfp4 or include_mxfp8:
         simple_op(
             "moe_combine_bf16",
             "moe_combine",
@@ -1100,8 +1125,11 @@ def emit_moe_layer_calls(
                         _b(w["w13_weight"]),
                         _b("moe.xsf_nvfp4"),
                         _b(w["w13_scale"]),
-                        _b("moe.w13_out_f32"),
+                        _b("moe.w13_out_bf16"),
                         _b("moe.m_indptr"),
+                        _b("moe.x_amax"),
+                        _b(w["w13_amax"]),
+                        _b(w["w13_denom"]),
                         _i32(2 * INTER_SIZE),
                         _i32(HIDDEN_SIZE),
                         _i32(NUM_EXPERTS),
@@ -1111,10 +1139,7 @@ def emit_moe_layer_calls(
                     "label": f"{pfx}.swiglu_quant_nvfp4",
                     "op": "moe_swiglu_quant_nvfp4",
                     "args": [
-                        _b("moe.w13_out_f32"),
-                        _b("moe.x_amax"),
-                        _b(w["w13_amax"]),
-                        _b(w["w13_denom"]),
+                        _b("moe.w13_out_bf16"),
                         _b("moe.gammas"),
                         _b("moe.m_indptr"),
                         _b("moe.act_nvfp4"),
@@ -1131,8 +1156,11 @@ def emit_moe_layer_calls(
                         _b(w["w2_weight"]),
                         _b("moe.act_sf_nvfp4"),
                         _b(w["w2_scale"]),
-                        _b("moe.w2_out_f32"),
+                        _b("moe.w2_out_bf16"),
                         _b("moe.m_indptr"),
+                        _b("moe.act_amax"),
+                        _b(w["w2_amax"]),
+                        _b(w["w2_denom"]),
                         _i32(HIDDEN_SIZE),
                         _i32(INTER_SIZE),
                         _i32(NUM_EXPERTS),
@@ -1140,14 +1168,10 @@ def emit_moe_layer_calls(
                 },
                 {
                     "label": f"{pfx}.combine_nvfp4",
-                    "op": "moe_combine_nvfp4",
+                    "op": "moe_combine_bf16",
                     "args": [
-                        _b("moe.w2_out_f32"),
+                        _b("moe.w2_out_bf16"),
                         _b("moe.src2dst"),
-                        _b("moe.act_amax"),
-                        _b(w["w2_amax"]),
-                        _b(w["w2_denom"]),
-                        _b("moe.sorted_ids"),
                         _b(output_buf),
                         t_var,
                     ],
