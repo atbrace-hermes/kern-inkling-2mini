@@ -71,14 +71,14 @@ flags = "plain"
 includes = []
 
 [kernels."moe_nvfp4_sm120"]
-sha256 = "b61a97b5f018236f3a8787b28b347bf1635f2308c2a039f6f14661f264ba35c4"
+sha256 = "51df9d394b25d71f61272c08b551f08ee69ed09e682e671876b38d8d2671bca9"
 milestone = "M2"
 source = "source/moe_nvfp4_sm120.cu"
 flags = "cutlass_sm120"
 includes = ["cutlass"]
 
 [kernels."moe_mxfp8_sm120"]
-sha256 = "bc1b7db54dd99ed3b943c8bbc7e7957ace2b10bb9385ff2b23d397b5952be6b5"
+sha256 = "5be5203c9cf77d56321b4ee8fe33a5cc5fd4cb4f43bad4c7250177c40ee53db4"
 milestone = "M2"
 source = "source/moe_mxfp8_sm120.cu"
 flags = "cutlass_sm120"

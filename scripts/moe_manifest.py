@@ -634,22 +634,44 @@ def _register_gemm_op(
             entry_launch["when"] = when
         return entry_launch
 
+    lowm_entry = "moe_nvfp4_gemm_lowm" if is_nvfp4 else "moe_mxfp8_gemm_lowm"
+    lowm_launch: dict[str, Any] = {
+        "module": mod_name,
+        "entry": lowm_entry,
+        "params": params,
+        "grid": [sm_count * 4, 1, 1],
+        "block": [128, 1, 1],
+        "pdl": True,
+        "args": [{"param": i} for i in range(len(params))],
+    }
+
+    if max_tokens <= 32:
+        ops[op_name] = {
+            "params": params,
+            "impl": {"launches": [lowm_launch]},
+        }
+        return
+
+    lowm_launch["when"] = {"var": token_axis, "max": 32}
+    launches[0]["when"] = {"var": token_axis, "min": 33}
+    launches.insert(0, lowm_launch)
+
     if is_nvfp4 and "n128" in variants:
         if max_tokens <= 256:
-            launches.append(gemm_launch("n32", None))
+            launches.append(gemm_launch("n32", {"var": token_axis, "min": 33}))
         elif max_tokens <= 768:
-            launches.append(gemm_launch("n32", {"var": token_axis, "max": 256}))
+            launches.append(gemm_launch("n32", {"var": token_axis, "min": 33, "max": 256}))
             launches.append(gemm_launch("n64", {"var": token_axis, "min": 257}))
         else:
-            launches.append(gemm_launch("n32", {"var": token_axis, "max": 256}))
+            launches.append(gemm_launch("n32", {"var": token_axis, "min": 33, "max": 256}))
             launches.append(gemm_launch("n64", {"var": token_axis, "min": 257, "max": 768}))
             launches.append(gemm_launch("n128", {"var": token_axis, "min": 769}))
     else:
-        if max_tokens <= 32:
-            launches.append(gemm_launch("n32", None))
+        if max_tokens <= 256:
+            launches.append(gemm_launch("n32", {"var": token_axis, "min": 33}))
         else:
-            launches.append(gemm_launch("n32", {"var": token_axis, "max": 32}))
-            launches.append(gemm_launch("n64", {"var": token_axis, "min": 33}))
+            launches.append(gemm_launch("n32", {"var": token_axis, "min": 33, "max": 256}))
+            launches.append(gemm_launch("n64", {"var": token_axis, "min": 257}))
 
     ops[op_name] = {
         "params": params,

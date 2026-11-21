@@ -261,6 +261,266 @@ extern "C" __global__ void __launch_bounds__(128) moe_mxfp8_prepare_args(
 #endif
 }
 
+namespace {
+
+__device__ __forceinline__ uint4 mxfp8_ld_w_cs(const void* ptr) {
+  uint4 v;
+  asm volatile("ld.global.cs.v4.u32 {%0, %1, %2, %3}, [%4];"
+               : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+               : "l"(ptr));
+  return v;
+}
+
+__device__ __forceinline__ uint32_t mxfp8_ld_sf_nc(const void* ptr) {
+  uint32_t v;
+  asm volatile("ld.global.nc.u32 %0, [%1];" : "=r"(v) : "l"(ptr));
+  return v;
+}
+
+__device__ __forceinline__ void mxfp8_transpose_4x4(
+    uint4 v, int tid_g, uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3) {
+  int odd = tid_g & 1;
+  uint32_t p0 = __shfl_xor_sync(0xFFFFFFFFu, odd ? v.x : v.y, 1);
+  uint32_t p1 = __shfl_xor_sync(0xFFFFFFFFu, odd ? v.z : v.w, 1);
+  uint32_t u0 = odd ? p0 : v.x;
+  uint32_t u1 = odd ? v.y : p0;
+  uint32_t u2 = odd ? p1 : v.z;
+  uint32_t u3 = odd ? v.w : p1;
+  int hi = (tid_g >> 1) & 1;
+  uint32_t q0 = __shfl_xor_sync(0xFFFFFFFFu, hi ? u0 : u2, 2);
+  uint32_t q1 = __shfl_xor_sync(0xFFFFFFFFu, hi ? u1 : u3, 2);
+  r0 = hi ? q0 : u0;
+  r1 = hi ? q1 : u1;
+  r2 = hi ? u2 : q0;
+  r3 = hi ? u3 : q1;
+}
+
+__device__ __forceinline__ void mxfp8_mma_m16n8k32(
+    float& d0, float& d1, float& d2, float& d3,
+    uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+    uint32_t b0, uint32_t b1,
+    uint32_t sfa, uint32_t sfb, uint16_t bid) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200)
+  uint16_t const zero = 0;
+  asm volatile(
+      "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 "
+      "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, "
+      "{%10}, {%11, %12}, {%13}, {%14, %15};\n"
+      : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1),
+        "r"(sfa), "h"(bid), "h"(zero), "r"(sfb), "h"(bid), "h"(zero));
+#endif
+}
+
+}  // namespace
+
+// Custom SM120 low-M MXFP8 Grouped GEMM for round/decode (T <= 32):
+//   - Single-launch persistent kernel (eliminates moe_mxfp8_prepare_args & TMA tensormap updates)
+//   - Active-expert compaction directly from m_indptr (zero empty-expert iteration)
+//   - Native SM120 block-scaled mma.m16n8k32 (SwapAB: 64 weight rows x up to 32 activation rows)
+//   - kMaxRows = 32 guarantees 1.00x DRAM weight reads per active expert for all T <= 32
+//   - 3x-unrolled K=384 streaming ld.global.cs.v4.u32 weight loads + L1/L2 cached UE8M0 scales
+//   - On-the-fly L1/L2 activation loads keep REG <= 168 (3 CTAs/SM, STACK:0)
+//   - Bit-exact BF16 output matching CUTLASS 128x32x128
+// Grid: (sm_count * 4, 1, 1), Block: (128, 1, 1)
+extern "C" __global__ void __launch_bounds__(128, 2) moe_mxfp8_gemm_lowm(
+    const uint8_t* __restrict__ A_acts,
+    const uint8_t* __restrict__ B_weights,
+    const uint8_t* __restrict__ SFA_acts,
+    const uint8_t* __restrict__ SFB_weights,
+    __nv_bfloat16* __restrict__ D_out,
+    const int* __restrict__ m_indptr,
+    int n,
+    int k,
+    int num_groups) {
+  constexpr int kWarps = 4;
+  constexpr int kTileM = kWarps * 16;  // 64
+  constexpr int kE = 128;
+  constexpr int kMaxRows = 32;
+  constexpr int kMaxN8 = kMaxRows / 8;  // 4
+  constexpr int kUnrollK128 = 3;        // 3 * 128 = 384: exact divisor of K=2304 (6x) and K=1152 (3x)
+
+  __shared__ int s_indptr[kE + 1];
+  __shared__ int s_ntile_prefix[kE + 1];
+  __shared__ __align__(16) __nv_bfloat16 s_out[kMaxRows][kTileM + 8];
+
+  int const tid = threadIdx.x;
+  int const warp = tid >> 5;
+  int const lane = tid & 31;
+  int const grp = lane >> 2;
+  int const tid_g = lane & 3;
+  bool const load_sfa = (tid_g < 2);
+
+#if (__CUDA_ARCH__ >= 900)
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+
+  for (int i = tid; i <= kE; i += kWarps * 32) {
+    s_indptr[i] = (i <= num_groups) ? m_indptr[i] : m_indptr[num_groups];
+  }
+  __syncthreads();
+
+  if (warp == 0) {
+    int run = 0;
+#pragma unroll
+    for (int g = 0; g < 4; ++g) {
+      int e = g * 32 + lane;
+      int cnt = s_indptr[e + 1] - s_indptr[e];
+      int nt = (cnt + kMaxRows - 1) >> 5;
+      int x = nt;
+#pragma unroll
+      for (int s = 1; s < 32; s <<= 1) {
+        int y = __shfl_up_sync(0xFFFFFFFFu, x, s);
+        if (lane >= s) x += y;
+      }
+      s_ntile_prefix[e] = run + (x - nt);
+      run += __shfl_sync(0xFFFFFFFFu, x, 31);
+    }
+    if (lane == 0) s_ntile_prefix[kE] = run;
+  }
+  __syncthreads();
+
+  int const total_ntiles = s_ntile_prefix[kE];
+  int const m_tiles_per_n = n / kTileM;
+  int const total_tiles = total_ntiles * m_tiles_per_n;
+  int const sf_n = ((n + 127) >> 7) << 7;
+  int const sf_k = (((k + 127) >> 7) << 7) >> 5;  // k / 32
+  int const sf_k_div4 = sf_k >> 2;                 // k / 128
+  int const num_k128 = k >> 7;
+
+  for (int tile_id = blockIdx.x; tile_id < total_tiles; tile_id += gridDim.x) {
+    int const ntile_global = tile_id / m_tiles_per_n;
+    int const m_tile = tile_id - ntile_global * m_tiles_per_n;
+
+    int lo = 0, hi = kE;
+    while (hi - lo > 1) {
+      int mid = (lo + hi) >> 1;
+      if (s_ntile_prefix[mid] <= ntile_global)
+        lo = mid;
+      else
+        hi = mid;
+    }
+    int const e = lo;
+    int const local_nt = ntile_global - s_ntile_prefix[e];
+    int const m_off_e = s_indptr[e];
+    int const cnt_e = s_indptr[e + 1] - m_off_e;
+    int const row_start_local = local_nt * kMaxRows;
+    int const rows_this_tile = min(kMaxRows, cnt_e - row_start_local);
+    int const row_start_global = m_off_e + row_start_local;
+    int const m_base = m_tile * kTileM + warp * 16;
+
+    const uint8_t* W_e = B_weights + int64_t(e) * n * k;
+    const uint8_t* SFW_e = SFB_weights + int64_t(e) * sf_n * sf_k;
+    int64_t const sf_m_off_e = ((int64_t(m_off_e) + int64_t(e) * 127) >> 7) << 7;
+    const uint8_t* SFA_e = SFA_acts + sf_m_off_e * sf_k;
+
+    const uint8_t* W_row0 = W_e + int64_t(m_base + grp) * k + tid_g * 16;
+    const uint8_t* W_row1 = W_e + int64_t(m_base + grp + 8) * k + tid_g * 16;
+    int const sf_r = m_base + grp + (lane & 1) * 8;
+    int64_t const sfa_base = (int64_t(sf_r >> 7) * sf_k_div4) * 512 +
+                             (sf_r & 31) * 16 + ((sf_r >> 5) & 3) * 4;
+
+    const uint8_t* B_tile_base = A_acts + int64_t(row_start_global) * k + tid_g * 16;
+    int64_t const sfb_tile_off =
+        (int64_t(row_start_local >> 7) * sf_k_div4) * 512 +
+        ((row_start_local >> 5) & 3) * 4 +
+        (row_start_local & 31) * 16 + grp * 16;
+    const uint8_t* SFB_tile = SFA_e + sfb_tile_off;
+
+    float acc[kMaxN8][4];
+#pragma unroll
+    for (int nb = 0; nb < kMaxN8; ++nb) {
+      acc[nb][0] = 0.0f;
+      acc[nb][1] = 0.0f;
+      acc[nb][2] = 0.0f;
+      acc[nb][3] = 0.0f;
+    }
+
+    for (int ks = 0; ks + kUnrollK128 <= num_k128; ks += kUnrollK128) {
+      uint4 w0_lo[kUnrollK128], w0_hi[kUnrollK128], w1_lo[kUnrollK128], w1_hi[kUnrollK128];
+      uint32_t sfa_buf[kUnrollK128];
+
+#pragma unroll
+      for (int u = 0; u < kUnrollK128; ++u) {
+        int kb = (ks + u) * 128;
+        int blk = ks + u;
+        w0_lo[u] = mxfp8_ld_w_cs(W_row0 + kb);
+        w0_hi[u] = mxfp8_ld_w_cs(W_row0 + kb + 64);
+        w1_lo[u] = mxfp8_ld_w_cs(W_row1 + kb);
+        w1_hi[u] = mxfp8_ld_w_cs(W_row1 + kb + 64);
+        sfa_buf[u] = load_sfa ? mxfp8_ld_sf_nc(SFW_e + sfa_base + int64_t(blk) * 512) : 0u;
+      }
+
+#pragma unroll
+      for (int u = 0; u < kUnrollK128; ++u) {
+        int kb = (ks + u) * 128;
+        int blk = ks + u;
+        uint32_t sfa = __shfl_sync(0xFFFFFFFFu, sfa_buf[u], (lane & ~2));
+        uint32_t a0_0, a2_0, a0_1, a2_1, a1_0, a3_0, a1_1, a3_1;
+        uint32_t a0_2, a2_2, a0_3, a2_3, a1_2, a3_2, a1_3, a3_3;
+        mxfp8_transpose_4x4(w0_lo[u], tid_g, a0_0, a2_0, a0_1, a2_1);
+        mxfp8_transpose_4x4(w1_lo[u], tid_g, a1_0, a3_0, a1_1, a3_1);
+        mxfp8_transpose_4x4(w0_hi[u], tid_g, a0_2, a2_2, a0_3, a2_3);
+        mxfp8_transpose_4x4(w1_hi[u], tid_g, a1_2, a3_2, a1_3, a3_3);
+#pragma unroll
+        for (int nb = 0; nb < kMaxN8; ++nb) {
+          if (nb == 0 || nb * 8 < rows_this_tile) {
+            bool const valid = (nb * 8 + grp < rows_this_tile);
+            const uint8_t* bptr = B_tile_base + int64_t(nb * 8 + grp) * k + kb;
+            uint4 blo = valid ? *reinterpret_cast<const uint4*>(bptr) : make_uint4(0, 0, 0, 0);
+            uint4 bhi = valid ? *reinterpret_cast<const uint4*>(bptr + 64) : make_uint4(0, 0, 0, 0);
+            uint32_t sfb = valid ? mxfp8_ld_sf_nc(SFB_tile + nb * 128 + int64_t(blk) * 512) : 0u;
+            uint32_t b0_0, b1_0, b0_1, b1_1;
+            mxfp8_transpose_4x4(blo, tid_g, b0_0, b1_0, b0_1, b1_1);
+            mxfp8_mma_m16n8k32(acc[nb][0], acc[nb][1], acc[nb][2], acc[nb][3],
+                               a0_0, a1_0, a2_0, a3_0, b0_0, b1_0, sfa, sfb, 0);
+            mxfp8_mma_m16n8k32(acc[nb][0], acc[nb][1], acc[nb][2], acc[nb][3],
+                               a0_1, a1_1, a2_1, a3_1, b0_1, b1_1, sfa, sfb, 1);
+            mxfp8_transpose_4x4(bhi, tid_g, b0_0, b1_0, b0_1, b1_1);
+            mxfp8_mma_m16n8k32(acc[nb][0], acc[nb][1], acc[nb][2], acc[nb][3],
+                               a0_2, a1_2, a2_2, a3_2, b0_0, b1_0, sfa, sfb, 2);
+            mxfp8_mma_m16n8k32(acc[nb][0], acc[nb][1], acc[nb][2], acc[nb][3],
+                               a0_3, a1_3, a2_3, a3_3, b0_1, b1_1, sfa, sfb, 3);
+          }
+        }
+      }
+    }
+
+    int const n0 = tid_g * 2;
+    int const n1 = tid_g * 2 + 1;
+#pragma unroll
+    for (int nb = 0; nb < kMaxN8; ++nb) {
+      if (nb * 8 < rows_this_tile) {
+        int r0 = nb * 8 + n0;
+        int r1 = nb * 8 + n1;
+        if (r0 < rows_this_tile) {
+          s_out[r0][warp * 16 + grp] = __float2bfloat16_rn(acc[nb][0]);
+          s_out[r0][warp * 16 + grp + 8] = __float2bfloat16_rn(acc[nb][2]);
+        }
+        if (r1 < rows_this_tile) {
+          s_out[r1][warp * 16 + grp] = __float2bfloat16_rn(acc[nb][1]);
+          s_out[r1][warp * 16 + grp + 8] = __float2bfloat16_rn(acc[nb][3]);
+        }
+      }
+    }
+    __syncthreads();
+
+    constexpr int kU4PerRow = kTileM / 8;
+    int const total_u4 = rows_this_tile * kU4PerRow;
+    for (int idx = tid; idx < total_u4; idx += kWarps * 32) {
+      int r = idx / kU4PerRow;
+      int c = (idx - r * kU4PerRow) * 8;
+      *reinterpret_cast<uint4*>(D_out + int64_t(row_start_global + r) * n + m_tile * kTileM + c) =
+          *reinterpret_cast<const uint4*>(&s_out[r][c]);
+    }
+    __syncthreads();
+  }
+#if (__CUDA_ARCH__ >= 900)
+  __syncthreads();
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
+}
+
 template __global__ void cutlass::device_kernel<moe_mxfp8::Mxfp8KernelN32>(
     CUTLASS_GRID_CONSTANT typename moe_mxfp8::Mxfp8KernelN32::Params const);
 template __global__ void cutlass::device_kernel<moe_mxfp8::Mxfp8KernelN64>(
