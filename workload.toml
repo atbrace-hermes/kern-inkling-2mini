@@ -1,0 +1,262 @@
+# Optimization workload for Inkling-2-Mini (text-only + DSpark MTP, SM120).
+#
+# Adapted from one full day of public agent-service traces recorded by kern-serve
+# (deploy/traces/20261120T053526Z, 2026-11-20, 36 rank-0 files, 394,719 steps,
+# 29,661.0 s traced GPU step time; top buckets covering 99.7% of step time):
+#
+#   1. Speculative rounds: Qwen3.8 DSpine 16-row rounds -> Inkling-2-Mini DSpark
+#      8-row rounds (`rows = [8]`), keeping the traced call counts per bucket
+#      (20 buckets across groups 1, 2, 4, 8; 348,447 steps = 99.90% of rounds).
+#      The 73-step groups=16 tail (0.02%) is omitted to match `seqs <= 8`.
+#   2. Full prefill chunks: Inkling-2-Mini serves with `--chunk 2048` (manifest
+#      `tokens <= 2048`), so the 9 full `chunk = 1024` buckets (44,452 steps,
+#      45.52M tokens) are repacked into 8 `chunk = 2048` buckets (22,228 steps,
+#      45.52M tokens — preserving total prefill tokens and context distribution).
+#   3. Partial prefill chunks: kept the top 4 mid-size tails (`512, 385, 200`)
+#      plus the top short tail (`chunk = 51`) so every manifest `when` branch is
+#      exercised (`moe_route_metadata` <=1024 / >=1025, `moe_*_gemm` <=32 / >=33,
+#      `attn_full_prefill` <=64 / >=65, `attn_*_decode` seqs=1 / >=2) as well as
+#      both sides of the SWA window (`W = 1024`).
+#
+# Plan footprint: 33 scenarios, 0 dropped, 762,176 KV tokens (13.08 GiB FP8 KV)
+# and 9 seq slots (~0.8 GiB SWA/sconv state) — fits comfortably on 72 GB VRAM,
+# including multi-candidate `kern bench --candidate` runs.
+samples = 16
+seed = 24301
+
+# --- Prefill: full 2048-row chunks (8 buckets, 22,228 calls = 45.52M tokens) ---
+
+# prefill · full chunk · kv<=128k (from 13,372 x 1024)
+[[sweep]]
+groups = [1]
+chunk = [2048]
+context = [88594]
+weight = 6686
+
+# prefill · full chunk · kv<=64k (from 13,546 x 1024)
+[[sweep]]
+groups = [1]
+chunk = [2048]
+context = [47975]
+weight = 6773
+
+# prefill · full chunk · kv<=32k (from 7,985 x 1024)
+[[sweep]]
+groups = [1]
+chunk = [2048]
+context = [23937]
+weight = 3993
+
+# prefill · full chunk · kv<=16k (from 3,932 x 1024)
+[[sweep]]
+groups = [1]
+chunk = [2048]
+context = [11788]
+weight = 1966
+
+# prefill · full chunk · kv<=256k (from 1,357 x 1024)
+[[sweep]]
+groups = [1]
+chunk = [2048]
+context = [152749]
+weight = 679
+
+# prefill · full chunk · kv<=8k (from 1,991 x 1024)
+[[sweep]]
+groups = [1]
+chunk = [2048]
+context = [5614]
+weight = 996
+
+# prefill · full chunk · kv<=4k (from 1,038 x 1024)
+[[sweep]]
+groups = [1]
+chunk = [2048]
+context = [2557]
+weight = 519
+
+# prefill · full cold chunk · kv<=2k (from 698@0 + 533@1023 x 1024)
+[[sweep]]
+groups = [1]
+chunk = [2048]
+context = [0]
+weight = 616
+
+# --- Prefill: partial / tail chunks (5 buckets, exercises tokens<=1024 and <=64) ---
+
+# prefill · mid tail · kv<=128k
+[[sweep]]
+groups = [1]
+chunk = [385]
+context = [96604]
+weight = 171
+
+# prefill · short cold prompt · kv<=512 (inside SWA window)
+[[sweep]]
+groups = [1]
+chunk = [512]
+context = [0]
+weight = 126
+
+# prefill · short-mid tail · kv<=128k
+[[sweep]]
+groups = [1]
+chunk = [200]
+context = [99530]
+weight = 105
+
+# prefill · mid tail · kv<=256k
+[[sweep]]
+groups = [1]
+chunk = [385]
+context = [151325]
+weight = 36
+
+# prefill · tiny tool-result extend · kv<=128k (exercises attn_full_prefill tokens<=64)
+[[sweep]]
+groups = [1]
+chunk = [51]
+context = [100745]
+weight = 88
+
+# --- DSpark speculative rounds (20 buckets, rows=8, groups 1/2/4/8) ---
+
+# round · g=4, tokens=32 · kv<=256k (moe_*_gemm tokens<=32 boundary)
+[[sweep]]
+groups = [4]
+rows = [8]
+context = [52801]
+weight = 78248
+
+# round · g=2, tokens=16 · kv<=256k
+[[sweep]]
+groups = [2]
+rows = [8]
+context = [91032]
+weight = 60868
+
+# round · g=2, tokens=16 · kv<=128k
+[[sweep]]
+groups = [2]
+rows = [8]
+context = [52640]
+weight = 54380
+
+# round · g=4, tokens=32 · kv<=512k
+[[sweep]]
+groups = [4]
+rows = [8]
+context = [82619]
+weight = 33295
+
+# round · g=1, tokens=8 · kv<=256k
+[[sweep]]
+groups = [1]
+rows = [8]
+context = [151704]
+weight = 33919
+
+# round · g=1, tokens=8 · kv<=128k
+[[sweep]]
+groups = [1]
+rows = [8]
+context = [107616]
+weight = 34805
+
+# round · g=8, tokens=64 · kv<=512k (exercises moe_*_gemm tokens>=33)
+[[sweep]]
+groups = [8]
+rows = [8]
+context = [49181]
+weight = 7066
+
+# round · g=8, tokens=64 · kv<=1M
+[[sweep]]
+groups = [8]
+rows = [8]
+context = [76145]
+weight = 5305
+
+# round · g=2, tokens=16 · kv<=64k
+[[sweep]]
+groups = [2]
+rows = [8]
+context = [25122]
+weight = 7634
+
+# round · g=4, tokens=32 · kv<=128k
+[[sweep]]
+groups = [4]
+rows = [8]
+context = [29189]
+weight = 5348
+
+# round · g=1, tokens=8 · kv<=64k
+[[sweep]]
+groups = [1]
+rows = [8]
+context = [52510]
+weight = 6258
+
+# round · g=1, tokens=8 · kv<=2k
+[[sweep]]
+groups = [1]
+rows = [8]
+context = [1453]
+weight = 6044
+
+# round · g=1, tokens=8 · kv<=4k
+[[sweep]]
+groups = [1]
+rows = [8]
+context = [2970]
+weight = 5859
+
+# round · g=2, tokens=16 · kv<=512k
+[[sweep]]
+groups = [2]
+rows = [8]
+context = [139508]
+weight = 2461
+
+# round · g=1, tokens=8 · kv<=8k
+[[sweep]]
+groups = [1]
+rows = [8]
+context = [5363]
+weight = 2955
+
+# round · g=1, tokens=8 · kv<=1k (inside SWA window W=1024)
+[[sweep]]
+groups = [1]
+rows = [8]
+context = [809]
+weight = 2382
+
+# round · g=8, tokens=64 · kv<=256k
+[[sweep]]
+groups = [8]
+rows = [8]
+context = [26857]
+weight = 329
+
+# round · g=1, tokens=8 · kv<=16k
+[[sweep]]
+groups = [1]
+rows = [8]
+context = [11069]
+weight = 609
+
+# round · g=1, tokens=8 · kv<=32k
+[[sweep]]
+groups = [1]
+rows = [8]
+context = [26628]
+weight = 535
+
+# round · g=4, tokens=32 · kv<=1M
+[[sweep]]
+groups = [4]
+rows = [8]
+context = [131747]
+weight = 147

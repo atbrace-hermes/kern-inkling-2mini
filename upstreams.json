@@ -1,0 +1,44 @@
+{
+  "_schema_note": "Maps repo-relative file paths to {repository, revision, path, original_sha256, adaptation}",
+  "third_party/flashinfer": {
+    "repository": "https://github.com/flashinfer-ai/flashinfer",
+    "revision": "023a8474e1f7469572c0d4284535fc6ffa699574",
+    "path": "."
+  },
+  "source/unembed_sample.cu": {
+    "repository": "local:kern-qwen38 + refs/sglang",
+    "revision": "023a8474e1f7469572c0d4284535fc6ffa699574",
+    "path": "kern-qwen38/source/{embedding.cu,argmax.cu,sample_glue.cu,copy_rows.cu}",
+    "original_sha256": {
+      "embedding.cu": "308055a660674f154b5822a6a470be40e09d3993944b0bef9d49cdee2f41a270",
+      "argmax.cu": "5e77a607e3673cddc8ae35c2a104bb501c7474b23b3c5c406e068b92a76b88e3",
+      "sample_glue.cu": "aea05bfebb9d432163dab6d99dea8b0e3b52241e5c411c827d2dd748c6273b0a",
+      "copy_rows.cu": "7fe6564f79c9fa5779f45072c28aa380b4195d40ae2f52e7c92211fe276e9306"
+    },
+    "adaptation": "Combined kern_embedding_bf16 (from embedding.cu with bounds __trap()), kern_last_row_bf16 (from copy_rows.cu), FP32 two-stage argmax (adapted from argmax.cu to f32 logits), kern_sample_copy_f32 (adapted from kern_sample_cast_bf16), and kern_softcap_tanh_mask_f32 (30*tanh(x/30) + >=200058 -> -inf)"
+  },
+  "scripts/build.py": {
+    "repository": "local:kern-qwen38 + kern-k31",
+    "path": "kern-k31/scripts/build.py + kern-qwen38/scripts/build.py",
+    "original_sha256": {
+      "kern-qwen38/scripts/build.py": "f4106aa6273ee9fd9e6df63e27a1fc04fd5afd5d90eb125d61f74adff17fb4dd"
+    },
+    "adaptation": "SM120 declarative kernels.toml builder with --milestone, --update, cuobjdump metadata extraction, and merge-updated build/sm_120/build.json"
+  },
+  "scripts/build_dsl.py": {
+    "repository": "local:kern-qwen38",
+    "path": "kern-qwen38/scripts/build_dsl.py",
+    "original_sha256": {
+      "kern-qwen38/scripts/build_dsl.py": "90138c221b67f9e765c1e57bae7194467e3d029d5790fd2a8985bc8b4f453c83"
+    },
+    "adaptation": "Triton 3.8.0 GPUTarget('cuda', 120, 32) -> sm_120a AOT builder with --milestone and non-destructive merge-updated build/sm_120/dsl.json"
+  },
+  "scripts/inspect_checkpoint.py": {
+    "repository": "local:kern-qwen38",
+    "path": "kern-qwen38/scripts/inspect_checkpoint.py",
+    "original_sha256": {
+      "kern-qwen38/scripts/inspect_checkpoint.py": "7ddc9f686b3c271c6f6780298c6a6193cfd667b5425d0bf76da36e4ff09e61a2"
+    },
+    "adaptation": "Adapted for Inkling-2-Mini text-only + DSpark MTP (excluding model.visual.* while verifying payload bounds, validating hf_quant_config.json + NVFP4 L0-19 / MXFP8 L20-23 + mtp.safetensors)"
+  }
+}

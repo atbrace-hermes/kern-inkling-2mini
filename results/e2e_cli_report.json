@@ -1,0 +1,18 @@
+{
+  "mode": "live",
+  "phase_mode": "cli",
+  "tier": "all",
+  "base_url": "http://127.0.0.1:8000",
+  "returncode": 0,
+  "pytest_returncode": 0,
+  "ok": true,
+  "tier4_skipped": 0,
+  "duration_s": 114.652,
+  "summary": {
+    "tests": 8,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0,
+    "passed": 8
+  }
+}

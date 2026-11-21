@@ -1,0 +1,39 @@
+# Storage and compute precision policy for Inkling-2-Mini (text-only + DSpark MTP) on SM120.
+[target]
+architecture = "sm_120a"
+device = "NVIDIA RTX PRO 5000 72GB Blackwell"
+checkpoint = "/workspace/weights/Inkling-2-Mini"
+model_type = "inkling2_loop"
+
+[weights]
+non_expert = "bf16"
+norms_and_controllers_bias_gates = "bf16"
+attn_res_and_router_bias = "fp32"
+moe_layers_0_19 = "nvfp4_e2m1"          # uint8 packed + fp8e4m3 block16 scale + fp32 amax/outer_scale
+moe_layers_0_19_scale_rule = "fouroversix_mae"
+moe_layers_20_23 = "mxfp8_e4m3"         # fp8e4m3 + ue8m0 block32 scale
+mtp = "bf16"
+exclude_prefixes = ["model.visual."]
+
+[kv_cache]
+# 8 target full-attention visits (phys 5,11,17,23 x visits) + 1 MTP full layer = 9 full layers.
+full_storage = "fp8_e4m3"
+scale_dtype = "fp32"
+scale_granularity = "per_visit_k_v"
+# 40 target SWA (W=1024) visits + 2 MTP SWA layers stored in per-seq ring (bytes_per_seq).
+swa_storage = "fp8_e4m3"
+reference_storage = "bf16"
+
+[state]
+# 48 target sconv visits (W=4, 4 streams: k, v, attn, mlp) + MTP rollback/commit staging.
+sconv_storage = "bf16"
+sconv_accumulation = "fp32"
+markov_rnn_storage = "bf16"
+markov_rnn_accumulation = "fp32"
+
+[compute]
+residual = "bf16"
+normalization_accumulation = "fp32"
+softmax_accumulation = "fp32"
+loop_controller_accumulation = "fp32"   # no-FMA gated merge
+unembed_accumulation = "fp32"           # cublas_bf16_tn_f32 + fp32 softcap 30*tanh(x/30)
