@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# loop/make [OUT] [--all]: CPU-only incremental build of changed CUDA/Triton/DSpark kernels,
+# manifest assembly via scripts/gen.py, and static verification via kern verify.
+set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
+
+build_all=""
+out_arg=""
+for arg in "$@"; do
+  if [[ "$arg" == "--all" ]]; then
+    build_all="--all"
+  elif [[ -z "$out_arg" ]]; then
+    out_arg="$arg"
+  else
+    echo "Usage: loop/make [OUT] [--all]" >&2
+    exit 2
+  fi
+done
+
+out=$(realpath -m "${out_arg:-$TREE/out/inkling-2-mini}")
+cd "$TREE"
+
+"$PY" "$LOOP/build_changed.py" --tree "$TREE" --main "$MAIN" --py "$PY" --nvcc "$NVCC" $build_all
+"$PY" scripts/gen.py --checkpoint "$WEIGHTS" --kernels "$TREE/build/sm_120" --kv-scales "$KV_SCALES" --out "$out"
+"$KERN" verify "$out/model.json" > "$out/verify.log" 2>&1 || { cat "$out/verify.log"; exit 1; }
+echo "make: $out"

@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# loop/ab A B OUT [PAIRS]: interleaved A/B benchmark under one GPU lease over workload.toml
+# and loop/guard.toml. Default PAIRS=1 for quick worker checks (use PAIRS=2 for landing gate).
+# Last line is JSON verdict: {a, b, change_pct, guard_worst, guard_pct, win}.
+set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
+
+a=$(realpath "$1")
+b=$(realpath "$2")
+out=$(realpath -m "$3")
+n=${4:-1}
+rm -rf "$out" && mkdir -p "$out"
+
+run() {
+  local bundle=$1 tag=$2 workload=$3
+  local wdir="$bundle/weights_inkling_1m"
+  [[ -d "$wdir" ]] || wdir="$STATE/main/bundle/weights_inkling_1m"
+  "$KERN" bench \
+    --manifest "$bundle/model.json" \
+    --kernels "$bundle/kernels" \
+    --weights "$wdir" \
+    --tokenizer "$wdir/tokenizer.json" \
+    --gpu 0 \
+    --workload "$workload" \
+    --out "$out/$tag.json" > "$out/$tag.log" 2>&1 \
+    || { echo "ab: $tag failed:" >&2; tail -25 "$out/$tag.log" >&2; return 1; }
+}
+
+sides() {
+  for i in $(seq 1 "$n"); do
+    local order="a b"
+    ((i % 2)) || order="b a"
+    for s in $order; do
+      local bundle=$a
+      [[ $s == b ]] && bundle=$b
+      run "$bundle" "$s-$i" "$MAIN/workload.toml"
+      run "$bundle" "g$s-$i" "$LOOP/guard.toml"
+    done
+  done
+}
+
+export -f run sides
+export a b out n
+"$LOOP/withgpu" bash -euo pipefail -c sides
+"$PY" "$LOOP/score.py" ab "$out"

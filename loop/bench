@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# loop/bench BUNDLE OUT [WORKLOAD]: kern bench of BUNDLE over WORKLOAD (default workload.toml)
+# under loop/withgpu. Writes OUT.json and OUT.log and prints p50s + weighted GPU-seconds cost.
+set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
+
+bundle=$(realpath "$1")
+out=$(realpath -m "$2")
+workload=$(realpath "${3:-$MAIN/workload.toml}")
+mkdir -p "$(dirname "$out")"
+
+weights_dir="$bundle/weights_inkling_1m"
+[[ -d "$weights_dir" ]] || weights_dir="$STATE/main/bundle/weights_inkling_1m"
+
+"$LOOP/withgpu" "$KERN" bench \
+  --manifest "$bundle/model.json" \
+  --kernels "$bundle/kernels" \
+  --weights "$weights_dir" \
+  --tokenizer "$weights_dir/tokenizer.json" \
+  --gpu 0 \
+  --workload "$workload" \
+  --out "$out.json" > "$out.log" 2>&1 || { tail -25 "$out.log"; exit 1; }
+
+"$PY" "$LOOP/score.py" show "$out.json"

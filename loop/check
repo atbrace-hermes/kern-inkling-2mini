@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# loop/check BUNDLE OUT [BASE]: numerics gate via kern test comparing BUNDLE against BASE
+# (default $STATE/main/bundle) under loop/withgpu. Uses the +candidate module-rename trick so
+# rebuilt cubins with unchanged names are always diffed and replayed.
+# Writes OUT.json and OUT.log; exits 0 PASS, 1 FAIL, 2 INCONCLUSIVE.
+set -uo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
+
+cand=$(realpath "$1")
+out=$(realpath -m "$2")
+base=$(realpath "${3:-$STATE/main/bundle}")
+mkdir -p "$(dirname "$out")"
+
+work=$out.d
+rm -rf "$work" && mkdir -p "$work/kernels"
+cp "$base"/kernels/*.cubin "$work/kernels/"
+
+"$PY" - "$base/model.json" "$cand" "$work" <<'PY'
+import json, shutil, sys
+from pathlib import Path
+
+base = json.load(open(sys.argv[1]))
+cand = Path(sys.argv[2])
+work = Path(sys.argv[3])
+m = json.load(open(cand / "model.json"))
+
+changed = {
+    k for k, v in m["modules"].items()
+    if base["modules"].get(k, {}).get("sha256") != v["sha256"]
+}
+for k in changed:
+    src = cand / "kernels" / m["modules"][k]["source"]
+    dst_name = f"{k}+candidate.cubin"
+    shutil.copyfile(src, work / "kernels" / dst_name)
+    m["modules"][k]["source"] = dst_name
+
+m["modules"] = {(f"{k}+candidate" if k in changed else k): v for k, v in m["modules"].items()}
+
+def rename_modules(obj):
+    if isinstance(obj, dict):
+        if "module" in obj and obj["module"] in changed:
+            obj["module"] = f"{obj['module']}+candidate"
+        for v in obj.values():
+            rename_modules(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            rename_modules(v)
+
+rename_modules(m["ops"])
+json.dump(m, open(work / "model.json", "w"))
+print("modules changed:", ", ".join(sorted(changed)) or "none")
+PY
+
+weights_dir="$cand/weights_inkling_1m"
+[[ -d "$weights_dir" ]] || weights_dir="$base/weights_inkling_1m"
+
+capacity=${KERN_CHECK_CAPACITY:-32768}
+
+"$LOOP/withgpu" "$KERN" test \
+  --capacity "$capacity" \
+  --reference "$base/model.json" \
+  --manifest "$work/model.json" \
+  --kernels "$work/kernels" \
+  --weights "$weights_dir" \
+  --tokenizer "$weights_dir/tokenizer.json" \
+  --gpu 0 \
+  --out "$out.json" > "$out.log" 2>&1
+rc=$?
+grep -E "logit|KL|flip|noise|PASS|FAIL|INCONCLUSIVE" "$out.log" | tail -8 || true
+tail -n 1 "$out.log" || true
+exit $rc

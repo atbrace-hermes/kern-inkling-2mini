@@ -1,0 +1,22 @@
+# Compact guard sweep covering non-primary shapes admitted by Inkling-2-Mini's manifest.
+# loop/ab holds every scenario here to <= +2.0% regression vs main.
+samples = 12
+seed = 24301
+
+# Speculative rounds across all batch sizes (groups=1,2,3,4,6,8) at short & mid context
+[[sweep]]
+groups = [1, 2, 3, 4, 6, 8]
+rows = [8]
+context = [512, 8192]
+
+# Plain decode (rows=1) across small/mid/full batch
+[[sweep]]
+groups = [1, 4, 8]
+rows = [1]
+context = [512]
+
+# Prefill chunks across the full admitted range [1..2048] at cold & 16k context
+[[sweep]]
+groups = [1]
+chunk = [1, 16, 64, 256, 512, 1024, 2048]
+context = [0, 16384]
