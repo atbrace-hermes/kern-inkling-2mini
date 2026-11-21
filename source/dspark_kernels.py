@@ -9,6 +9,15 @@ try:
 except ImportError:  # pragma: no cover
     from triton.language.extra.cuda import libdevice as tldevice
 
+_EX2_ASM = tl.constexpr("ex2.approx.ftz.f32 $0, $1;")
+
+
+@triton.jit
+def _ex2(x):
+    return tl.inline_asm_elementwise(
+        _EX2_ASM, "=f,f", [x], dtype=tl.float32, is_pure=True, pack=1
+    )
+
 
 @triton.jit
 def _mix_rmsnorm_kernel(
@@ -402,75 +411,169 @@ def _dspark_attn_paged_kernel(
     seq = tl.program_id(1)
 
     seqlen_k = tl.load(Lengths + seq)
-    prefix = tl.maximum(seqlen_k - BLOCK_SIZE, 0)
-
     rows = tl.arange(0, BLOCK_M)
     tok = rows // G
-    row_valid = (tok < BLOCK_SIZE) & (seqlen_k > 0)
     head = kv_head * G + (rows % G)
     token = (seq * BLOCK_SIZE + tok).to(tl.int64)
+    row_store = tok < BLOCK_SIZE
     offs_d = tl.arange(0, D)
+
+    if seqlen_k <= 0:
+        z = tl.zeros([BLOCK_M, D], tl.float32)
+        if MODE_PARTIAL:
+            part = (split.to(tl.int64) * num_tokens + token) * H + head
+            part_mask = row_store & (token < num_tokens)
+            tl.store(Lse + part, tl.full([BLOCK_M], float("-inf"), tl.float32), mask=part_mask)
+            tl.store(Out + part[:, None] * D + offs_d[None, :], z, mask=part_mask[:, None])
+        else:
+            tl.store(
+                Out + token[:, None] * stride_out_t + head[:, None] * D + offs_d[None, :],
+                z.to(Out.dtype.element_ty),
+                mask=row_store[:, None],
+            )
+        return
+
+    prefix = tl.maximum(seqlen_k - BLOCK_SIZE, 0)
+    num_live = seqlen_k - prefix
+    n_prefix_tiles = tl.cdiv(prefix, BLOCK_N)
+    do_live = split == (num_splits - 1)
+
+    # Balanced contiguous partition of prefix tiles across splits.
+    base_tiles = n_prefix_tiles // num_splits
+    rem_tiles = n_prefix_tiles % num_splits
+    tile_start = split * base_tiles + tl.minimum(split, rem_tiles)
+    tile_count = base_tiles + tl.where(split < rem_tiles, 1, 0)
+    tile_end = tile_start + tile_count
+
+    if (tile_count == 0) & (not do_live):
+        z = tl.zeros([BLOCK_M, D], tl.float32)
+        if MODE_PARTIAL:
+            part = (split.to(tl.int64) * num_tokens + token) * H + head
+            part_mask = row_store & (token < num_tokens)
+            tl.store(Lse + part, tl.full([BLOCK_M], float("-inf"), tl.float32), mask=part_mask)
+            tl.store(Out + part[:, None] * D + offs_d[None, :], z, mask=part_mask[:, None])
+        else:
+            tl.store(
+                Out + token[:, None] * stride_out_t + head[:, None] * D + offs_d[None, :],
+                z.to(Out.dtype.element_ty),
+                mask=row_store[:, None],
+            )
+        return
 
     q = tl.load(
         Q + token[:, None] * stride_q_t + head[:, None] * D + offs_d[None, :],
-        mask=row_valid[:, None],
+        mask=row_store[:, None],
         other=0.0,
     )
 
-    n_hi = (seqlen_k + BLOCK_N - 1) // BLOCK_N
-    num_iters = tl.maximum(n_hi - split + num_splits - 1, 0) // num_splits
-
-    qk_scale = softmax_scale * LOG2E
+    qk_scale_old = softmax_scale * k_scale * LOG2E
     m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
     l_i = tl.zeros([BLOCK_M], tl.float32)
     acc = tl.zeros([BLOCK_M, D], tl.float32)
 
     bt = BlockTable + seq.to(tl.int64) * stride_bt
     offs_n = tl.arange(0, BLOCK_N)
+    full_prefix_tiles = prefix // BLOCK_N
+    full_end = tl.maximum(tile_start, tl.minimum(tile_end, full_prefix_tiles))
+    has_partial = (tile_start <= full_prefix_tiles) & (full_prefix_tiles < tile_end)
 
-    for i in range(num_iters):
-        n = split + i * num_splits
-        keys = n * BLOCK_N + offs_n
-        in_range = keys < seqlen_k
-        is_old = in_range & (keys < prefix)
-        is_live = in_range & (keys >= prefix)
+    kv_slot_s = tl.multiple_of(kv_slot_stride, 16)
+    kv_page_s = tl.multiple_of(kv_page_stride, 16)
+    kv_v_off = tl.multiple_of(kv_v_offset, 16)
+    kv_head_off = tl.multiple_of(kv_layer_offset + kv_head.to(tl.int64) * kv_head_stride, 16)
 
-        page = tl.load(bt + keys // PAGE, mask=is_old, other=0).to(tl.int64)
-        old_at = kv_layer_offset + page * kv_page_stride + (keys % PAGE).to(tl.int64) * kv_slot_stride + kv_head * kv_head_stride
-        old_k_fp8 = tl.load(Cache + old_at[None, :] + offs_d[:, None], mask=is_old[None, :], other=0.0)
-        old_v_fp8 = tl.load(Cache + old_at[:, None] + kv_v_offset + offs_d[None, :], mask=is_old[:, None], other=0.0)
-        old_k = (old_k_fp8.to(tl.float32) * k_scale).to(tl.bfloat16)
-        old_v = (old_v_fp8.to(tl.float32) * v_scale).to(tl.bfloat16)
+    # Hot loop: 100% full single-page FP8 tiles, coalesced [BLOCK_N, D] loads, zero per-key masks.
+    for n in range(tile_start, full_end):
+        key_base = n * BLOCK_N
+        page_idx = key_base // PAGE
+        page_off = key_base % PAGE
+        page = tl.load(bt + page_idx).to(tl.int64)
+        kv_base = tl.multiple_of(kv_head_off + page * kv_page_s + page_off * kv_slot_s, 16)
 
-        live_tok = (seq * BLOCK_SIZE + tl.maximum(keys - prefix, 0)).to(tl.int64)
-        live_k = tl.load(
-            K + live_tok[None, :] * stride_k_t + kv_head * D + offs_d[:, None],
-            mask=is_live[None, :],
+        k = tl.load(
+            Cache + kv_base + offs_n[:, None] * kv_slot_s + offs_d[None, :],
+            eviction_policy="evict_first",
+        ).to(tl.bfloat16)
+
+        s = tl.dot(q, tl.trans(k))
+        m_new = tl.maximum(m_i, tl.max(s, 1) * qk_scale_old)
+        alpha = _ex2(m_i - m_new)
+        p = _ex2(s * qk_scale_old - m_new[:, None])
+        l_i = l_i * alpha + tl.sum(p, 1)
+
+        v = tl.load(
+            Cache + kv_base + kv_v_off + offs_n[:, None] * kv_slot_s + offs_d[None, :],
+            eviction_policy="evict_first",
+        ).to(tl.bfloat16)
+        acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v)
+        m_i = m_new
+
+    # At most one partial prefix tile at the end of the prefix.
+    if has_partial:
+        key_base = full_prefix_tiles * BLOCK_N
+        keys = key_base + offs_n
+        is_old = keys < prefix
+        page_idx = key_base // PAGE
+        page_off = key_base % PAGE
+        page = tl.load(bt + page_idx).to(tl.int64)
+        kv_base = tl.multiple_of(kv_head_off + page * kv_page_s + page_off * kv_slot_s, 16)
+
+        k = tl.load(
+            Cache + kv_base + offs_n[:, None] * kv_slot_s + offs_d[None, :],
+            mask=is_old[:, None],
+            other=0.0,
+            eviction_policy="evict_first",
+        ).to(tl.bfloat16)
+        s = tl.dot(q, tl.trans(k)) * qk_scale_old
+        s = tl.where(is_old[None, :], s, float("-inf"))
+        m_new = tl.maximum(m_i, tl.max(s, 1))
+        m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
+        alpha = _ex2(m_i - m_safe)
+        p = _ex2(s - m_safe[:, None])
+        l_i = l_i * alpha + tl.sum(p, 1)
+
+        v = tl.load(
+            Cache + kv_base + kv_v_off + offs_n[:, None] * kv_slot_s + offs_d[None, :],
+            mask=is_old[:, None],
+            other=0.0,
+            eviction_policy="evict_first",
+        ).to(tl.bfloat16)
+        acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v)
+        m_i = m_new
+
+    acc = acc * v_scale
+
+    # Live BF16 draft block (1..BLOCK_SIZE tokens) handled once by the final split.
+    if do_live:
+        LIVE_N: tl.constexpr = 16
+        offs_live = tl.arange(0, LIVE_N)
+        is_live = offs_live < num_live
+        live_tok = (seq * BLOCK_SIZE + offs_live).to(tl.int64)
+
+        k_live = tl.load(
+            K + live_tok[:, None] * stride_k_t + kv_head * D + offs_d[None, :],
+            mask=is_live[:, None],
             other=0.0,
         )
-        live_v = tl.load(
+        s_live = tl.dot(q, tl.trans(k_live)) * (softmax_scale * LOG2E)
+        s_live = tl.where(is_live[None, :], s_live, float("-inf"))
+        m_new = tl.maximum(m_i, tl.max(s_live, 1))
+        m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
+        alpha = _ex2(m_i - m_safe)
+        p_live = _ex2(s_live - m_safe[:, None])
+        l_i = l_i * alpha + tl.sum(p_live, 1)
+
+        v_live = tl.load(
             V + live_tok[:, None] * stride_v_t + kv_head * D + offs_d[None, :],
             mask=is_live[:, None],
             other=0.0,
         )
-
-        k = tl.where((keys < prefix)[None, :], old_k, live_k)
-        v = tl.where((keys < prefix)[:, None], old_v, live_v)
-
-        s = tl.dot(q, k) * qk_scale
-        s = tl.where(in_range[None, :], s, float("-inf"))
-        m_new = tl.maximum(m_i, tl.max(s, 1))
-        m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
-        alpha = tl.exp2(m_i - m_safe)
-        p = tl.exp2(s - m_safe[:, None])
-        l_i = l_i * alpha + tl.sum(p, 1)
-        acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v)
+        acc = acc * alpha[:, None] + tl.dot(p_live.to(tl.bfloat16), v_live)
         m_i = m_new
 
     empty = l_i == 0.0
-    o = tl.where(seqlen_k > 0, acc / tl.where(empty, 1.0, l_i)[:, None], 0.0)
-    lse2 = tl.where(empty | (seqlen_k <= 0), float("-inf"), m_i + tl.log2(tl.where(empty, 1.0, l_i)))
-    row_store = tok < BLOCK_SIZE
+    o = acc / tl.where(empty, 1.0, l_i)[:, None]
+    lse2 = tl.where(empty, float("-inf"), m_i + tl.log2(tl.where(empty, 1.0, l_i)))
     if MODE_PARTIAL:
         part = (split.to(tl.int64) * num_tokens + token) * H + head
         part_mask = row_store & (token < num_tokens)

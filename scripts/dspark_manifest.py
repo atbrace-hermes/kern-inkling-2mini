@@ -144,10 +144,19 @@ def build_m4_kernels(
         ("spec_state_commit", "spec_state_commit", []),
     ]
 
+    spec_path = out / "spec_build.json"
+    prev_spec_mods = json.loads(spec_path.read_text()).get("modules", {}) if spec_path.exists() else {}
+
     def compile_cu(item):
         name, src_stem, extra = item
         src = repo / "source" / f"{src_stem}.cu"
         cubin = out / f"{name}.cubin"
+        src_sha = hashlib.sha256(src.read_bytes()).hexdigest()
+        prev = prev_spec_mods.get(name)
+        if prev and cubin.exists() and prev.get("source_sha256") == src_sha:
+            cubin_sha = hashlib.sha256(cubin.read_bytes()).hexdigest()
+            if cubin_sha == prev.get("sha256"):
+                return name, prev
         cmd = [
             nvcc_bin,
             "-std=c++17",
@@ -157,15 +166,15 @@ def build_m4_kernels(
             "-cubin",
             "-arch=sm_120a",
             *extra,
-            str(src),
+            f"source/{src_stem}.cu",
             "-o",
             str(cubin),
         ]
-        subprocess.run(cmd, check=True)
+        subprocess.run(cmd, cwd=repo, check=True)
         return name, {
             "source": cubin.name,
             "sha256": hashlib.sha256(cubin.read_bytes()).hexdigest(),
-            "source_sha256": hashlib.sha256(src.read_bytes()).hexdigest(),
+            "source_sha256": src_sha,
             "command": cmd,
         }
 
@@ -352,6 +361,7 @@ def build_m4_kernels(
             {},
         ),
     ]
+    paged_div16 = {(i,): [["tt.divisibility", 16]] for i in (0, 1, 2, 3, 6, 11, 12, 13, 15, 16, 17, 18, 19, 20)}
     for page_sz in (64, 128):
         suf = "" if page_sz == 64 else f"_p{page_sz}"
         triton_specs += [
@@ -372,21 +382,38 @@ def build_m4_kernels(
             (
                 f"dspark_attn_paged_direct{suf}",
                 dspark_py._dspark_attn_paged_kernel,
-                f"*bf16,*bf16,*bf16,*fp8e4nv,*i32,*i32,*bf16,*fp32,fp32,fp32,fp32,i64,i64,i64,i64,i64,i64,i64,i64,i64,i64,i32,i32,24,8,128,8,{page_sz},0,32,128",
+                f"*bf16,*bf16,*bf16,*fp8e4nv,*i32,*i32,*bf16,*fp32,fp32,fp32,fp32,i64,i64,i64,i64,i64,i64,i64,i64,i64,i64,i32,i32,24,8,128,8,{page_sz},0,32,32",
                 4,
-                {},
+                {"__opts__": {"num_stages": 3, "enable_fp_fusion": True}, "__attrs__": paged_div16},
             ),
             (
                 f"dspark_attn_paged_partial{suf}",
                 dspark_py._dspark_attn_paged_kernel,
-                f"*bf16,*bf16,*bf16,*fp8e4nv,*i32,*i32,*fp32,*fp32,fp32,fp32,fp32,i64,i64,i64,i64,i64,i64,i64,i64,i64,i64,i32,i32,24,8,128,8,{page_sz},1,32,128",
+                f"*bf16,*bf16,*bf16,*fp8e4nv,*i32,*i32,*fp32,*fp32,fp32,fp32,fp32,i64,i64,i64,i64,i64,i64,i64,i64,i64,i64,i32,i32,24,8,128,8,{page_sz},1,32,32",
                 4,
-                {},
+                {"__opts__": {"num_stages": 3, "enable_fp_fusion": True}, "__attrs__": paged_div16},
             ),
         ]
 
+    dsl_path = out / "dspark_dsl.json"
+    prev_dsl_mods = json.loads(dsl_path.read_text()).get("modules", {}) if dsl_path.exists() else {}
+
+    def _strip_ptx_debug(text: str) -> str:
+        out_lines = []
+        for ln in text.splitlines():
+            s = ln.lstrip()
+            if s.startswith((".file", ".loc", "//")):
+                continue
+            if s.startswith(".section\t.debug") or s.startswith(".section .debug"):
+                break
+            out_lines.append(ln)
+        return "\n".join(out_lines)
+
     dsl_records = {}
     for name, kernel, sig_str, warps, extra_const in triton_specs:
+        extra_const = dict(extra_const)
+        extra_opts = extra_const.pop("__opts__", {})
+        extra_attrs = extra_const.pop("__attrs__", {})
         sig, constants = {}, {}
         for arg, typ in zip(kernel.arg_names, sig_str.split(","), strict=True):
             if typ.isdecimal():
@@ -396,10 +423,12 @@ def build_m4_kernels(
             else:
                 sig[arg] = typ
         constants.update(extra_const)
+        compile_opts = {"num_warps": warps, "num_stages": 2, "enable_fp_fusion": False}
+        compile_opts.update(extra_opts)
         compiled = triton.compile(
-            ASTSource(kernel, signature=sig, constexprs=constants, attrs={}),
+            ASTSource(kernel, signature=sig, constexprs=constants, attrs=extra_attrs),
             target=GPUTarget("cuda", 120, 32),
-            options={"num_warps": warps, "num_stages": 2, "enable_fp_fusion": False},
+            options=compile_opts,
         )
         if (
             compiled.metadata.global_scratch_size
@@ -410,8 +439,22 @@ def build_m4_kernels(
         ptx = compiled.asm["ptx"]
         _check_ptx_sm120_safe(name, ptx)
         cubin_path = out / f"{name}.cubin"
+        ptx_path = out / f"{name}.ptx"
+        prev = prev_dsl_mods.get(name)
+        if (
+            prev
+            and cubin_path.exists()
+            and ptx_path.exists()
+            and prev.get("entry") == compiled.name
+            and prev.get("shared_mem") == compiled.metadata.shared
+            and prev.get("block") == [32 * warps, 1, 1]
+            and prev.get("signature") == list(sig.values())
+            and _strip_ptx_debug(ptx_path.read_text()) == _strip_ptx_debug(ptx)
+        ):
+            dsl_records[name] = prev
+            continue
         cubin_path.write_bytes(compiled.asm["cubin"])
-        (out / f"{name}.ptx").write_text(ptx)
+        ptx_path.write_text(ptx)
         dsl_records[name] = {
             "source": cubin_path.name,
             "sha256": hashlib.sha256(cubin_path.read_bytes()).hexdigest(),
