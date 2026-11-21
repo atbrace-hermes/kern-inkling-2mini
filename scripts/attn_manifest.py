@@ -157,7 +157,7 @@ def register_modules(
     """Register sconv.cubin, attn_prologue.cubin, and all attn_*.cubin Triton AOT modules."""
     if dsl is None:
         dsl = load_dsl(kernels_dir)
-    for mod_name in ("sconv", "attn_prologue", "rel_attn_sm120", "rel_verify_sm120"):
+    for mod_name in ("sconv", "attn_prologue", "rel_attn_sm120", "rel_verify_sm120", "bf16_gemv_sm120"):
         cubin_path = kernels_dir / f"{mod_name}.cubin"
         modules[mod_name] = {
             "source": cubin_path.name,
@@ -280,11 +280,52 @@ def register_ops(
 ) -> None:
     """Register all M3 sconv, attn_prologue, SWA commit, and rel_attention ops."""
     # Linear projection for dynamic sconv weight_proj & general bf16 gemm
+    # Small-M (tokens <= 32) uses SM120 256-bit v8.b32 direct-register MMA/GEMV with PDL;
+    # tokens >= 33 falls back to cuBLASLt BF16 TN.
     ops.setdefault(
         "m3_gemm_bf16",
         {
             "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32", "i32"],
-            "impl": {"launches": [{"entry": "extern:cublaslt_bf16_tn"}]},
+            "impl": {
+                "launches": [
+                    {
+                        "module": "bf16_gemv_sm120",
+                        "entry": "kern_bf16_gemv_m1_sm120",
+                        "grid": [384, 1, 1],
+                        "block": [256, 1, 1],
+                        "pdl": True,
+                        "when": {"var": "tokens", "max": 1},
+                    },
+                    {
+                        "module": "bf16_gemv_sm120",
+                        "entry": "kern_bf16_gemm_m8_sm120",
+                        "grid": [384, 1, 1],
+                        "block": [256, 1, 1],
+                        "pdl": True,
+                        "when": {"var": "tokens", "min": 2, "max": 8},
+                    },
+                    {
+                        "module": "bf16_gemv_sm120",
+                        "entry": "kern_bf16_gemm_m16_sm120",
+                        "grid": [384, 1, 1],
+                        "block": [256, 1, 1],
+                        "pdl": True,
+                        "when": {"var": "tokens", "min": 9, "max": 16},
+                    },
+                    {
+                        "module": "bf16_gemv_sm120",
+                        "entry": "kern_bf16_gemm_m32_sm120",
+                        "grid": [384, 1, 1],
+                        "block": [256, 1, 1],
+                        "pdl": True,
+                        "when": {"var": "tokens", "min": 17, "max": 32},
+                    },
+                    {
+                        "entry": "extern:cublaslt_bf16_tn",
+                        "when": {"var": "tokens", "min": 33},
+                    },
+                ]
+            },
         },
     )
     ops["m3_fill_f32"] = {

@@ -795,8 +795,8 @@ class TestM3AttnSconv(unittest.TestCase):
             torch.testing.assert_close(v["t.sconv_mlp_out"][:T], ref_sconv_static(m_pf, w_mlp, None, pos_pf, add_pf, res_pf), rtol=0, atol=0)
 
             rt.run("sconv_dyn_prefill", {"tokens": T})
-            dyn_ref = (xk_pf @ w_dyn_pr.t())
-            torch.testing.assert_close(v["sconv.k_out"][:T], ref_sconv_dynamic(k_pf, w_dyn_st, dyn_ref, None, pos_pf), rtol=0, atol=0)
+            dyn_ref = (xk_pf.float() @ w_dyn_pr.float().t()).to(torch.bfloat16)
+            torch.testing.assert_close(v["sconv.k_out"][:T], ref_sconv_dynamic(k_pf, w_dyn_st, dyn_ref, None, pos_pf), rtol=2e-2, atol=2e-2)
 
             # 2. Decode batch (seqs=4: seq0=line1 active, seq1=line2 active @ pos=0, seq2=line0 null, seq3=line3 valid=0)
             k_dec = torch.randn((4, 1024), dtype=torch.bfloat16, device="cuda")
@@ -825,9 +825,9 @@ class TestM3AttnSconv(unittest.TestCase):
             torch.testing.assert_close(v["sconv.k_out"][2], torch.zeros_like(exp_k0), rtol=0, atol=0)
             torch.testing.assert_close(v["sconv.k_out"][3], torch.zeros_like(exp_k0), rtol=0, atol=0)
 
-            rt.run("sconv_dyn_decode", {"seqs": 4})
-            exp_dyn0 = ref_sconv_dynamic(k_dec[0:1], w_dyn_st, (xk_dec[0:1] @ w_dyn_pr.t()), k_pf[2:5], torch.tensor([5], device="cuda"))[0]
-            torch.testing.assert_close(v["sconv.k_out"][0], exp_dyn0, rtol=0, atol=0)
+            rt.run("sconv_dyn_decode", {"seqs": 4, "tokens": 4})
+            exp_dyn0 = ref_sconv_dynamic(k_dec[0:1], w_dyn_st, (xk_dec[0:1].float() @ w_dyn_pr.float().t()).to(torch.bfloat16), k_pf[2:5], torch.tensor([5], device="cuda"))[0]
+            torch.testing.assert_close(v["sconv.k_out"][0], exp_dyn0, rtol=2e-2, atol=2e-2)
 
             # 3. Speculative verify (read-only!) + rollback + commit_all
             # seq0 history is now [k_pf[3], k_pf[4], k_dec[0]] at pos=6..13; seq1 history is [0, 0, k_dec[1]] at pos=1..8
@@ -877,8 +877,8 @@ class TestM3AttnSconv(unittest.TestCase):
             rt.run("sconv_dyn_verify", {"tokens": 32})
             torch.testing.assert_close(
                 v["sconv.k_out"][:8],
-                ref_sconv_dynamic(k_ver[:8], w_dyn_st, (xk_ver[:8] @ w_dyn_pr.t()), h0, pos_ver[:8]),
-                rtol=0, atol=0,
+                ref_sconv_dynamic(k_ver[:8], w_dyn_st, (xk_ver[:8].float() @ w_dyn_pr.float().t()).to(torch.bfloat16), h0, pos_ver[:8]),
+                rtol=2e-2, atol=2e-2,
             )
 
             # Verify read-only: re-running verify produces identical result (history untouched!)

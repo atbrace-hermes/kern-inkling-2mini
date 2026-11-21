@@ -113,6 +113,13 @@ source = "source/rel_verify_sm120.cu"
 flags = "plain"
 includes = []
 
+[kernels."bf16_gemv_sm120"]
+sha256 = "6c6911aae6d50343e490557829f7c3a90cab5b76f8414025ada0cd8519323367"
+milestone = "M3"
+source = "source/bf16_gemv_sm120.cu"
+flags = "plain"
+includes = []
+
 # M4 CUDA modules
 [kernels."dspark_derive"]
 sha256 = "460b0bbb02847d49cc3a07cf0ebd9c4e25488348979bd31f570491a0c64c2743"
