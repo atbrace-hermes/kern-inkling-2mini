@@ -99,6 +99,13 @@ source = "source/attn_prologue.cu"
 flags = "plain"
 includes = []
 
+[kernels."rel_attn_sm120"]
+sha256 = "5c6b61d24ec8a89a1875d0759b4725bbf0212173bcc04ee5578b2843d2e287fb"
+milestone = "M3"
+source = "source/rel_attn_sm120.cu"
+flags = "plain"
+includes = []
+
 # M4 CUDA modules
 [kernels."dspark_derive"]
 sha256 = "460b0bbb02847d49cc3a07cf0ebd9c4e25488348979bd31f570491a0c64c2743"

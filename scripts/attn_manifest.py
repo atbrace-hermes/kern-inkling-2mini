@@ -157,7 +157,7 @@ def register_modules(
     """Register sconv.cubin, attn_prologue.cubin, and all attn_*.cubin Triton AOT modules."""
     if dsl is None:
         dsl = load_dsl(kernels_dir)
-    for mod_name in ("sconv", "attn_prologue"):
+    for mod_name in ("sconv", "attn_prologue", "rel_attn_sm120"):
         cubin_path = kernels_dir / f"{mod_name}.cubin"
         modules[mod_name] = {
             "source": cubin_path.name,
@@ -989,29 +989,49 @@ def register_ops(
         "i32", "i32", "i32", "f32", "f32",
     ]
 
-    for op_name, mod_name, grid_x, grid_z in (
-        ("attn_swa_prefill", "attn_swa_prefill", _ceil_div("tokens", 8), 1),
-        ("attn_swa_verify", "attn_swa_verify", 1, "seqs"),
-    ):
-        ops[op_name] = {
-            "params": swa_cur_if_params,
-            "impl": {
-                "scratch": {"dummy_lse": {"dtype": "f32", "shape": [1]}},
-                "launches": [
-                    _triton_launch(
-                        dsl,
-                        mod_name,
-                        swa_cur_k_params_gated,
-                        [grid_x, 8, grid_z],
-                        [
-                            *[{"param": j} for j in range(10)],
-                            {"scratch": "dummy_lse"},
-                            *[{"param": j} for j in range(10, 15)],
-                        ],
-                    )
-                ],
-            },
-        }
+    ops["attn_swa_prefill"] = {
+        "params": swa_cur_if_params,
+        "impl": {
+            "launches": [
+                {
+                    "module": "rel_attn_sm120",
+                    "entry": "kern_rel_swa_prefill_m64_sm120",
+                    "grid": [_ceil_div("tokens", 64), HEADS, 1],
+                    "block": [128, 1, 1],
+                    "shared_mem": 49152,
+                    "when": {"var": "tokens", "max": 512},
+                },
+                {
+                    "module": "rel_attn_sm120",
+                    "entry": "kern_rel_swa_prefill_m128_sm120",
+                    "grid": [_ceil_div("tokens", 128), HEADS, 1],
+                    "block": [256, 1, 1],
+                    "shared_mem": 49152,
+                    "when": {"var": "tokens", "min": 513},
+                },
+            ],
+        },
+    }
+
+    ops["attn_swa_verify"] = {
+        "params": swa_cur_if_params,
+        "impl": {
+            "scratch": {"dummy_lse": {"dtype": "f32", "shape": [1]}},
+            "launches": [
+                _triton_launch(
+                    dsl,
+                    "attn_swa_verify",
+                    swa_cur_k_params_gated,
+                    [1, 8, "seqs"],
+                    [
+                        *[{"param": j} for j in range(10)],
+                        {"scratch": "dummy_lse"},
+                        *[{"param": j} for j in range(10, 15)],
+                    ],
+                )
+            ],
+        },
+    }
 
     # SWA Decode: 8 splits when seqs <= 1, single-split gated when seqs >= 2
     ops["attn_swa_decode"] = {
