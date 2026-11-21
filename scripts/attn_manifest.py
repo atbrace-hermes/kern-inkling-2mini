@@ -157,7 +157,7 @@ def register_modules(
     """Register sconv.cubin, attn_prologue.cubin, and all attn_*.cubin Triton AOT modules."""
     if dsl is None:
         dsl = load_dsl(kernels_dir)
-    for mod_name in ("sconv", "attn_prologue", "rel_attn_sm120"):
+    for mod_name in ("sconv", "attn_prologue", "rel_attn_sm120", "rel_verify_sm120"):
         cubin_path = kernels_dir / f"{mod_name}.cubin"
         modules[mod_name] = {
             "source": cubin_path.name,
@@ -1013,23 +1013,59 @@ def register_ops(
         },
     }
 
+    # SWA Verify: SM120 CUDA split-KV + 1-warp float4 combine (dedicated cur split, adaptive by seqs)
+    swa_verify_split_params = [
+        "in buffer<bf16>", "in state", "in buffer<fp8e4m3>", "in buffer<fp8e4m3>",
+        "in buffer<bf16>", "in buffer<i32>", "in buffer<i32>",
+        "out buffer<f32>", "out buffer<f32>",
+        "i32", "f32", "f32", "i32", "i32",
+    ]
+    swa_verify_launches: list[dict[str, Any]] = []
+    for num_splits, ring_splits, when_cond in (
+        (9, 8, {"var": "seqs", "max": 2}),
+        (5, 4, {"var": "seqs", "min": 3}),
+    ):
+        swa_verify_launches.append(
+            {
+                "module": "rel_verify_sm120",
+                "entry": "kern_attn_swa_verify_split",
+                "params": swa_verify_split_params,
+                "grid": [num_splits, 8, "seqs"],
+                "block": [128, 1, 1],
+                "args": [
+                    {"param": 0}, {"param": 1}, {"param": 2}, {"param": 3},
+                    {"param": 4}, {"param": 7}, {"param": 8},
+                    {"scratch": "o_part"}, {"scratch": "lse_part"},
+                    {"param": 10}, {"param": 13}, {"param": 14},
+                    _i32(num_splits), _i32(ring_splits),
+                ],
+                "when": when_cond,
+            }
+        )
+        swa_verify_launches.append(
+            {
+                "module": "rel_verify_sm120",
+                "entry": f"kern_attn_verify_combine_s{num_splits}",
+                "params": combine_params,
+                "grid": ["tokens", HEADS, 1],
+                "block": [32, 1, 1],
+                "args": [
+                    {"scratch": "o_part"}, {"scratch": "lse_part"},
+                    {"param": 5}, {"param": 6}, {"param": 9},
+                    {"param": 10}, {"param": 11}, {"param": 12},
+                ],
+                "pdl": True,
+                "when": when_cond,
+            }
+        )
     ops["attn_swa_verify"] = {
         "params": swa_cur_if_params,
         "impl": {
-            "scratch": {"dummy_lse": {"dtype": "f32", "shape": [1]}},
-            "launches": [
-                _triton_launch(
-                    dsl,
-                    "attn_swa_verify",
-                    swa_cur_k_params_gated,
-                    [1, 8, "seqs"],
-                    [
-                        *[{"param": j} for j in range(10)],
-                        {"scratch": "dummy_lse"},
-                        *[{"param": j} for j in range(10, 15)],
-                    ],
-                )
-            ],
+            "scratch": {
+                "o_part": {"dtype": "f32", "shape": [9, "tokens", HEADS, HEAD_DIM]},
+                "lse_part": {"dtype": "f32", "shape": [9, "tokens", HEADS]},
+            },
+            "launches": swa_verify_launches,
         },
     }
 

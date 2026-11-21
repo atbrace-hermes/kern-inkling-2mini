@@ -1206,6 +1206,68 @@ class TestM3AttnSconv(unittest.TestCase):
             ).view(1, 3072)
             torch.testing.assert_close(v["t.attn_y"][0:1], y_dec_ref0, rtol=3e-2, atol=3e-2)
 
+    def test_swa_verify_ring_wrap_and_batch_parity(self):
+        """Exercise attn_swa_verify across cold start (past=0), exact window (past=1024), and ring wrap (past=1474) for seqs=1,4."""
+        rt, v = self.rt, self.v
+        v["t.k_scale"].fill_(0.05)
+        v["t.v_scale"].fill_(0.025)
+        v["t.q_l2"].fill_(1.0)
+        v["t.r_l2"].fill_(1.0)
+        v["t.rel_proj"].normal_(mean=0.0, std=0.2)
+
+        for past, seqs in ((0, 1), (1024, 1), (1474, 4)):
+            with self.subTest(past=past, seqs=seqs):
+                k_pf = torch.randn((past, 1024), dtype=torch.bfloat16, device="cuda") * 0.4 if past > 0 else None
+                v_pf = torch.randn((past, 1024), dtype=torch.bfloat16, device="cuda") * 0.4 if past > 0 else None
+                if past > 0:
+                    for si in range(seqs):
+                        v["seq_state.lines"].fill_(0)
+                        v["seq_state.lines"][0, 0] = si + 1
+                        v["positions"][:past].copy_(torch.arange(past, dtype=torch.int64, device="cuda"))
+                        v["lengths"][0] = past
+                        v["t.q_in"][:past].zero_()
+                        v["t.r_in"][:past].zero_()
+                        v["t.k_in"][:past].copy_(k_pf)
+                        v["t.v_in"][:past].copy_(v_pf)
+                        v["t.gate"][:past].zero_()
+                        v["t.sink"][:past].zero_()
+                        rt.run("swa_prefill", {"tokens": past})
+
+                T = seqs * 8
+                v["seq_state.lines"][0, :seqs].copy_(torch.arange(1, seqs + 1, dtype=torch.int32, device="cuda"))
+                v["positions"][:T].copy_(torch.arange(past, past + 8, dtype=torch.int64, device="cuda").repeat(seqs))
+                v["valid"][:T].fill_(1)
+                v["lengths"][:seqs].fill_(past + 8)
+                q_v = torch.randn((T, 3072), dtype=torch.bfloat16, device="cuda") * 0.6
+                r_v = torch.randn((T, 384), dtype=torch.bfloat16, device="cuda") * 0.6
+                k_v = torch.randn((T, 1024), dtype=torch.bfloat16, device="cuda") * 0.4
+                v_v = torch.randn((T, 1024), dtype=torch.bfloat16, device="cuda") * 0.4
+                g_v = torch.randn((T, 3072), dtype=torch.bfloat16, device="cuda")
+                s_v = torch.randn((T, 24), dtype=torch.bfloat16, device="cuda")
+                v["t.q_in"][:T].copy_(q_v)
+                v["t.r_in"][:T].copy_(r_v)
+                v["t.k_in"][:T].copy_(k_v)
+                v["t.v_in"][:T].copy_(v_v)
+                v["t.gate"][:T].copy_(g_v)
+                v["t.sink"][:T].copy_(s_v)
+
+                rt.run("swa_verify", {"tokens": T, "seqs": seqs})
+
+                for si in range(seqs):
+                    r0, r1 = si * 8, (si + 1) * 8
+                    k_all = (torch.cat([k_pf, k_v[r0:r1]], dim=0) if past > 0 else k_v[r0:r1]).view(past + 8, 8, 128).float()
+                    kn = k_all.pow(2).sum(dim=-1, keepdim=True).sqrt()
+                    kc = k_all * torch.clamp(22.627416997969522 / (kn + 1e-6), max=1.0)
+                    v_all = (torch.cat([v_pf, v_v[r0:r1]], dim=0) if past > 0 else v_v[r0:r1]).view(past + 8, 8, 128)
+                    y_ref = ref_rel_attention(
+                        v["t.q_clip_out"][r0:r1],
+                        ref_quant_fp8_dequant(kc, 0.05),
+                        ref_quant_fp8_dequant(ref_v_rmsnorm(v_all), 0.025),
+                        v["t.rel_bias_out"][r0:r1], g_v[r0:r1].view(8, 24, 128), s_v[r0:r1],
+                        past=past, window=1024,
+                    ).view(8, 3072)
+                    torch.testing.assert_close(v["t.attn_y"][r0:r1], y_ref, rtol=3e-2, atol=3e-2)
+
     def test_cuda_graph_capture_replay(self):
         rt, v = self.rt, self.v
         if True:
