@@ -1,6 +1,12 @@
 .venv/
 __pycache__/
+*.pyc
+*.pyo
+.ruff_cache/
 build/
 out/
+state/
 *.egg-info/
 weights/
+results/*.parquet
+results/*.log
