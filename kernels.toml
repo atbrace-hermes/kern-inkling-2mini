@@ -114,7 +114,7 @@ flags = "plain"
 includes = []
 
 [kernels."bf16_gemv_sm120"]
-sha256 = "6c6911aae6d50343e490557829f7c3a90cab5b76f8414025ada0cd8519323367"
+sha256 = "b37ee3012dfceec58afb3a185b1b24cab9a5ad246a0ad2dcace6882bb60c10c5"
 milestone = "M3"
 source = "source/bf16_gemv_sm120.cu"
 flags = "plain"

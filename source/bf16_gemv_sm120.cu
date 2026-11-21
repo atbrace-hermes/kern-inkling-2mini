@@ -276,16 +276,13 @@ __device__ __forceinline__ void run_v8_mma_pdl(
   }
 }
 
-}  // namespace
-
 // ---------------------------------------------------------------------------
 // M = 1 specialized 256-bit BF16 GEMV with PDL (decode-g1-r1 / prefill-c1).
-// Grid: [384, 1, 1], Block: [256, 1, 1]
 // ---------------------------------------------------------------------------
-extern "C" __global__ __launch_bounds__(256, 4) void kern_bf16_gemv_m1_sm120(
-    const __nv_bfloat16* __restrict__ A,
-    const __nv_bfloat16* __restrict__ W,
-    __nv_bfloat16* __restrict__ C,
+__device__ __forceinline__ void run_v8_gemv_m1_pdl(
+    const bf16* __restrict__ A,
+    const bf16* __restrict__ W,
+    bf16* __restrict__ C,
     int M, int N, int K) {
   if (M <= 0 || N <= 0 || K <= 0) {
     pdl_wait();
@@ -392,7 +389,7 @@ extern "C" __global__ __launch_bounds__(256, 4) void kern_bf16_gemv_m1_sm120(
     return;
   }
 
-  // N >= 512: 1 warp per output row (8 rows/CTA -> 384 CTAs for N=3072, 288 for N=2304, 128 for N=1024).
+  // N >= 512: 1 warp per output row (8 rows/CTA -> 1075 CTAs for N=8600, 819 for 6552, 128 for 1024).
   const int global_warp = blockIdx.x * WARPS + warp;
   const int total_warps = gridDim.x * WARPS;
   if (global_warp >= N) {
@@ -429,10 +426,20 @@ extern "C" __global__ __launch_bounds__(256, 4) void kern_bf16_gemv_m1_sm120(
   }
 }
 
+}  // namespace
+
 // ---------------------------------------------------------------------------
-// M in [2..8], [9..16], [17..32] SM120 256-bit direct-register MMA with PDL.
-// Grid: [384, 1, 1], Block: [256, 1, 1]
+// Single GEMV/GEMM entries: M=1, M in [2..8], [9..16], [17..32], [33..64].
+// Grid: [1088, 1, 1], Block: [256, 1, 1]
 // ---------------------------------------------------------------------------
+extern "C" __global__ __launch_bounds__(256, 4) void kern_bf16_gemv_m1_sm120(
+    const __nv_bfloat16* __restrict__ A,
+    const __nv_bfloat16* __restrict__ W,
+    __nv_bfloat16* __restrict__ C,
+    int M, int N, int K) {
+  run_v8_gemv_m1_pdl(A, W, C, M, N, K);
+}
+
 extern "C" __global__ __launch_bounds__(256, 4) void kern_bf16_gemm_m8_sm120(
     const __nv_bfloat16* __restrict__ A,
     const __nv_bfloat16* __restrict__ W,
@@ -455,4 +462,68 @@ extern "C" __global__ __launch_bounds__(256, 3) void kern_bf16_gemm_m32_sm120(
     __nv_bfloat16* __restrict__ C,
     int M, int N, int K) {
   run_v8_mma_pdl<2, false, 2>(A, W, C, M, N, K);
+}
+
+// ---------------------------------------------------------------------------
+// Dual-stream paired GEMV/GEMM entries (e.g. k_proj + v_proj when x_k != x_v).
+// Grid: [ceil_div(N, 8), 2, 1], Block: [256, 1, 1] (blockIdx.y=0 -> stream 0, y=1 -> stream 1).
+// ---------------------------------------------------------------------------
+extern "C" __global__ __launch_bounds__(256, 4) void kern_bf16_gemm_pair_m1_sm120(
+    const __nv_bfloat16* __restrict__ A0,
+    const __nv_bfloat16* __restrict__ W0,
+    __nv_bfloat16* __restrict__ C0,
+    const __nv_bfloat16* __restrict__ A1,
+    const __nv_bfloat16* __restrict__ W1,
+    __nv_bfloat16* __restrict__ C1,
+    int M, int N, int K) {
+  const bool s1 = (blockIdx.y != 0);
+  run_v8_gemv_m1_pdl(s1 ? A1 : A0, s1 ? W1 : W0, s1 ? C1 : C0, M, N, K);
+}
+
+extern "C" __global__ __launch_bounds__(256, 4) void kern_bf16_gemm_pair_m8_sm120(
+    const __nv_bfloat16* __restrict__ A0,
+    const __nv_bfloat16* __restrict__ W0,
+    __nv_bfloat16* __restrict__ C0,
+    const __nv_bfloat16* __restrict__ A1,
+    const __nv_bfloat16* __restrict__ W1,
+    __nv_bfloat16* __restrict__ C1,
+    int M, int N, int K) {
+  const bool s1 = (blockIdx.y != 0);
+  run_v8_mma_pdl<1, true, 1>(s1 ? A1 : A0, s1 ? W1 : W0, s1 ? C1 : C0, M, N, K);
+}
+
+extern "C" __global__ __launch_bounds__(256, 3) void kern_bf16_gemm_pair_m16_sm120(
+    const __nv_bfloat16* __restrict__ A0,
+    const __nv_bfloat16* __restrict__ W0,
+    __nv_bfloat16* __restrict__ C0,
+    const __nv_bfloat16* __restrict__ A1,
+    const __nv_bfloat16* __restrict__ W1,
+    __nv_bfloat16* __restrict__ C1,
+    int M, int N, int K) {
+  const bool s1 = (blockIdx.y != 0);
+  run_v8_mma_pdl<1, false, 1>(s1 ? A1 : A0, s1 ? W1 : W0, s1 ? C1 : C0, M, N, K);
+}
+
+extern "C" __global__ __launch_bounds__(256, 3) void kern_bf16_gemm_pair_m32_sm120(
+    const __nv_bfloat16* __restrict__ A0,
+    const __nv_bfloat16* __restrict__ W0,
+    __nv_bfloat16* __restrict__ C0,
+    const __nv_bfloat16* __restrict__ A1,
+    const __nv_bfloat16* __restrict__ W1,
+    __nv_bfloat16* __restrict__ C1,
+    int M, int N, int K) {
+  const bool s1 = (blockIdx.y != 0);
+  run_v8_mma_pdl<2, false, 2>(s1 ? A1 : A0, s1 ? W1 : W0, s1 ? C1 : C0, M, N, K);
+}
+
+extern "C" __global__ __launch_bounds__(256, 3) void kern_bf16_gemm_pair_m64_sm120(
+    const __nv_bfloat16* __restrict__ A0,
+    const __nv_bfloat16* __restrict__ W0,
+    __nv_bfloat16* __restrict__ C0,
+    const __nv_bfloat16* __restrict__ A1,
+    const __nv_bfloat16* __restrict__ W1,
+    __nv_bfloat16* __restrict__ C1,
+    int M, int N, int K) {
+  const bool s1 = (blockIdx.y != 0);
+  run_v8_mma_pdl<4, false, 1>(s1 ? A1 : A0, s1 ? W1 : W0, s1 ? C1 : C0, M, N, K);
 }

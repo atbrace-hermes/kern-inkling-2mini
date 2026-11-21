@@ -67,13 +67,20 @@ def _register_attn_sconv_buffers(buffers: dict[str, Any]) -> None:
     def weight(name: str, shape: list[int], tensor: str) -> None:
         buf(name, "bf16", shape, "weight", bind=[{"tensor": tensor}])
 
+    def weight_concat(name: str, shape: list[int], tensors: list[str]) -> None:
+        buf(name, "bf16", shape, "weight", bind=[{"tensor": t} for t in tensors])
+
     # Attention / sconv / MoE / verify workspaces
+    # - decode/round use fused `attn.qrgskv` (stride 8600 on SWA pass0, 6552 on SWA pass>0 & Full)
+    # - prefill slices the same multi-segment weight buffers into separate `attn.{q,r,gate,sink,k,v}`
+    #   to preserve bit-exact cuBLASLt prefill reduction order (zero KV-cache/e2e drift).
+    buf("attn.qrgskv", "bf16", ["tokens", 8600])
     buf("attn.q", "bf16", ["tokens", 3072])
     buf("attn.r", "bf16", ["tokens", 384])
-    buf("attn.k", "bf16", ["tokens", 1024])
-    buf("attn.v", "bf16", ["tokens", 1024])
     buf("attn.gate", "bf16", ["tokens", 3072])
     buf("attn.sink", "bf16", ["tokens", 24])
+    buf("attn.k", "bf16", ["tokens", 1024])
+    buf("attn.v", "bf16", ["tokens", 1024])
     buf("attn.proj", "bf16", ["tokens", H])
     buf("moe_out", "bf16", ["tokens", H])
     buf("d.verify_logits", "f32", ["tokens", VOCAB])
@@ -81,12 +88,24 @@ def _register_attn_sconv_buffers(buffers: dict[str, Any]) -> None:
     # Per-layer attention + sconv weights (24 physical layers)
     for p in range(loop_manifest.NUM_PHYSICAL_LAYERS):
         pfx = f"model.llm.layers.{p}"
-        weight(f"{pfx}.attn.wq_du.weight", [3072, H], f"{pfx}.attn.wq_du.weight")
-        weight(f"{pfx}.attn.wr_du.weight", [384, H], f"{pfx}.attn.wr_du.weight")
-        weight(f"{pfx}.attn.wk_dv.weight", [1024, H], f"{pfx}.attn.wk_dv.weight")
-        weight(f"{pfx}.attn.wv_dv.weight", [1024, H], f"{pfx}.attn.wv_dv.weight")
-        weight(f"{pfx}.attn.gate_attn.weight", [3072, H], f"{pfx}.attn.gate_attn.weight")
-        weight(f"{pfx}.attn.attn_sink_proj.weight", [24, H], f"{pfx}.attn.attn_sink_proj.weight")
+        qrgs_tensors = [
+            f"{pfx}.attn.wq_du.weight",
+            f"{pfx}.attn.wr_du.weight",
+            f"{pfx}.attn.gate_attn.weight",
+            f"{pfx}.attn.attn_sink_proj.weight",
+        ]
+        if p in loop_manifest.FULL_LAYERS:
+            weight_concat(f"{pfx}.attn.wqrgs.weight", [6552, H], qrgs_tensors)
+            weight(f"{pfx}.attn.wk_dv.weight", [1024, H], f"{pfx}.attn.wk_dv.weight")
+            weight(f"{pfx}.attn.wv_dv.weight", [1024, H], f"{pfx}.attn.wv_dv.weight")
+        else:
+            # SWA layers bind all 6 projections contiguously; pass_idx==0 uses all 8600 rows in one GEMM,
+            # while pass_idx>0 slices [0:6552], [6552:7576], [7576:8600] with zero weight duplication.
+            weight_concat(
+                f"{pfx}.attn.wqrgskv.weight",
+                [8600, H],
+                [*qrgs_tensors, f"{pfx}.attn.wk_dv.weight", f"{pfx}.attn.wv_dv.weight"],
+            )
         weight(f"{pfx}.attn.wo_ud.weight", [H, 3072], f"{pfx}.attn.wo_ud.weight")
         weight(f"{pfx}.attn.q_l2_clip.scale", [24, 128], f"{pfx}.attn.q_l2_clip.scale")
         weight(f"{pfx}.attn.rel_l2_clip.scale", [24, 16], f"{pfx}.attn.rel_l2_clip.scale")
@@ -292,52 +311,111 @@ def build_manifest(
                 x_v = x_q
 
             pfx = f"model.llm.layers.{phys}"
-            calls.extend(
-                [
+            is_full = phys in loop_manifest.FULL_LAYERS
+            w_qrgs_name = f"{pfx}.attn.wqrgs.weight" if is_full else f"{pfx}.attn.wqrgskv.weight"
+            if is_full:
+                w_k = _b(f"{pfx}.attn.wk_dv.weight")
+                w_v = _b(f"{pfx}.attn.wv_dv.weight")
+            else:
+                w_k = _b(w_qrgs_name, 6552 * H * 2)
+                w_v = _b(w_qrgs_name, 7576 * H * 2)
+
+            if mode == "prefill":
+                # Prefill slices the concatenated weight buffers at exact projection offsets to
+                # keep cuBLASLt reduction order 100% bit-identical with zero weight duplication.
+                calls.extend(
+                    [
+                        {
+                            "label": f"v{v}.q_proj",
+                            "op": "m3_gemm_bf16",
+                            "args": [x_q, _b(w_qrgs_name, 0), _b("attn.q"), {"var": t_var}, _i32(3072), _i32(H)],
+                        },
+                        {
+                            "label": f"v{v}.r_proj",
+                            "op": "m3_gemm_bf16",
+                            "args": [x_q, _b(w_qrgs_name, 3072 * H * 2), _b("attn.r"), {"var": t_var}, _i32(384), _i32(H)],
+                        },
+                        {
+                            "label": f"v{v}.k_proj",
+                            "op": "m3_gemm_bf16",
+                            "args": [x_k, w_k, _b("attn.k"), {"var": t_var}, _i32(1024), _i32(H)],
+                        },
+                        {
+                            "label": f"v{v}.v_proj",
+                            "op": "m3_gemm_bf16",
+                            "args": [x_v, w_v, _b("attn.v"), {"var": t_var}, _i32(1024), _i32(H)],
+                        },
+                        {
+                            "label": f"v{v}.gate_proj",
+                            "op": "m3_gemm_bf16",
+                            "args": [x_q, _b(w_qrgs_name, 3456 * H * 2), _b("attn.gate"), {"var": t_var}, _i32(3072), _i32(H)],
+                        },
+                        {
+                            "label": f"v{v}.sink_proj",
+                            "op": "m3_gemm_bf16",
+                            "args": [x_q, _b(w_qrgs_name, 6528 * H * 2), _b("attn.sink"), {"var": t_var}, _i32(24), _i32(H)],
+                        },
+                    ]
+                )
+                q_in, r_in, gate_in, sink_in = _b("attn.q"), _b("attn.r"), _b("attn.gate"), _b("attn.sink")
+                stride_q, stride_r, stride_gate, stride_sink = 3072, 384, 3072, 24
+                k_in, v_in, kv_stride = _b("attn.k"), _b("attn.v"), 1024
+            elif pass_idx == 0 and not is_full:
+                # All 6 projections share x_q -> single [8600, H] GEMM into attn.qrgskv.
+                calls.append(
                     {
-                        "label": f"v{v}.q_proj",
+                        "label": f"v{v}.qrgskv_proj",
                         "op": "m3_gemm_bf16",
-                        "args": [x_q, _b(f"{pfx}.attn.wq_du.weight"), _b("attn.q"), {"var": t_var}, _i32(3072), _i32(H)],
-                    },
-                    {
-                        "label": f"v{v}.r_proj",
-                        "op": "m3_gemm_bf16",
-                        "args": [x_q, _b(f"{pfx}.attn.wr_du.weight"), _b("attn.r"), {"var": t_var}, _i32(384), _i32(H)],
-                    },
-                    {
-                        "label": f"v{v}.k_proj",
-                        "op": "m3_gemm_bf16",
-                        "args": [x_k, _b(f"{pfx}.attn.wk_dv.weight"), _b("attn.k"), {"var": t_var}, _i32(1024), _i32(H)],
-                    },
-                    {
-                        "label": f"v{v}.v_proj",
-                        "op": "m3_gemm_bf16",
-                        "args": [x_v, _b(f"{pfx}.attn.wv_dv.weight"), _b("attn.v"), {"var": t_var}, _i32(1024), _i32(H)],
-                    },
-                    {
-                        "label": f"v{v}.gate_proj",
-                        "op": "m3_gemm_bf16",
-                        "args": [x_q, _b(f"{pfx}.attn.gate_attn.weight"), _b("attn.gate"), {"var": t_var}, _i32(3072), _i32(H)],
-                    },
-                    {
-                        "label": f"v{v}.sink_proj",
-                        "op": "m3_gemm_bf16",
-                        "args": [x_q, _b(f"{pfx}.attn.attn_sink_proj.weight"), _b("attn.sink"), {"var": t_var}, _i32(24), _i32(H)],
-                    },
-                ]
-            )
+                        "args": [x_q, _b(w_qrgs_name), _b("attn.qrgskv"), {"var": t_var}, _i32(8600), _i32(H)],
+                    }
+                )
+                q_in = _b("attn.qrgskv", 0)
+                r_in = _b("attn.qrgskv", 3072 * 2)
+                gate_in = _b("attn.qrgskv", 3456 * 2)
+                sink_in = _b("attn.qrgskv", 6528 * 2)
+                stride_q = stride_r = stride_gate = stride_sink = 8600
+                k_in = _b("attn.qrgskv", 6552 * 2)
+                v_in = _b("attn.qrgskv", 7576 * 2)
+                kv_stride = 8600
+            else:
+                calls.extend(
+                    [
+                        {
+                            "label": f"v{v}.qrgs_proj",
+                            "op": "m3_gemm_bf16",
+                            "args": [x_q, _b(w_qrgs_name, 0), _b("attn.qrgskv"), {"var": t_var}, _i32(6552), _i32(H)],
+                        },
+                        {
+                            "label": f"v{v}.kv_proj",
+                            "op": "m3_gemm_bf16_pair",
+                            "args": [
+                                x_k, w_k, _b("attn.k"),
+                                x_v, w_v, _b("attn.v"),
+                                {"var": t_var}, _i32(1024), _i32(H),
+                            ],
+                        },
+                    ]
+                )
+                q_in = _b("attn.qrgskv", 0)
+                r_in = _b("attn.qrgskv", 3072 * 2)
+                gate_in = _b("attn.qrgskv", 3456 * 2)
+                sink_in = _b("attn.qrgskv", 6528 * 2)
+                stride_q = stride_r = stride_gate = stride_sink = 6552
+                k_in, v_in, kv_stride = _b("attn.k"), _b("attn.v"), 1024
 
             attn_manifest.emit_sconv_kv(
                 calls,
                 mode,
                 v,
                 phys,
-                _b("attn.k"),
-                _b("attn.v"),
+                k_in,
+                v_in,
                 x_k,
                 x_v,
                 _b("sconv.k_out"),
                 _b("sconv.v_out"),
+                stride_k=kv_stride,
+                stride_v=kv_stride,
                 max_seqs=max_seqs,
             )
 
@@ -347,15 +425,19 @@ def build_manifest(
                 mode,
                 v,
                 phys,
-                _b("attn.q"),
-                _b("attn.r"),
+                q_in,
+                r_in,
                 _b("sconv.k_out"),
                 _b("sconv.v_out"),
-                _b("attn.gate"),
-                _b("attn.sink"),
+                gate_in,
+                sink_in,
                 _b("attn.out"),
                 ks_v,
                 vs_v,
+                stride_q=stride_q,
+                stride_r=stride_r,
+                stride_gate=stride_gate,
+                stride_sink=stride_sink,
                 max_seqs=max_seqs,
             )
 

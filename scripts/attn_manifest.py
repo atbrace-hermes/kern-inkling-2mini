@@ -291,7 +291,7 @@ def register_ops(
                     {
                         "module": "bf16_gemv_sm120",
                         "entry": "kern_bf16_gemv_m1_sm120",
-                        "grid": [384, 1, 1],
+                        "grid": [1088, 1, 1],
                         "block": [256, 1, 1],
                         "pdl": True,
                         "when": {"var": "tokens", "max": 1},
@@ -299,7 +299,7 @@ def register_ops(
                     {
                         "module": "bf16_gemv_sm120",
                         "entry": "kern_bf16_gemm_m8_sm120",
-                        "grid": [384, 1, 1],
+                        "grid": [1088, 1, 1],
                         "block": [256, 1, 1],
                         "pdl": True,
                         "when": {"var": "tokens", "min": 2, "max": 8},
@@ -307,7 +307,7 @@ def register_ops(
                     {
                         "module": "bf16_gemv_sm120",
                         "entry": "kern_bf16_gemm_m16_sm120",
-                        "grid": [384, 1, 1],
+                        "grid": [1088, 1, 1],
                         "block": [256, 1, 1],
                         "pdl": True,
                         "when": {"var": "tokens", "min": 9, "max": 16},
@@ -315,7 +315,7 @@ def register_ops(
                     {
                         "module": "bf16_gemv_sm120",
                         "entry": "kern_bf16_gemm_m32_sm120",
-                        "grid": [384, 1, 1],
+                        "grid": [1088, 1, 1],
                         "block": [256, 1, 1],
                         "pdl": True,
                         "when": {"var": "tokens", "min": 17, "max": 32},
@@ -323,6 +323,138 @@ def register_ops(
                     {
                         "entry": "extern:cublaslt_bf16_tn",
                         "when": {"var": "tokens", "min": 33},
+                    },
+                ]
+            },
+        },
+    )
+    gemm_params = ["in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32", "i32"]
+    pair_params = [
+        "in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>",
+        "in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>",
+        "i32", "i32", "i32",
+    ]
+    pair_cublas_0 = [
+        {"param": 0}, {"param": 1}, {"param": 2},
+        {"param": 6}, {"param": 7}, {"param": 8},
+    ]
+    pair_cublas_1 = [
+        {"param": 3}, {"param": 4}, {"param": 5},
+        {"param": 6}, {"param": 7}, {"param": 8},
+    ]
+    # Dual-stream paired BF16 GEMM (e.g. k_proj + v_proj with distinct inputs x_k != x_v).
+    ops.setdefault(
+        "m3_gemm_bf16_pair",
+        {
+            "params": pair_params,
+            "impl": {
+                "launches": [
+                    {
+                        "module": "bf16_gemv_sm120",
+                        "entry": "kern_bf16_gemm_pair_m1_sm120",
+                        "grid": [128, 2, 1],
+                        "block": [256, 1, 1],
+                        "pdl": True,
+                        "when": {"var": "tokens", "max": 1},
+                    },
+                    {
+                        "module": "bf16_gemv_sm120",
+                        "entry": "kern_bf16_gemm_pair_m8_sm120",
+                        "grid": [128, 2, 1],
+                        "block": [256, 1, 1],
+                        "pdl": True,
+                        "when": {"var": "tokens", "min": 2, "max": 8},
+                    },
+                    {
+                        "module": "bf16_gemv_sm120",
+                        "entry": "kern_bf16_gemm_pair_m16_sm120",
+                        "grid": [128, 2, 1],
+                        "block": [256, 1, 1],
+                        "pdl": True,
+                        "when": {"var": "tokens", "min": 9, "max": 16},
+                    },
+                    {
+                        "module": "bf16_gemv_sm120",
+                        "entry": "kern_bf16_gemm_pair_m32_sm120",
+                        "grid": [128, 2, 1],
+                        "block": [256, 1, 1],
+                        "pdl": True,
+                        "when": {"var": "tokens", "min": 17, "max": 32},
+                    },
+                    {
+                        "entry": "extern:cublaslt_bf16_tn",
+                        "params": gemm_params,
+                        "args": pair_cublas_0,
+                        "when": {"var": "tokens", "min": 33},
+                    },
+                    {
+                        "entry": "extern:cublaslt_bf16_tn",
+                        "params": gemm_params,
+                        "args": pair_cublas_1,
+                        "when": {"var": "tokens", "min": 33},
+                    },
+                ]
+            },
+        },
+    )
+    # Dual-stream small-N paired BF16 GEMM (N=32 dynamic sconv weight_proj; beats cuBLASLt through M=64).
+    ops.setdefault(
+        "m3_gemm_bf16_pair_dyn",
+        {
+            "params": pair_params,
+            "impl": {
+                "launches": [
+                    {
+                        "module": "bf16_gemv_sm120",
+                        "entry": "kern_bf16_gemm_pair_m1_sm120",
+                        "grid": [32, 2, 1],
+                        "block": [256, 1, 1],
+                        "pdl": True,
+                        "when": {"var": "tokens", "max": 1},
+                    },
+                    {
+                        "module": "bf16_gemv_sm120",
+                        "entry": "kern_bf16_gemm_pair_m8_sm120",
+                        "grid": [4, 2, 1],
+                        "block": [256, 1, 1],
+                        "pdl": True,
+                        "when": {"var": "tokens", "min": 2, "max": 8},
+                    },
+                    {
+                        "module": "bf16_gemv_sm120",
+                        "entry": "kern_bf16_gemm_pair_m16_sm120",
+                        "grid": [4, 2, 1],
+                        "block": [256, 1, 1],
+                        "pdl": True,
+                        "when": {"var": "tokens", "min": 9, "max": 16},
+                    },
+                    {
+                        "module": "bf16_gemv_sm120",
+                        "entry": "kern_bf16_gemm_pair_m32_sm120",
+                        "grid": [4, 2, 1],
+                        "block": [256, 1, 1],
+                        "pdl": True,
+                        "when": {"var": "tokens", "min": 17, "max": 32},
+                    },
+                    {
+                        "module": "bf16_gemv_sm120",
+                        "entry": "kern_bf16_gemm_pair_m64_sm120",
+                        "grid": [4, 2, 1],
+                        "block": [256, 1, 1],
+                        "pdl": True,
+                        "when": {"var": "tokens", "min": 33, "max": 64},
+                    },
+                    {
+                        "entry": "extern:cublaslt_bf16_tn",
+                        "params": gemm_params,
+                        "args": pair_cublas_0,
+                        "when": {"var": "tokens", "min": 65},
+                    },
+                    {
+                        "entry": "extern:cublaslt_bf16_tn",
+                        "params": gemm_params,
+                        "args": pair_cublas_1,
+                        "when": {"var": "tokens", "min": 65},
                     },
                 ]
             },
@@ -1243,6 +1375,18 @@ def emit_sconv_kv(
     t_var = _mode_tokens(mode)
     raw_base = visit_idx * max_seqs * 8 * SCONV_RAW_ROW_ELEMS
 
+    use_pair_dyn = (not is_local) and (mode != "prefill")
+    if use_pair_dyn:
+        calls.append({
+            "label": f"v{visit_idx}.kv_sconv.dyn",
+            "op": "m3_gemm_bf16_pair_dyn",
+            "args": [
+                x_k, _b(f"model.llm.layers.{phys_idx}.attn.k_sconv.weight_proj"), _b("sconv.dyn_k"),
+                x_v, _b(f"model.llm.layers.{phys_idx}.attn.v_sconv.weight_proj"), _b("sconv.dyn_v"),
+                {"var": t_var}, _i32(32), _i32(HIDDEN_SIZE),
+            ],
+        })
+
     for stream, x_in, x_src, out_buf, stride in (
         ("k", k_in, x_k, k_out, stride_k),
         ("v", v_in, x_v, v_out, stride_v),
@@ -1276,13 +1420,14 @@ def emit_sconv_kv(
                 })
         else:
             dyn_buf = _b(f"sconv.dyn_{stream}")
-            w_proj = _b(f"model.llm.layers.{phys_idx}.attn.{stream}_sconv.weight_proj")
             w_static = _b(f"model.llm.layers.{phys_idx}.attn.{stream}_sconv.static_w")
-            calls.append({
-                "label": f"v{visit_idx}.{stream}_sconv.dyn",
-                "op": "m3_gemm_bf16",
-                "args": [x_src, w_proj, dyn_buf, {"var": t_var}, _i32(32), _i32(HIDDEN_SIZE)],
-            })
+            if not use_pair_dyn:
+                w_proj = _b(f"model.llm.layers.{phys_idx}.attn.{stream}_sconv.weight_proj")
+                calls.append({
+                    "label": f"v{visit_idx}.{stream}_sconv.dyn",
+                    "op": "m3_gemm_bf16",
+                    "args": [x_src, w_proj, dyn_buf, {"var": t_var}, _i32(32), _i32(HIDDEN_SIZE)],
+                })
             if mode == "prefill":
                 calls.append({
                     "label": f"v{visit_idx}.{stream}_sconv",
