@@ -307,9 +307,12 @@ def build_m4_kernels(
         (
             "dspark_attn_ring",
             dspark_py._dspark_attn_ring_kernel,
-            "*bf16,*bf16,*bf16,*fp8e4nv,*i32,*i32,*bf16,fp32,fp32,fp32,i64,i64,i64,i64,i64,24,8,128,8,1024,1032,32,64",
+            "*bf16,*bf16,*bf16,*fp8e4nv,*i32,*i32,*bf16,fp32,fp32,fp32,i64,i64,i64,i64,i64,24,8,128,8,1024,1032,32,32",
             4,
-            {},
+            {
+                "__opts__": {"num_stages": 3, "enable_fp_fusion": True},
+                "__attrs__": {(i,): [["tt.divisibility", 16]] for i in (0, 1, 2, 3, 6, 10, 11, 12, 13, 14)},
+            },
         ),
         (
             "dspark_attn_combine_16",

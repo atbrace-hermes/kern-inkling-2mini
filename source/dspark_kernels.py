@@ -287,85 +287,158 @@ def _dspark_attn_ring_kernel(
     """Bidirectional block attention for local DSpark layers (0, 2) over FP8 ring + live BF16 block."""
     G: tl.constexpr = H // HKV
     LOG2E: tl.constexpr = 1.4426950408889634
+    KV_WIDTH: tl.constexpr = HKV * D
+    SLOT_STRIDE: tl.constexpr = 2 * KV_WIDTH
     kv_head = tl.program_id(0)
     seq = tl.program_id(1)
 
     seqlen_k = tl.load(Lengths + seq)
-    line = tl.load(Lines + seq).to(tl.int64)
-    prefix = tl.maximum(seqlen_k - BLOCK_SIZE, 0)
-
     rows = tl.arange(0, BLOCK_M)
     tok = rows // G
-    row_valid = (tok < BLOCK_SIZE) & (seqlen_k > 0)
     head = kv_head * G + (rows % G)
     token = (seq * BLOCK_SIZE + tok).to(tl.int64)
+    row_store = tok < BLOCK_SIZE
     offs_d = tl.arange(0, D)
+
+    if seqlen_k <= 0:
+        tl.store(
+            Out + token[:, None] * stride_out_t + head[:, None] * D + offs_d[None, :],
+            tl.zeros([BLOCK_M, D], tl.bfloat16),
+            mask=row_store[:, None],
+        )
+        return
+
+    line = tl.load(Lines + seq).to(tl.int64)
+    prefix = tl.maximum(seqlen_k - BLOCK_SIZE, 0)
+    num_live = seqlen_k - prefix
+    first_key = tl.maximum(0, seqlen_k - WINDOW) if WINDOW > 0 else 0
 
     q = tl.load(
         Q + token[:, None] * stride_q_t + head[:, None] * D + offs_d[None, :],
-        mask=row_valid[:, None],
+        mask=row_store[:, None],
         other=0.0,
     )
 
-    first_key = tl.maximum(0, seqlen_k - WINDOW) if WINDOW > 0 else 0
-    n_lo = first_key // BLOCK_N
-    n_hi = (seqlen_k + BLOCK_N - 1) // BLOCK_N
-    num_iters = tl.maximum(n_hi - n_lo, 0)
-
-    qk_scale = softmax_scale * LOG2E
+    qk_scale_old = softmax_scale * k_scale * LOG2E
     m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
     l_i = tl.zeros([BLOCK_M], tl.float32)
     acc = tl.zeros([BLOCK_M, D], tl.float32)
 
-    kv_width = HKV * D
-    cache_base = tl.maximum(line, 0) * cache_seq_stride
-    offs_n = tl.arange(0, BLOCK_N)
+    if (line > 0) & (first_key < prefix):
+        cache_base = tl.multiple_of(line * cache_seq_stride + kv_head.to(tl.int64) * D, 16)
+        offs_n = tl.arange(0, BLOCK_N)
+        n_lo = first_key // BLOCK_N
+        n_hi = tl.cdiv(prefix, BLOCK_N)
+        # Full interior tiles strictly inside [first_key, prefix)
+        full_lo = tl.cdiv(first_key, BLOCK_N)
+        full_hi = prefix // BLOCK_N
 
-    for i in range(num_iters):
-        keys = (n_lo + i) * BLOCK_N + offs_n
-        in_window = (keys >= first_key) & (keys < seqlen_k)
-        is_old = in_window & (keys < prefix) & (line > 0)
-        is_live = in_window & (keys >= prefix)
+        # Leading partial tile (if first_key is not BLOCK_N-aligned)
+        if n_lo < full_lo:
+            key_base = n_lo * BLOCK_N
+            keys = key_base + offs_n
+            is_old = (keys >= first_key) & (keys < prefix)
+            ring_base = (key_base % RING).to(tl.int64)
+            tile_base = tl.multiple_of(cache_base + ring_base * SLOT_STRIDE, 16)
+            k = tl.load(
+                Cache + tile_base + offs_n[:, None] * SLOT_STRIDE + offs_d[None, :],
+                mask=is_old[:, None],
+                other=0.0,
+            ).to(tl.bfloat16)
+            s = tl.dot(q, tl.trans(k)) * qk_scale_old
+            s = tl.where(is_old[None, :], s, float("-inf"))
+            m_new = tl.maximum(m_i, tl.max(s, 1))
+            m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
+            alpha = _ex2(m_i - m_safe)
+            p = _ex2(s - m_safe[:, None])
+            l_i = l_i * alpha + tl.sum(p, 1)
+            v = tl.load(
+                Cache + tile_base + KV_WIDTH + offs_n[:, None] * SLOT_STRIDE + offs_d[None, :],
+                mask=is_old[:, None],
+                other=0.0,
+            ).to(tl.bfloat16)
+            acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v)
+            m_i = m_new
 
-        ring_slots = (keys % RING).to(tl.int64)
-        old_at = cache_base + ring_slots * (2 * kv_width) + kv_head * D
-        old_k_fp8 = tl.load(Cache + old_at[None, :] + offs_d[:, None], mask=is_old[None, :], other=0.0)
-        old_v_fp8 = tl.load(Cache + old_at[:, None] + kv_width + offs_d[None, :], mask=is_old[:, None], other=0.0)
-        old_k = (old_k_fp8.to(tl.float32) * k_scale).to(tl.bfloat16)
-        old_v = (old_v_fp8.to(tl.float32) * v_scale).to(tl.bfloat16)
+        # Hot loop: 100% full non-wrapping ring tiles, coalesced [BLOCK_N, D] loads, zero per-key masks
+        full_hi_loop = tl.maximum(full_lo, full_hi)
+        for n in range(full_lo, full_hi_loop):
+            key_base = n * BLOCK_N
+            ring_base = (key_base % RING).to(tl.int64)
+            tile_base = tl.multiple_of(cache_base + ring_base * SLOT_STRIDE, 16)
+            k = tl.load(
+                Cache + tile_base + offs_n[:, None] * SLOT_STRIDE + offs_d[None, :],
+            ).to(tl.bfloat16)
+            s = tl.dot(q, tl.trans(k))
+            m_new = tl.maximum(m_i, tl.max(s, 1) * qk_scale_old)
+            alpha = _ex2(m_i - m_new)
+            p = _ex2(s * qk_scale_old - m_new[:, None])
+            l_i = l_i * alpha + tl.sum(p, 1)
+            v = tl.load(
+                Cache + tile_base + KV_WIDTH + offs_n[:, None] * SLOT_STRIDE + offs_d[None, :],
+            ).to(tl.bfloat16)
+            acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v)
+            m_i = m_new
 
-        live_tok = (seq * BLOCK_SIZE + tl.maximum(keys - prefix, 0)).to(tl.int64)
-        live_k = tl.load(
-            K + live_tok[None, :] * stride_k_t + kv_head * D + offs_d[:, None],
-            mask=is_live[None, :],
-            other=0.0,
-        )
-        live_v = tl.load(
-            V + live_tok[:, None] * stride_v_t + kv_head * D + offs_d[None, :],
-            mask=is_live[:, None],
-            other=0.0,
-        )
+        # Trailing partial tile (if prefix is not BLOCK_N-aligned and not already covered by leading tile)
+        if (full_hi < n_hi) & (full_hi >= full_lo):
+            key_base = full_hi * BLOCK_N
+            keys = key_base + offs_n
+            is_old = (keys >= first_key) & (keys < prefix)
+            ring_base = (key_base % RING).to(tl.int64)
+            tile_base = tl.multiple_of(cache_base + ring_base * SLOT_STRIDE, 16)
+            k = tl.load(
+                Cache + tile_base + offs_n[:, None] * SLOT_STRIDE + offs_d[None, :],
+                mask=is_old[:, None],
+                other=0.0,
+            ).to(tl.bfloat16)
+            s = tl.dot(q, tl.trans(k)) * qk_scale_old
+            s = tl.where(is_old[None, :], s, float("-inf"))
+            m_new = tl.maximum(m_i, tl.max(s, 1))
+            m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
+            alpha = _ex2(m_i - m_safe)
+            p = _ex2(s - m_safe[:, None])
+            l_i = l_i * alpha + tl.sum(p, 1)
+            v = tl.load(
+                Cache + tile_base + KV_WIDTH + offs_n[:, None] * SLOT_STRIDE + offs_d[None, :],
+                mask=is_old[:, None],
+                other=0.0,
+            ).to(tl.bfloat16)
+            acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v)
+            m_i = m_new
 
-        k = tl.where((keys < prefix)[None, :], old_k, live_k)
-        v = tl.where((keys < prefix)[:, None], old_v, live_v)
+    acc = acc * v_scale
 
-        s = tl.dot(q, k) * qk_scale
-        visible = in_window & ((line > 0) | (keys >= prefix))
-        s = tl.where(visible[None, :], s, float("-inf"))
-        m_new = tl.maximum(m_i, tl.max(s, 1))
-        m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
-        alpha = tl.exp2(m_i - m_safe)
-        p = tl.exp2(s - m_safe[:, None])
-        l_i = l_i * alpha + tl.sum(p, 1)
-        acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v)
-        m_i = m_new
+    # Live BF16 draft block (1..BLOCK_SIZE tokens)
+    LIVE_N: tl.constexpr = 16
+    offs_live = tl.arange(0, LIVE_N)
+    is_live = offs_live < num_live
+    live_tok = (seq * BLOCK_SIZE + offs_live).to(tl.int64)
+    k_live = tl.load(
+        K + live_tok[:, None] * stride_k_t + kv_head * D + offs_d[None, :],
+        mask=is_live[:, None],
+        other=0.0,
+    )
+    s_live = tl.dot(q, tl.trans(k_live)) * (softmax_scale * LOG2E)
+    s_live = tl.where(is_live[None, :], s_live, float("-inf"))
+    m_new = tl.maximum(m_i, tl.max(s_live, 1))
+    m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
+    alpha = _ex2(m_i - m_safe)
+    p_live = _ex2(s_live - m_safe[:, None])
+    l_i = l_i * alpha + tl.sum(p_live, 1)
+    v_live = tl.load(
+        V + live_tok[:, None] * stride_v_t + kv_head * D + offs_d[None, :],
+        mask=is_live[:, None],
+        other=0.0,
+    )
+    acc = acc * alpha[:, None] + tl.dot(p_live.to(tl.bfloat16), v_live)
 
     empty = l_i == 0.0
-    o = tl.where(seqlen_k > 0, acc / tl.where(empty, 1.0, l_i)[:, None], 0.0)
+    o = acc / tl.where(empty, 1.0, l_i)[:, None]
     tl.store(
         Out + token[:, None] * stride_out_t + head[:, None] * D + offs_d[None, :],
         o.to(Out.dtype.element_ty),
-        mask=(tok < BLOCK_SIZE)[:, None],
+        mask=row_store[:, None],
     )
 
 
