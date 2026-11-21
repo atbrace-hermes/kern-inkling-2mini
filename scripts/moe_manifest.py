@@ -888,9 +888,10 @@ def register_ops(
         simple_op(
             "moe_quant_nvfp4",
             "moe_swiglu_quant",
-            "moe_quant_nvfp4",
+            "moe_quant_nvfp4_v2",
             [
                 "in buffer<bf16>",
+                "in buffer<i32>",
                 "in buffer<i32>",
                 "in buffer<i32>",
                 "out buffer<u8>",
@@ -921,9 +922,10 @@ def register_ops(
         simple_op(
             "moe_quant_mxfp8",
             "moe_swiglu_quant",
-            "moe_quant_mxfp8",
+            "moe_quant_mxfp8_v2",
             [
                 "in buffer<bf16>",
+                "in buffer<i32>",
                 "in buffer<i32>",
                 "in buffer<i32>",
                 "out buffer<fp8e4m3>",
@@ -1109,12 +1111,13 @@ def emit_moe_layer_calls(
                     "op": "moe_quant_nvfp4",
                     "args": [
                         _b(input_buf),
-                        _b("moe.dst2src"),
+                        _b("moe.ids"),
+                        _b("moe.src2dst"),
                         _b("moe.m_indptr"),
                         _b("moe.xq_nvfp4"),
                         _b("moe.xsf_nvfp4"),
                         _b("moe.x_amax"),
-                        n_expr,
+                        t_var,
                     ],
                 },
                 {
@@ -1186,11 +1189,12 @@ def emit_moe_layer_calls(
                     "op": "moe_quant_mxfp8",
                     "args": [
                         _b(input_buf),
-                        _b("moe.dst2src"),
+                        _b("moe.ids"),
+                        _b("moe.src2dst"),
                         _b("moe.m_indptr"),
                         _b("moe.xq_mxfp8"),
                         _b("moe.xsf_mxfp8"),
-                        n_expr,
+                        t_var,
                     ],
                 },
                 {

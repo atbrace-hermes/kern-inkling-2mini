@@ -57,7 +57,7 @@ flags = "plain"
 includes = []
 
 [kernels."moe_swiglu_quant"]
-sha256 = "1352afb8ea57ee16e2934e5512051883d99488c86f199c72ee8a1362a235296d"
+sha256 = "36e5fc69003ed844aee055191d6c876b60c326f3945c6c22b4c6371aab33973c"
 milestone = "M2"
 source = "source/moe_swiglu_quant.cu"
 flags = "plain"

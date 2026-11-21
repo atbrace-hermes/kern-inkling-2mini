@@ -82,6 +82,81 @@ __device__ __forceinline__ void quantize_part(
   scale = choose4 ? bits4 : bits6;
 }
 
+// Fast bit-exact quantize_part for E=4 (kSplit=4 aligned within warp):
+// - encoder/decoder/outer hoisted once per CTA via SMEM
+// - scale6/scale4/inverse6/inverse4 computed once per 4-thread block (part==0) and shuffled
+template <int E>
+__device__ __forceinline__ void quantize_part_fast(
+    float const (&x)[E], float encoder, float decoder, float outer, float block_max,
+    uint32_t& packed, uint8_t& scale) {
+  static_assert(E == 4, "quantize_part_fast assumes 4 threads per 16-elem block");
+  int const group_leader = (threadIdx.x & 31) & ~3;
+  uint8_t bits6 = 0, bits4 = 0;
+  float scale6 = 0.0f, scale4 = 0.0f, inverse6 = 0.0f, inverse4 = 0.0f;
+  if ((threadIdx.x & 3) == 0) {
+    scale6 = e4m3_round(fminf(__fmul_rn(block_max, __fmul_rn(encoder, float(1.0 / 6.0))), 448.0f), bits6);
+    scale4 = e4m3_round(fminf(__fmul_rn(block_max, __fmul_rn(encoder, 0.25f)), 448.0f), bits4);
+    inverse6 = fminf(__fdiv_rn(1.0f, __fmul_rn(scale6, decoder)), kFltMax);
+    inverse4 = fminf(__fdiv_rn(1.0f, __fmul_rn(scale4, decoder)), kFltMax);
+  }
+  scale6 = __shfl_sync(0xFFFFFFFFu, scale6, group_leader);
+  scale4 = __shfl_sync(0xFFFFFFFFu, scale4, group_leader);
+  inverse6 = __shfl_sync(0xFFFFFFFFu, inverse6, group_leader);
+  inverse4 = __shfl_sync(0xFFFFFFFFu, inverse4, group_leader);
+  uint32_t p6 = 0, p4 = 0;
+  float e6[E], e4[E];
+#pragma unroll
+  for (int i = 0; i < E / 2; ++i) {
+    float r0, r1;
+    p6 |= e2m1_pack(__fmul_rn(x[2 * i], inverse6), __fmul_rn(x[2 * i + 1], inverse6), r0, r1) << (8 * i);
+    e6[2 * i] = fabsf(__fsub_rn(__fmul_rn(__fmul_rn(r0, scale6), outer), x[2 * i]));
+    e6[2 * i + 1] = fabsf(__fsub_rn(__fmul_rn(__fmul_rn(r1, scale6), outer), x[2 * i + 1]));
+    p4 |= e2m1_pack(__fmul_rn(x[2 * i], inverse4), __fmul_rn(x[2 * i + 1], inverse4), r0, r1) << (8 * i);
+    e4[2 * i] = fabsf(__fsub_rn(__fmul_rn(__fmul_rn(r0, scale4), outer), x[2 * i]));
+    e4[2 * i + 1] = fabsf(__fsub_rn(__fmul_rn(__fmul_rn(r1, scale4), outer), x[2 * i + 1]));
+  }
+#pragma unroll
+  for (int width = E / 2; width >= 1; width /= 2) {
+#pragma unroll
+    for (int i = 0; i < width; ++i) {
+      e6[i] = __fadd_rn(e6[2 * i], e6[2 * i + 1]);
+      e4[i] = __fadd_rn(e4[2 * i], e4[2 * i + 1]);
+    }
+  }
+#pragma unroll
+  for (int s = 1; s < 16 / E; s *= 2) {
+    e6[0] = __fadd_rn(e6[0], __shfl_xor_sync(0xFFFFFFFFu, e6[0], s));
+    e4[0] = __fadd_rn(e4[0], __shfl_xor_sync(0xFFFFFFFFu, e4[0], s));
+  }
+  bool choose4 = e4[0] < e6[0];
+  packed = choose4 ? p4 : p6;
+  scale = choose4 ? bits4 : bits6;
+}
+
+template <int kThreads>
+__device__ __forceinline__ float block_max_reduce_with_enc(
+    float v, float* red, float* s_enc_dec_out) {
+#pragma unroll
+  for (int s = 16; s >= 1; s /= 2) v = fmaxf(v, __shfl_xor_sync(0xFFFFFFFFu, v, s));
+  constexpr int kWarps = kThreads / 32;
+  if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = v;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float m = red[0];
+#pragma unroll
+    for (int w = 1; w < kWarps; ++w) m = fmaxf(m, red[w]);
+    float enc = fminf(__fdiv_rn(1536.0f, m), kFltMax);
+    float dec = __fdiv_rn(1.0f, enc);
+    float out = __fmul_rn(m, float(1.0 / 1536.0));
+    s_enc_dec_out[0] = m;
+    s_enc_dec_out[1] = enc;
+    s_enc_dec_out[2] = dec;
+    s_enc_dec_out[3] = out;
+  }
+  __syncthreads();
+  return s_enc_dec_out[0];
+}
+
 template <int E>
 __device__ __forceinline__ float part_max(float const (&x)[E]) {
   float m = 0.0f;
@@ -133,6 +208,53 @@ __device__ __forceinline__ void load_offsets(int const* offsets, int* s_offsets)
   __syncthreads();
 }
 
+__device__ __forceinline__ int load_offsets_and_tails(
+    int const* offsets, int* s_offsets, uint8_t* s_tail_exp) {
+  for (int i = threadIdx.x; i <= kNumExperts; i += blockDim.x) {
+    s_offsets[i] = offsets[i];
+  }
+  __syncthreads();
+  __shared__ int s_ntail;
+  if (threadIdx.x < 32) {
+    int lane = threadIdx.x;
+    int base = 0;
+#pragma unroll
+    for (int g = 0; g < 4; ++g) {
+      int e = g * 32 + lane;
+      bool need = (((s_offsets[e + 1] - s_offsets[e]) & 127) != 0);
+      unsigned mask = __ballot_sync(0xFFFFFFFFu, need);
+      if (need) {
+        s_tail_exp[base + __popc(mask & ((1u << lane) - 1))] = uint8_t(e);
+      }
+      base += __popc(mask);
+    }
+    if (lane == 0) s_ntail = base;
+  }
+  __syncthreads();
+  return s_ntail;
+}
+
+__device__ __forceinline__ void zero_tails_fast(
+    int const* offsets, uint8_t const* s_tail_exp, int n_tail, uint8_t* x_scales, int scale_k) {
+  int const atoms = scale_k / 4;
+  int const lane = threadIdx.x & 31;
+  int const warps = blockDim.x >> 5;
+  int const total_items = n_tail * atoms;
+  for (int item = blockIdx.x * warps + (threadIdx.x >> 5); item < total_items;
+       item += gridDim.x * warps) {
+    int e = int(s_tail_exp[item / atoms]);
+    int count = offsets[e + 1] - offsets[e];
+    int used = count & 127;
+    uint32_t* atom = reinterpret_cast<uint32_t*>(
+        x_scales + scale_base(offsets, e, scale_k) +
+        (int64_t(count / 128) * atoms + (item % atoms)) * 512 + lane * 16);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      if (lane + 32 * i >= used) atom[i] = 0;
+    }
+  }
+}
+
 __device__ __forceinline__ void zero_tails(
     int const* offsets, uint8_t* x_scales, int scale_k) {
   int const atoms = scale_k / 4;
@@ -162,7 +284,7 @@ __device__ __forceinline__ float capped_swiglu(float gate, float up, float gamma
       : "=f"(sigmoid)
       : "f"(gate));
   float tg, tu;
-  asm("tanh.approx.f32 %0, %1;" : "=f"(tg) : "f"(__fdiv_rn(gate, kGateCap)));
+  asm("tanh.approx.f32 %0, %1;" : "=f"(tg) : "f"(__fmul_rn(gate, 0.25f)));
   gate = __fmul_rn(kGateCap, tg);
   asm("tanh.approx.f32 %0, %1;" : "=f"(tu) : "f"(__fdiv_rn(up, kUpCap)));
   up = __fmul_rn(kUpCap, tu);
@@ -278,6 +400,87 @@ extern "C" __global__ void __launch_bounds__(576) moe_quant_nvfp4(
 #endif
 }
 
+// 8x-deduplicated NVFP4 quantization: quantizes each unique token t in [0, T) ONCE and
+// scatters packed NVFP4, 128x4 swizzled E4M3 scales, and x_amax to its 8 routed destinations.
+// K=2304 -> 144 blocks of 16, split=4 -> 576 threads (18 warps) per CTA, E=4 values/thread.
+// Grid: (min(T, 2048), 1, 1), Block: (576, 1, 1)
+extern "C" __global__ void __launch_bounds__(576) moe_quant_nvfp4_v2(
+    const __nv_bfloat16* __restrict__ x,
+    const int* __restrict__ ids,
+    const int* __restrict__ src2dst,
+    const int* __restrict__ m_indptr,
+    uint8_t* __restrict__ values,
+    uint8_t* __restrict__ x_scales,
+    float* __restrict__ x_amax,
+    int T) {
+  constexpr int kThreads = 576;
+  constexpr int kSplit = 4;
+  constexpr int kE = 4;
+  constexpr int kScaleK = kHidden / 16;  // 144
+
+  __shared__ int s_offsets[kNumExperts + 1];
+  __shared__ uint8_t s_tail_exp[kNumExperts];
+  __shared__ float red[2][kThreads / 32];
+  __shared__ float s_enc[2][4];
+  __shared__ int s_dst[2][kTopK];
+  __shared__ int64_t s_scale_row_off[2][kTopK];
+
+#if (__CUDA_ARCH__ >= 900)
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+  int const n_tail = load_offsets_and_tails(m_indptr, s_offsets, s_tail_exp);
+  int const block = threadIdx.x / kSplit;
+  int const part = threadIdx.x % kSplit;
+  int const scale_col_off = (block >> 2) * 512 + (block & 3);
+  int const val_col_off = block * 8 + part * 2;
+  int parity = 0;
+
+  for (int t = blockIdx.x; t < T; t += gridDim.x, parity ^= 1) {
+    if (threadIdx.x < kTopK) {
+      int dst = src2dst[int64_t(t) * kTopK + threadIdx.x];
+      int e = ids[int64_t(t) * kTopK + threadIdx.x];
+      int local_r = dst - s_offsets[e];
+      s_dst[parity][threadIdx.x] = dst;
+      s_scale_row_off[parity][threadIdx.x] =
+          scale_base(s_offsets, e, kScaleK) +
+          int64_t(local_r >> 7) * (kScaleK / 4) * 512 +
+          (local_r & 31) * 16 + ((local_r >> 5) & 3) * 4;
+    }
+
+    float v[kE];
+    const __nv_bfloat16* src = x + int64_t(t) * kHidden + block * 16 + part * kE;
+    uint2 raw = *reinterpret_cast<const uint2*>(src);
+    const __nv_bfloat16* h = reinterpret_cast<const __nv_bfloat16*>(&raw);
+#pragma unroll
+    for (int i = 0; i < kE; ++i) v[i] = __bfloat162float(h[i]);
+
+    float block_max = part_max<kE>(v);
+    float amax = block_max_reduce_with_enc<kThreads>(block_max, red[parity], s_enc[parity]);
+    uint32_t packed;
+    uint8_t scale;
+    quantize_part_fast<kE>(
+        v, s_enc[parity][1], s_enc[parity][2], s_enc[parity][3], block_max, packed, scale);
+
+    if (threadIdx.x < kTopK) {
+      x_amax[s_dst[parity][threadIdx.x]] = amax;
+    }
+    uint16_t packed16 = uint16_t(packed);
+#pragma unroll
+    for (int k = 0; k < kTopK; ++k) {
+      int dst = s_dst[parity][k];
+      *reinterpret_cast<uint16_t*>(values + int64_t(dst) * (kHidden / 2) + val_col_off) = packed16;
+      if (part == 0) {
+        x_scales[s_scale_row_off[parity][k] + scale_col_off] = scale;
+      }
+    }
+  }
+  zero_tails_fast(s_offsets, s_tail_exp, n_tail, x_scales, kScaleK);
+#if (__CUDA_ARCH__ >= 900)
+  __syncthreads();
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
+}
+
 // Softcapped SwiGLU (interleaved [gate, up]) + NVFP4 fouroversix_mae quantization (N=1152).
 // N=1152 -> 72 blocks of 16, split=4 -> 288 threads (9 warps) per CTA, E=4 values/thread.
 // Grid: (min(n, 2048), 1, 1), Block: (288, 1, 1)
@@ -366,12 +569,14 @@ extern "C" __global__ void __launch_bounds__(288) moe_swiglu_quant_nvfp4_bf16(
   constexpr int kScaleK = kInter / 16;  // 72
 
   __shared__ int s_offsets[kNumExperts + 1];
+  __shared__ uint8_t s_tail_exp[kNumExperts];
   __shared__ float red[2][kThreads / 32];
+  __shared__ float s_enc[2][4];
 
 #if (__CUDA_ARCH__ >= 900)
   asm volatile("griddepcontrol.wait;" ::: "memory");
 #endif
-  load_offsets(m_indptr, s_offsets);
+  int const n_tail = load_offsets_and_tails(m_indptr, s_offsets, s_tail_exp);
   int const block = threadIdx.x / kSplit;
   int const part = threadIdx.x % kSplit;
   int const total_rows = s_offsets[kNumExperts];
@@ -392,10 +597,11 @@ extern "C" __global__ void __launch_bounds__(288) moe_swiglu_quant_nvfp4_bf16(
     }
 
     float block_max = part_max<kE>(v);
-    float amax = block_max_reduce<kThreads>(block_max, red[parity]);
+    float amax = block_max_reduce_with_enc<kThreads>(block_max, red[parity], s_enc[parity]);
     uint32_t packed;
     uint8_t scale_bits;
-    quantize_part<kE>(v, amax, block_max, packed, scale_bits);
+    quantize_part_fast<kE>(
+        v, s_enc[parity][1], s_enc[parity][2], s_enc[parity][3], block_max, packed, scale_bits);
 
     if (threadIdx.x == 0) act_amax[row] = amax;
     uint8_t* dst = values + int64_t(row) * (kInter / 2) + block * 8 + part * 2;
@@ -406,7 +612,7 @@ extern "C" __global__ void __launch_bounds__(288) moe_swiglu_quant_nvfp4_bf16(
                scale_offset(row - s_offsets[expert], block, kScaleK)] = scale_bits;
     }
   }
-  zero_tails(s_offsets, x_scales, kScaleK);
+  zero_tails_fast(s_offsets, s_tail_exp, n_tail, x_scales, kScaleK);
 #if (__CUDA_ARCH__ >= 900)
   __syncthreads();
   asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
@@ -461,6 +667,80 @@ extern "C" __global__ void __launch_bounds__(160) moe_quant_mxfp8(
     }
   }
   zero_tails(s_offsets, x_scales, kScaleK);
+#if (__CUDA_ARCH__ >= 900)
+  __syncthreads();
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
+}
+
+// 8x-deduplicated MXFP8 quantization: quantizes each unique token t in [0, T) ONCE and
+// scatters FP8 values + 128x4 swizzled UE8M0 scales to its 8 routed destinations.
+// K=2304 -> 144 half-blocks of 16 -> 160 threads (5 warps), active block < 144.
+// Grid: (min(T, 2048), 1, 1), Block: (160, 1, 1)
+extern "C" __global__ void __launch_bounds__(160) moe_quant_mxfp8_v2(
+    const __nv_bfloat16* __restrict__ x,
+    const int* __restrict__ ids,
+    const int* __restrict__ src2dst,
+    const int* __restrict__ m_indptr,
+    uint8_t* __restrict__ values,
+    uint8_t* __restrict__ x_scales,
+    int T) {
+  constexpr int kScaleK = kHidden / 32;  // 72
+  constexpr int kHalfBlocks = kHidden / 16;  // 144
+
+  __shared__ int s_offsets[kNumExperts + 1];
+  __shared__ uint8_t s_tail_exp[kNumExperts];
+  __shared__ int s_dst[kTopK];
+  __shared__ int64_t s_scale_row_off[kTopK];
+#if (__CUDA_ARCH__ >= 900)
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+  int const n_tail = load_offsets_and_tails(m_indptr, s_offsets, s_tail_exp);
+  int const block = threadIdx.x;
+  bool const active = (block < kHalfBlocks);
+  int const scale_col = block >> 1;
+  int const scale_col_off = (scale_col >> 2) * 512 + (scale_col & 3);
+
+  for (int t = blockIdx.x; t < T; t += gridDim.x) {
+    if (threadIdx.x < kTopK) {
+      int dst = src2dst[int64_t(t) * kTopK + threadIdx.x];
+      int e = ids[int64_t(t) * kTopK + threadIdx.x];
+      int local_r = dst - s_offsets[e];
+      s_dst[threadIdx.x] = dst;
+      s_scale_row_off[threadIdx.x] =
+          scale_base(s_offsets, e, kScaleK) +
+          int64_t(local_r >> 7) * (kScaleK / 4) * 512 +
+          (local_r & 31) * 16 + ((local_r >> 5) & 3) * 4;
+    }
+    __syncthreads();
+
+    float v[16];
+    if (active) {
+      const uint4* src = reinterpret_cast<const uint4*>(x + int64_t(t) * kHidden + block * 16);
+      uint4 raw[2] = {src[0], src[1]};
+      const __nv_bfloat16* h = reinterpret_cast<const __nv_bfloat16*>(raw);
+#pragma unroll
+      for (int i = 0; i < 16; ++i) v[i] = __bfloat162float(h[i]);
+    } else {
+#pragma unroll
+      for (int i = 0; i < 16; ++i) v[i] = 0.0f;
+    }
+    uint4 packed;
+    uint8_t exponent;
+    mxfp8_half_block(v, packed, exponent);
+    if (active) {
+#pragma unroll
+      for (int k = 0; k < kTopK; ++k) {
+        int dst = s_dst[k];
+        *reinterpret_cast<uint4*>(values + int64_t(dst) * kHidden + block * 16) = packed;
+        if ((block & 1) == 0) {
+          x_scales[s_scale_row_off[k] + scale_col_off] = exponent;
+        }
+      }
+    }
+    __syncthreads();
+  }
+  zero_tails_fast(s_offsets, s_tail_exp, n_tail, x_scales, kScaleK);
 #if (__CUDA_ARCH__ >= 900)
   __syncthreads();
   asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
