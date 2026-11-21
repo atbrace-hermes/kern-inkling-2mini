@@ -544,9 +544,291 @@ def rel_decode_combine_kernel(
     tl.store(Y + row * (H * D) + head * D + offs_d, o.to(Y.dtype.element_ty))
 
 
+@triton.jit
+def rel_attention_full_bulk_kernel(
+    Q,
+    KVState,
+    BlockTable,
+    SeqLens,
+    OBulk,
+    LseBulk,
+    num_tokens,
+    table_width,
+    sm_scale,
+    H: tl.constexpr,
+    HKV: tl.constexpr,
+    G: tl.constexpr,
+    D: tl.constexpr,
+    E: tl.constexpr,
+    PAGE: tl.constexpr,
+    BULK_ALIGN: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Per-Q-head paged FP8 full-attention bulk loop (keys with dist >= E: no Rel bias, no causal mask).
+
+    Produces unscaled normalized OBulk [tokens, H, D] fp32 and log2 LseBulk [tokens, H] fp32
+    over pages [0, n_bulk_pages) where n_bulk_pages is aligned to BULK_ALIGN=128 tokens.
+    """
+    STRIDE_KV_BLK: tl.constexpr = 9 * 2 * HKV * PAGE * D
+    STRIDE_KV_HALF: tl.constexpr = HKV * PAGE * D
+    STRIDE_KV_H: tl.constexpr = PAGE * D
+
+    m_tile = tl.program_id(0)
+    head = tl.program_id(1)
+    kv_head = head // G
+
+    first_tok = m_tile * BLOCK_M
+    if first_tok >= num_tokens:
+        return
+
+    seqlen_k = tl.load(SeqLens)
+    past = seqlen_k - num_tokens
+
+    aligned_tok = (first_tok // BULK_ALIGN) * BULK_ALIGN
+    aligned_pos_lo = past + aligned_tok
+    n_bulk_pages = tl.minimum(tl.maximum(aligned_pos_lo - E + 1, 0) // PAGE, seqlen_k // PAGE)
+    if n_bulk_pages <= 0:
+        tl.extra.cuda.gdc_launch_dependents()
+        return
+
+    offs_m = first_tok + tl.arange(0, BLOCK_M)
+    row_valid = offs_m < num_tokens
+    token = offs_m.to(tl.int64)
+    offs_d = tl.arange(0, D)
+    offs_n = tl.arange(0, BLOCK_N)
+
+    tl.extra.cuda.gdc_wait()
+
+    q = tl.load(
+        Q + token[:, None] * (H * D) + head * D + offs_d[None, :],
+        mask=row_valid[:, None],
+        other=0.0,
+    )
+
+    qk_scale = sm_scale * LOG2E
+    m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
+    l_i = tl.zeros([BLOCK_M], tl.float32)
+    acc = tl.zeros([BLOCK_M, D], tl.float32)
+
+    for n in range(0, n_bulk_pages):
+        page = tl.load(BlockTable + n)
+        safe_page = tl.maximum(page, 0)
+        kv_base = tl.multiple_of(safe_page.to(tl.int64) * STRIDE_KV_BLK + kv_head * STRIDE_KV_H, 128)
+        k = tl.load(KVState + kv_base + offs_n[:, None] * D + offs_d[None, :]).to(tl.bfloat16)
+        s = tl.dot(q, tl.trans(k)) * qk_scale
+        m_new = tl.maximum(m_i, tl.max(s, 1))
+        alpha = tl.exp2(m_i - m_new)
+        p = tl.exp2(s - m_new[:, None])
+        l_i = l_i * alpha + tl.sum(p, 1)
+        v = tl.load(KVState + kv_base + STRIDE_KV_HALF + offs_n[:, None] * D + offs_d[None, :]).to(tl.bfloat16)
+        acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v)
+        m_i = m_new
+
+    tl.extra.cuda.gdc_launch_dependents()
+
+    empty = l_i == 0.0
+    o = acc / tl.where(empty, 1.0, l_i)[:, None]
+    lse2 = tl.where(empty, float("-inf"), m_i + tl.log2(tl.where(empty, 1.0, l_i)))
+
+    tl.store(LseBulk + token * H + head, lse2, mask=row_valid)
+    tl.store(
+        OBulk + token[:, None] * (H * D) + head * D + offs_d[None, :],
+        o,
+        mask=row_valid[:, None],
+    )
+
+
+@triton.jit
+def rel_attention_full_tail_kernel(
+    Q,
+    KVState,
+    Rel,
+    Gate,
+    Sink,
+    BlockTable,
+    SeqLens,
+    OBulk,
+    LseBulk,
+    Out,
+    num_tokens,
+    table_width,
+    stride_gate,
+    stride_sink,
+    sm_scale,
+    v_scale,
+    H: tl.constexpr,
+    HKV: tl.constexpr,
+    G: tl.constexpr,
+    D: tl.constexpr,
+    E: tl.constexpr,
+    PAGE: tl.constexpr,
+    BULK_ALIGN: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Per-Q-head causal + Rel-bias tail loop for full prefill, merging (OBulk, LseBulk) + Gate/Sink."""
+    STRIDE_KV_BLK: tl.constexpr = 9 * 2 * HKV * PAGE * D
+    STRIDE_KV_HALF: tl.constexpr = HKV * PAGE * D
+    STRIDE_KV_H: tl.constexpr = PAGE * D
+
+    m_tile = tl.program_id(0)
+    head = tl.program_id(1)
+    kv_head = head // G
+
+    first_tok = m_tile * BLOCK_M
+    if first_tok >= num_tokens:
+        return
+
+    seqlen_k = tl.load(SeqLens)
+    past = seqlen_k - num_tokens
+
+    offs_m = first_tok + tl.arange(0, BLOCK_M)
+    row_valid = offs_m < num_tokens
+    token = offs_m.to(tl.int64)
+
+    pos = past + offs_m
+    aligned_tok = (first_tok // BULK_ALIGN) * BULK_ALIGN
+    aligned_pos_lo = past + aligned_tok
+    pos_hi = past + tl.minimum(first_tok + BLOCK_M, num_tokens) - 1
+
+    n_bulk_pages = tl.minimum(tl.maximum(aligned_pos_lo - E + 1, 0) // PAGE, seqlen_k // PAGE)
+    n_hi = tl.cdiv(tl.minimum(pos_hi + 1, seqlen_k), BLOCK_N)
+    n_start = tl.minimum(n_bulk_pages * (PAGE // BLOCK_N), n_hi)
+
+    offs_d = tl.arange(0, D)
+    offs_n = tl.arange(0, BLOCK_N)
+
+    q = tl.load(
+        Q + token[:, None] * (H * D) + head * D + offs_d[None, :],
+        mask=row_valid[:, None],
+        other=0.0,
+    )
+
+    qk_scale = sm_scale * LOG2E
+    m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
+    l_i = tl.zeros([BLOCK_M], tl.float32)
+    acc = tl.zeros([BLOCK_M, D], tl.float32)
+
+    rel_row_i32 = offs_m * (H * E) + head * E
+
+    for n in range(n_start, n_hi):
+        keys = n * BLOCK_N + offs_n
+        page_idx = (n * BLOCK_N) // PAGE
+        page_off = (n * BLOCK_N) % PAGE
+        page = tl.load(BlockTable + page_idx, mask=n * BLOCK_N < seqlen_k, other=0)
+        kv_valid = (keys < seqlen_k) & (page >= 0)
+        safe_page = tl.maximum(page, 0)
+        kv_base = tl.multiple_of(
+            safe_page.to(tl.int64) * STRIDE_KV_BLK + kv_head * STRIDE_KV_H + page_off * D,
+            128,
+        )
+        k = tl.load(
+            KVState + kv_base + offs_n[:, None] * D + offs_d[None, :],
+            mask=kv_valid[:, None],
+            other=0.0,
+        ).to(tl.bfloat16)
+
+        s = tl.dot(q, tl.trans(k)) * qk_scale
+        dist = pos[:, None] - keys[None, :]
+        visible = (dist >= 0) & kv_valid[None, :]
+        in_extent = visible & (dist < E) & row_valid[:, None]
+        safe_dist = tl.where(in_extent, dist, 0)
+        bias = tl.load(
+            Rel + (rel_row_i32[:, None] + safe_dist),
+            mask=in_extent,
+            other=0.0,
+        )
+        s += bias.to(tl.float32) * LOG2E
+        s = tl.where(visible, s, float("-inf"))
+
+        m_new = tl.maximum(m_i, tl.max(s, 1))
+        m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
+        alpha = tl.exp2(m_i - m_safe)
+        p = tl.exp2(s - m_safe[:, None])
+        l_i = l_i * alpha + tl.sum(p, 1)
+
+        v = tl.load(
+            KVState + kv_base + STRIDE_KV_HALF + offs_n[:, None] * D + offs_d[None, :],
+            mask=kv_valid[:, None],
+            other=0.0,
+        ).to(tl.bfloat16)
+        acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v)
+        m_i = m_new
+
+    empty_tail = l_i == 0.0
+    o_tail = acc / tl.where(empty_tail, 1.0, l_i)[:, None]
+    lse_tail = tl.where(empty_tail, float("-inf"), m_i + tl.log2(tl.where(empty_tail, 1.0, l_i)))
+
+    # Wait for bulk kernel's OBulk/LseBulk stores before merging.
+    tl.extra.cuda.gdc_wait()
+
+    if n_bulk_pages > 0:
+        lse_bulk = tl.load(LseBulk + token * H + head, mask=row_valid, other=float("-inf"))
+        o_bulk = tl.load(
+            OBulk + token[:, None] * (H * D) + head * D + offs_d[None, :],
+            mask=row_valid[:, None],
+            other=0.0,
+        )
+        lse_max = tl.maximum(lse_bulk, lse_tail)
+        lse_max_safe = tl.where(lse_max == float("-inf"), 0.0, lse_max)
+        w_bulk = tl.exp2(lse_bulk - lse_max_safe)
+        w_tail = tl.exp2(lse_tail - lse_max_safe)
+        w_sum = w_bulk + w_tail
+        w_sum_safe = tl.where(w_sum == 0.0, 1.0, w_sum)
+        o = ((o_bulk * w_bulk[:, None] + o_tail * w_tail[:, None]) / w_sum_safe[:, None]) * v_scale
+        lse2 = tl.where(w_sum == 0.0, float("-inf"), lse_max_safe + tl.log2(w_sum_safe))
+    else:
+        o = o_tail * v_scale
+        lse2 = lse_tail
+
+    cols = head * D + offs_d[None, :]
+    gate = tl.load(
+        Gate + token[:, None] * stride_gate + cols,
+        mask=row_valid[:, None],
+        other=0.0,
+    )
+    sink = tl.load(
+        Sink + token * stride_sink + head,
+        mask=row_valid,
+        other=0.0,
+    )
+    o = o * _sigmoid(gate.to(tl.float32))
+    o = o * _sigmoid(lse2 * LN2 - sink.to(tl.float32))[:, None]
+    tl.store(
+        Out + token[:, None] * (H * D) + cols,
+        o.to(Out.dtype.element_ty),
+        mask=row_valid[:, None],
+    )
+
+
+_ALIGNED_PTR_ARGS = frozenset({
+    "Q", "KVState", "SeqState", "KCur", "VCur", "Rel", "Gate", "Out", "OBulk", "OPart", "Y",
+})
+
+
+def _ptr_attrs(sig: dict[str, str]) -> dict[tuple[int], list[list]]:
+    return {
+        (idx,): [["tt.divisibility", 16]]
+        for idx, (arg_name, arg_type) in enumerate(sig.items())
+        if arg_type.startswith("*") and arg_name in _ALIGNED_PTR_ARGS
+    }
+
+
 def get_dsl_specs() -> list[tuple]:
     """Return M3 SM120 Triton AOT kernel specs shared by build_dsl() and scripts/attn_build.py."""
     SEQ_STATE_BYTES = 90_005_376
+    bulk_sig = {
+        "Q": "*bf16", "KVState": "*fp8e4nv",
+        "BlockTable": "*i32", "SeqLens": "*i32", "OBulk": "*fp32", "LseBulk": "*fp32",
+        "num_tokens": "i32", "table_width": "i32", "sm_scale": "fp32",
+    }
+    tail_sig = {
+        "Q": "*bf16", "KVState": "*fp8e4nv", "Rel": "*bf16", "Gate": "*bf16", "Sink": "*bf16",
+        "BlockTable": "*i32", "SeqLens": "*i32", "OBulk": "*fp32", "LseBulk": "*fp32", "Out": "*bf16",
+        "num_tokens": "i32", "table_width": "i32", "stride_gate": "i32", "stride_sink": "i32",
+        "sm_scale": "fp32", "v_scale": "fp32",
+    }
     specs = [
         (
             "attn_log_tau",
@@ -557,23 +839,45 @@ def get_dsl_specs() -> list[tuple]:
             2,
             False,
         ),
-        # Full attention (paged FP8 KV)
+        # Full attention (paged FP8 KV): 2-phase bulk + tail for tokens >= 65
         (
-            "attn_full_prefill",
-            rel_attention_full_kernel,
-            {
-                "Q": "*bf16", "KVState": "*fp8e4nv", "Rel": "*bf16", "Gate": "*bf16", "Sink": "*bf16",
-                "BlockTable": "*i32", "SeqLens": "*i32", "Out": "*bf16", "Lse": "*fp32",
-                "num_tokens": "i32", "table_width": "i32", "stride_gate": "i32", "stride_sink": "i32",
-                "sm_scale": "fp32", "v_scale": "fp32",
-            },
+            "attn_full_prefill_bulk",
+            rel_attention_full_bulk_kernel,
+            bulk_sig,
             {
                 "H": 24, "HKV": 8, "G": 3, "D": 128, "E": 1024, "PAGE": 64,
-                "QLEN_CONST": 0, "NUM_SPLITS": 1, "MODE": MODE_GATED, "BLOCK_M": 32, "BLOCK_N": 32,
+                "BULK_ALIGN": 128, "BLOCK_M": 128, "BLOCK_N": 64,
+            },
+            8,
+            2,
+            True,
+            _ptr_attrs(bulk_sig),
+        ),
+        (
+            "attn_full_prefill_bulk64",
+            rel_attention_full_bulk_kernel,
+            bulk_sig,
+            {
+                "H": 24, "HKV": 8, "G": 3, "D": 128, "E": 1024, "PAGE": 64,
+                "BULK_ALIGN": 128, "BLOCK_M": 64, "BLOCK_N": 64,
             },
             4,
             2,
             True,
+            _ptr_attrs(bulk_sig),
+        ),
+        (
+            "attn_full_prefill_tail",
+            rel_attention_full_tail_kernel,
+            tail_sig,
+            {
+                "H": 24, "HKV": 8, "G": 3, "D": 128, "E": 1024, "PAGE": 64,
+                "BULK_ALIGN": 128, "BLOCK_M": 32, "BLOCK_N": 32,
+            },
+            4,
+            2,
+            True,
+            _ptr_attrs(tail_sig),
         ),
         (
             "attn_full_prefill_split",
@@ -749,9 +1053,11 @@ def build_dsl(out_dir: Path | None = None) -> dict:
     specs = get_dsl_specs()
 
     records = {}
-    for name, kernel, sig, constants, warps, stages, fp_fusion in specs:
+    for spec in specs:
+        name, kernel, sig, constants, warps, stages, fp_fusion = spec[:7]
+        attrs = spec[7] if len(spec) > 7 else {}
         compiled = triton.compile(
-            ASTSource(kernel, signature=sig, constexprs=constants, attrs={}),
+            ASTSource(kernel, signature=sig, constexprs=constants, attrs=attrs),
             target=GPUTarget("cuda", 120, 32),
             options={"num_warps": warps, "num_stages": stages, "enable_fp_fusion": fp_fusion},
         )

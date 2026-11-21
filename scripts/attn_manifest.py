@@ -96,7 +96,9 @@ def _mul(a: Any, b: Any) -> dict[str, list[Any]]:
 
 ATTN_DSL_MODULES = (
     "attn_log_tau",
-    "attn_full_prefill",
+    "attn_full_prefill_bulk",
+    "attn_full_prefill_bulk64",
+    "attn_full_prefill_tail",
     "attn_full_prefill_split",
     "attn_full_decode1",
     "attn_full_decode8",
@@ -764,14 +766,25 @@ def register_ops(
         "i32", "i32", "i32",
     ]
 
-    # Full Prefill: split-KV (tokens <= 64) or single-split gated (tokens >= 65)
+    # Full Prefill: split-KV (tokens <= 64) or 2-phase bulk + tail (tokens >= 65)
+    full_bulk_params = [
+        "in buffer<bf16>", "in state",
+        "in buffer<i32>", "in buffer<i32>", "out buffer<f32>", "out buffer<f32>",
+        "i32", "i32", "f32",
+    ]
+    full_tail_params = [
+        "in buffer<bf16>", "in state", "in buffer<bf16>", "in buffer<bf16>", "in buffer<bf16>",
+        "in buffer<i32>", "in buffer<i32>", "in buffer<f32>", "in buffer<f32>", "out buffer<bf16>",
+        "i32", "i32", "i32", "i32", "f32", "f32",
+    ]
     ops["attn_full_prefill"] = {
         "params": full_if_params,
         "impl": {
             "scratch": {
                 "o_part": {"dtype": "f32", "shape": [16, 64, HEADS, HEAD_DIM]},
                 "lse_part": {"dtype": "f32", "shape": [16, 64, HEADS]},
-                "dummy_lse": {"dtype": "f32", "shape": [1]},
+                "o_bulk": {"dtype": "f32", "shape": ["tokens", HEADS, HEAD_DIM]},
+                "lse_bulk": {"dtype": "f32", "shape": ["tokens", HEADS]},
             },
             "launches": [
                 _triton_launch(
@@ -802,15 +815,41 @@ def register_ops(
                 ),
                 _triton_launch(
                     dsl,
-                    "attn_full_prefill",
-                    full_k_params_gated,
-                    [_ceil_div("tokens", 8), 8, 1],
+                    "attn_full_prefill_bulk64",
+                    full_bulk_params,
+                    [_ceil_div("tokens", 64), HEADS, 1],
+                    [
+                        {"param": 0}, {"param": 1},
+                        {"param": 5}, {"param": 6}, {"scratch": "o_bulk"}, {"scratch": "lse_bulk"},
+                        {"param": 8}, _i32(page_columns), {"param": 11},
+                    ],
+                    when={"var": "tokens", "min": 65, "max": 512},
+                ),
+                _triton_launch(
+                    dsl,
+                    "attn_full_prefill_bulk",
+                    full_bulk_params,
+                    [_ceil_div("tokens", 128), HEADS, 1],
+                    [
+                        {"param": 0}, {"param": 1},
+                        {"param": 5}, {"param": 6}, {"scratch": "o_bulk"}, {"scratch": "lse_bulk"},
+                        {"param": 8}, _i32(page_columns), {"param": 11},
+                    ],
+                    when={"var": "tokens", "min": 513},
+                ),
+                _triton_launch(
+                    dsl,
+                    "attn_full_prefill_tail",
+                    full_tail_params,
+                    [_ceil_div("tokens", 32), HEADS, 1],
                     [
                         {"param": 0}, {"param": 1}, {"param": 2}, {"param": 3}, {"param": 4},
-                        {"param": 5}, {"param": 6}, {"param": 7}, {"scratch": "dummy_lse"},
+                        {"param": 5}, {"param": 6}, {"scratch": "o_bulk"}, {"scratch": "lse_bulk"},
+                        {"param": 7},
                         {"param": 8}, _i32(page_columns), {"param": 9}, {"param": 10},
                         {"param": 11}, {"param": 12},
                     ],
+                    pdl=True,
                     when={"var": "tokens", "min": 65},
                 ),
             ],
