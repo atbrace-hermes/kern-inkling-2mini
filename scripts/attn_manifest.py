@@ -854,30 +854,34 @@ def register_ops(
                     pdl=True,
                     when={"var": "tokens", "max": 64},
                 ),
-                _triton_launch(
-                    dsl,
-                    "attn_full_prefill_bulk64",
-                    full_bulk_params,
-                    [_ceil_div("tokens", 64), HEADS, 1],
-                    [
+                {
+                    "module": "rel_attn_sm120",
+                    "entry": "kern_rel_full_prefill_bulk_bf16_m64_sm120",
+                    "params": full_bulk_params,
+                    "grid": [_ceil_div("tokens", 64), HEADS, 1],
+                    "block": [128, 1, 1],
+                    "shared_mem": 49152,
+                    "args": [
                         {"param": 0}, {"param": 1},
                         {"param": 5}, {"param": 6}, {"scratch": "o_bulk"}, {"scratch": "lse_bulk"},
                         {"param": 8}, _i32(page_columns), {"param": 11},
                     ],
-                    when={"var": "tokens", "min": 65, "max": 512},
-                ),
-                _triton_launch(
-                    dsl,
-                    "attn_full_prefill_bulk",
-                    full_bulk_params,
-                    [_ceil_div("tokens", 128), HEADS, 1],
-                    [
+                    "when": {"var": "tokens", "min": 65, "max": 512},
+                },
+                {
+                    "module": "rel_attn_sm120",
+                    "entry": "kern_rel_full_prefill_bulk_bf16_m128_sm120",
+                    "params": full_bulk_params,
+                    "grid": [_ceil_div("tokens", 128), HEADS, 1],
+                    "block": [256, 1, 1],
+                    "shared_mem": 49152,
+                    "args": [
                         {"param": 0}, {"param": 1},
                         {"param": 5}, {"param": 6}, {"scratch": "o_bulk"}, {"scratch": "lse_bulk"},
                         {"param": 8}, _i32(page_columns), {"param": 11},
                     ],
-                    when={"var": "tokens", "min": 513},
-                ),
+                    "when": {"var": "tokens", "min": 513},
+                },
                 _triton_launch(
                     dsl,
                     "attn_full_prefill_tail",

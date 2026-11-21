@@ -100,7 +100,7 @@ flags = "plain"
 includes = []
 
 [kernels."rel_attn_sm120"]
-sha256 = "5c6b61d24ec8a89a1875d0759b4725bbf0212173bcc04ee5578b2843d2e287fb"
+sha256 = "832a19e4fb74a5359408ec0f22ed657286ab7294c2c1dffb99ebaf0e3bb46724"
 milestone = "M3"
 source = "source/rel_attn_sm120.cu"
 flags = "plain"
