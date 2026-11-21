@@ -122,7 +122,7 @@ flags = "plain"
 includes = []
 
 [kernels."spec_markov_rows"]
-sha256 = "8d987feb2d3bd796a7eb27dd74a49bb989fb4883735aa58449fa2a3811c31f72"
+sha256 = "728b3763db965eb0c011c9f5a7d360c489fda495e652eb292f52c94f70d1ba5c"
 milestone = "M4"
 source = "source/markov_rows.cu"
 flags = "plain"

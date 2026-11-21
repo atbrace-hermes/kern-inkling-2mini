@@ -774,7 +774,6 @@ def register_modules(
             "dspark_markov_add_bias",
             "dspark_markov_state_concat",
             "dspark_markov_gate_add",
-            "dspark_add_softcap_mask",
         }
         if layout.num_kv_splits > 1:
             keep_dsl.add("dspark_attn_combine_16")
@@ -985,10 +984,8 @@ def register_ops(
     buf("d.markov_in", "bf16", ["seqs", 2 * DSPARK_MARKOV_RANK])
     buf("d.markov_state_part", "f32", ["seqs", 3 * DSPARK_MARKOV_RANK])
     buf("d.markov_latent", "bf16", ["seqs", DSPARK_MARKOV_RANK])
-    buf("d.step_bias", "bf16", ["seqs", VOCAB_PADDED])
-    buf("d.step_logits", "bf16", ["seqs", VOCAB_PADDED])
-    buf("d.argmax_pmax", "f32", ["seqs", 64])
-    buf("d.argmax_pidx", "i32", ["seqs", 64])
+    buf("d.argmax_pmax", "f32", ["seqs", 220])
+    buf("d.argmax_pidx", "i32", ["seqs", 220])
     buf("d.draft", "i64", ["seqs", DSPARK_NUM_SPEC])
     buf("d.verify_ids", "i64", ["tokens"])
     for n, dt in (
@@ -1202,24 +1199,82 @@ def register_ops(
         ["seqs", 1, 1],
         32,
     )
-    _cuda_op(
-        ops,
-        "dspark_markov_argmax_partial",
-        "spec_markov_rows",
-        "kern_argmax_rows_partial_bf16",
-        ["in buffer<bf16>", "i64", "out buffer<f32>", "out buffer<i32>", "i32"],
-        ["seqs", 64, 1],
-        1024,
-    )
-    _cuda_op(
-        ops,
-        "dspark_markov_argmax_final",
-        "spec_markov_rows",
-        "kern_argmax_rows_final_i64",
-        ["in buffer<f32>", "in buffer<i32>", "out buffer<i64>", "i32", "i32"],
-        ["seqs", 1, 1],
-        64,
-    )
+    ops["dspark_markov_fold_argmax"] = {
+        "params": [
+            "in buffer<bf16>",
+            "in buffer<bf16>",
+            "in buffer<bf16>",
+            "in buffer<bf16>",
+            "out buffer<f32>",
+            "out buffer<i32>",
+            "out buffer<i64>",
+            "i32",
+            "i32",
+            "f32",
+            "i32",
+            "i32",
+            "i32",
+        ],
+        "impl": {
+            "launches": [
+                {
+                    "module": "spec_markov_rows",
+                    "entry": "kern_markov_fold_softcap_argmax_partial",
+                    "params": [
+                        "in buffer<bf16>",
+                        "in buffer<bf16>",
+                        "in buffer<bf16>",
+                        "in buffer<bf16>",
+                        "out buffer<f32>",
+                        "out buffer<i32>",
+                        "i32",
+                        "i32",
+                        "f32",
+                        "i32",
+                        "i32",
+                        "i32",
+                    ],
+                    "grid": [220, 1, 1],
+                    "block": [256, 1, 1],
+                    "args": [
+                        {"param": 0},
+                        {"param": 1},
+                        {"param": 2},
+                        {"param": 3},
+                        {"param": 4},
+                        {"param": 5},
+                        {"param": 7},
+                        {"param": 8},
+                        {"param": 9},
+                        {"param": 10},
+                        {"param": 11},
+                        {"param": 12},
+                    ],
+                },
+                {
+                    "module": "spec_markov_rows",
+                    "entry": "kern_markov_argmax_final_pdl",
+                    "params": [
+                        "in buffer<f32>",
+                        "in buffer<i32>",
+                        "out buffer<i64>",
+                        "i32",
+                        "i32",
+                    ],
+                    "grid": ["seqs", 1, 1],
+                    "block": [256, 1, 1],
+                    "pdl": True,
+                    "args": [
+                        {"param": 4},
+                        {"param": 5},
+                        {"param": 6},
+                        {"param": 12},
+                        _i32(220),
+                    ],
+                },
+            ]
+        },
+    }
 
     if register_target_commit_ops:
         _cuda_op(
@@ -1525,13 +1580,6 @@ def register_ops(
             "i32",
         ],
         ["seqs", 1, 1],
-    )
-    _triton_op(
-        ops,
-        "dspark_add_softcap_mask",
-        dsl["dspark_add_softcap_mask"],
-        ["in buffer<bf16>", "in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32", "f32"],
-        [ceil_div(VOCAB_PADDED, 1024), "seqs", 1],
     )
 
     # Target verify sampling op
@@ -2128,42 +2176,21 @@ def emit_round_program(
                 label=f"markov.s{step}.gate",
             ),
             _call(
-                "dspark_gemm_bf16",
+                "dspark_markov_fold_argmax",
                 _b("d.markov_latent"),
                 _b("d.fold_weight"),
-                _b("d.step_bias"),
-                _var("seqs"),
-                _i32(VOCAB_PADDED),
-                _i32(DSPARK_MARKOV_RANK),
-                label=f"markov.s{step}.fold_proj",
-            ),
-            _call(
-                "dspark_add_softcap_mask",
-                _b("d.base_logits"),
-                _b("d.step_bias"),
                 _b("d.fold_bias"),
-                _b("d.step_logits"),
-                _i32(step),
-                _f32(SOFTCAP),
-                label=f"markov.s{step}.softcap_mask",
-            ),
-            _call(
-                "dspark_markov_argmax_partial",
-                _b("d.step_logits"),
-                _i64(VOCAB_PADDED),
-                _b("d.argmax_pmax"),
-                _b("d.argmax_pidx"),
-                _i32(VOCAB_PADDED),
-                label=f"markov.s{step}.argmax_partial",
-            ),
-            _call(
-                "dspark_markov_argmax_final",
+                _b("d.base_logits"),
                 _b("d.argmax_pmax"),
                 _b("d.argmax_pidx"),
                 _b("d.draft", step * 8),
+                _var("seqs"),
+                _i32(step),
+                _f32(SOFTCAP),
+                _i32(VOCAB_PADDED),
+                _i32(VOCAB_UNPADDED),
                 _i32(DSPARK_NUM_SPEC),
-                _i32(64),
-                label=f"markov.s{step}.argmax_final",
+                label=f"markov.s{step}.fold_argmax",
             ),
         ]
 

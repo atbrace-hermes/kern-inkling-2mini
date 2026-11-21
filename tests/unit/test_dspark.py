@@ -1455,6 +1455,107 @@ class TestDsparkGPU(unittest.TestCase):
         ref = (30.0 * torch.tanh(logits_in[:, :VU].float() / 30.0)).bfloat16()
         torch.testing.assert_close(views["logits"][:, :VU], ref, atol=1e-2, rtol=1e-2)
 
+    def test_markov_fused_fold_softcap_argmax_parity(self):
+        """Verify fused kern_markov_fold_softcap_argmax_partial + kern_markov_argmax_final_pdl
+        matches PyTorch bf16(fold_proj) + fold_bias + base_logits + softcap + vocab mask + argmax
+        across seqs in (1, 2, 3, 4, 8), including padded vocab > 200058 poison values."""
+        torch = self.torch
+        g = torch.Generator().manual_seed(861)
+        VP, VU, R, NSTEPS = dm.VOCAB_PADDED, dm.VOCAB_UNPADDED, dm.DSPARK_MARKOV_RANK, dm.DSPARK_NUM_SPEC
+        fold_w = (torch.randn(VP, R, generator=g) * 0.05).bfloat16().cuda()
+        fold_b = (torch.randn(VP, generator=g) * 0.5).bfloat16().cuda()
+
+        p_part = [
+            "in buffer<bf16>", "in buffer<bf16>", "in buffer<bf16>", "in buffer<bf16>",
+            "out buffer<f32>", "out buffer<i32>",
+            "i32", "i32", "f32", "i32", "i32", "i32",
+        ]
+        p_fin = ["in buffer<f32>", "in buffer<i32>", "out buffer<i64>", "i32", "i32"]
+
+        for seqs, step in ((1, 0), (2, 3), (3, 1), (4, 5), (8, 6)):
+            with self.subTest(seqs=seqs, step=step):
+                latent = (torch.randn(seqs, R, generator=g) * 0.5).bfloat16().cuda()
+                base = (torch.randn(seqs, NSTEPS, VP, generator=g) * 4.0).bfloat16().cuda()
+                # Inject clear winners in unpadded vocab and poison padded vocab >= 200058
+                winners = [(17 + 13107 * s) % VU for s in range(seqs)]
+                for s, w_tok in enumerate(winners):
+                    base[s, step, w_tok] = 25.0
+                base[:, step, VU:] = 100.0
+                base[:, step, VU + 3] = float("nan")
+
+                m = {
+                    "schema_version": 7,
+                    "model": "markov-fused-fold-test",
+                    "vars": {},
+                    "states": {},
+                    "buffers": {
+                        "lat": {"dtype": "bf16", "shape": [seqs, R], "kind": "input"},
+                        "fw": {"dtype": "bf16", "shape": [VP, R], "kind": "input"},
+                        "fb": {"dtype": "bf16", "shape": [VP], "kind": "input"},
+                        "base": {"dtype": "bf16", "shape": [seqs, NSTEPS, VP], "kind": "input"},
+                        "pmax": {"dtype": "f32", "shape": [seqs, 220], "kind": "workspace"},
+                        "pidx": {"dtype": "i32", "shape": [seqs, 220], "kind": "workspace"},
+                        "draft": {"dtype": "i64", "shape": [seqs, NSTEPS], "kind": "output"},
+                    },
+                    "modules": self._spec_mod("spec_markov_rows"),
+                    "ops": {
+                        "fused": {
+                            "params": p_part[:6] + ["out buffer<i64>"] + p_part[6:],
+                            "impl": {
+                                "launches": [
+                                    {
+                                        "module": "spec_markov_rows",
+                                        "entry": "kern_markov_fold_softcap_argmax_partial",
+                                        "params": p_part,
+                                        "grid": [220, 1, 1],
+                                        "block": [256, 1, 1],
+                                        "args": [{"param": j} for j in range(6)] + [{"param": j} for j in range(7, 13)],
+                                    },
+                                    {
+                                        "module": "spec_markov_rows",
+                                        "entry": "kern_markov_argmax_final_pdl",
+                                        "params": p_fin,
+                                        "grid": [seqs, 1, 1],
+                                        "block": [256, 1, 1],
+                                        "pdl": True,
+                                        "args": [{"param": 4}, {"param": 5}, {"param": 6}, {"param": 12}, {"i32": 220}],
+                                    },
+                                ]
+                            },
+                        }
+                    },
+                    "programs": {
+                        "run": {
+                            "calls": [
+                                {
+                                    "op": "fused",
+                                    "args": [
+                                        {"buf": "lat"}, {"buf": "fw"}, {"buf": "fb"}, {"buf": "base"},
+                                        {"buf": "pmax"}, {"buf": "pidx"}, {"buf": "draft", "offset": step * 8},
+                                        {"i32": seqs}, {"i32": step}, {"f32": 30.0},
+                                        {"i32": VP}, {"i32": VU}, {"i32": NSTEPS},
+                                    ],
+                                }
+                            ]
+                        }
+                    },
+                }
+
+                def setup(rt, v):
+                    v["lat"].copy_(latent)
+                    v["fw"].copy_(fold_w)
+                    v["fb"].copy_(fold_b)
+                    v["base"].copy_(base)
+
+                _, views = self._run_manifest(m, setup, "run", {})
+                step_bias = (latent.float() @ fold_w[:VU].float().T).bfloat16()
+                bias_bf = (step_bias.float() + fold_b[:VU].float()[None, :]).bfloat16()
+                x_bf = (base[:, step, :VU].float() + bias_bf.float()).bfloat16()
+                logits = (30.0 * torch.tanh(x_bf.float() / 30.0)).bfloat16()
+                ref_tok = logits.argmax(dim=-1)
+                self.assertTrue(torch.equal(views["draft"][:, step], ref_tok))
+                self.assertEqual(views["draft"][:, step].tolist(), winners)
+
 
 if __name__ == "__main__":
     unittest.main()
