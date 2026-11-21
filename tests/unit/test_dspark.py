@@ -1556,6 +1556,624 @@ class TestDsparkGPU(unittest.TestCase):
                 self.assertTrue(torch.equal(views["draft"][:, step], ref_tok))
                 self.assertEqual(views["draft"][:, step].tolist(), winners)
 
+    def test_dspark_attn_paged_sm120_parity(self):
+        """Verify SM120 CUDA transposed-MMA split-KV paged FP8 attention + PDL combine."""
+        torch = self.torch
+        g = torch.Generator().manual_seed(866)
+        block_size = 8
+        page_sz = 64
+        H, HKV, D = 24, 8, 128
+        k_scale = 0.037
+        v_scale = 0.029
+        scale = D**-0.5
+
+        for split_cnt, context_lens in (
+            (27, [0]),
+            (27, [72]),
+            (20, [5, 135]),
+            (10, [0, 8, 64, 520]),
+            (5, [0, 5, 8, 64, 72, 135, 520, 1025]),
+        ):
+            with self.subTest(splits=split_cnt, context_lens=context_lens):
+                seqs = len(context_lens)
+                tokens = seqs * block_size
+                max_pages = max(1, (max(context_lens) + page_sz - 1) // page_sz + 1)
+                total_pages = seqs * max_pages
+
+                qkv = torch.randn(tokens, 5120, generator=g).bfloat16().cuda()
+                k_hist_u8 = [
+                    torch.randn(n, HKV, D, generator=g).bfloat16().to(torch.float8_e4m3fn).cuda().view(torch.uint8)
+                    for n in context_lens
+                ]
+                v_hist_u8 = [
+                    torch.randn(n, HKV, D, generator=g).bfloat16().to(torch.float8_e4m3fn).cuda().view(torch.uint8)
+                    for n in context_lens
+                ]
+
+                kv_page_stride = 9 * 2 * HKV * page_sz * D
+                kv_layer_off = 8 * 2 * HKV * page_sz * D
+                kv_head_stride = page_sz * D
+                kv_slot_stride = D
+                kv_v_off = HKV * page_sz * D
+                paged_cache = torch.zeros((total_pages, kv_page_stride), dtype=torch.uint8, device="cuda")
+                # Shuffled non-contiguous physical pages to catch page-table indexing bugs
+                perm = torch.randperm(total_pages, generator=g, dtype=torch.int32).cuda()
+                pages_tbl = perm.view(seqs, max_pages)
+
+                for s_idx, n in enumerate(context_lens):
+                    for p in range(n):
+                        pg = int(pages_tbl[s_idx, p // page_sz].item())
+                        in_pg = p % page_sz
+                        for hd in range(HKV):
+                            base_k = kv_layer_off + hd * kv_head_stride + in_pg * kv_slot_stride
+                            paged_cache[pg, base_k : base_k + D] = k_hist_u8[s_idx][p, hd]
+                            paged_cache[pg, base_k + kv_v_off : base_k + kv_v_off + D] = v_hist_u8[s_idx][p, hd]
+
+                lengths = torch.tensor([n + block_size for n in context_lens], dtype=torch.int32, device="cuda")
+
+                split_params = [
+                    "in buffer<bf16>", "in buffer<bf16>", "in buffer<bf16>", "in state",
+                    "in buffer<i32>", "in buffer<i32>", "out buffer<f32>", "out buffer<f32>",
+                    "f32", "f32", "f32", "i64", "i64", "i64", "i64",
+                    "i64", "i64", "i64", "i64", "i64", "i32", "i32",
+                ]
+                comb_params = ["in buffer<f32>", "in buffer<f32>", "out buffer<bf16>", "i32"]
+                m = {
+                    "schema_version": 7,
+                    "model": "dspark-attn-paged-sm120-test",
+                    "vars": {},
+                    "states": {
+                        "kv": {"host": {"dtype": "u8", "shape": [total_pages, kv_page_stride], "strides": [kv_page_stride, 1]}},
+                    },
+                    "buffers": {
+                        "QKV": {"dtype": "bf16", "shape": [tokens, 5120], "kind": "input"},
+                        "Pages": {"dtype": "i32", "shape": [seqs, max_pages], "kind": "input"},
+                        "Lengths": {"dtype": "i32", "shape": [seqs], "kind": "input"},
+                        "Out": {"dtype": "bf16", "shape": [tokens, 3072], "kind": "output"},
+                    },
+                    "modules": self._spec_mod("spec_round"),
+                    "ops": {
+                        "paged_sm120": {
+                            "params": [
+                                "in buffer<bf16>", "in buffer<bf16>", "in buffer<bf16>", "in state",
+                                "in buffer<i32>", "in buffer<i32>", "out buffer<bf16>",
+                                "f32", "f32", "f32", "i64", "i64", "i64", "i64",
+                                "i64", "i64", "i64", "i64", "i64", "i32",
+                            ],
+                            "impl": {
+                                "scratch": {
+                                    "o_part": {"dtype": "f32", "shape": [split_cnt, tokens, H, D]},
+                                    "lse_part": {"dtype": "f32", "shape": [split_cnt, tokens, H]},
+                                },
+                                "launches": [
+                                    {
+                                        "module": "spec_round",
+                                        "entry": "kern_dspark_attn_paged_split_sm120",
+                                        "params": split_params,
+                                        "grid": [split_cnt, HKV, seqs],
+                                        "block": [128, 1, 1],
+                                        "args": [
+                                            {"param": 0}, {"param": 1}, {"param": 2}, {"param": 3},
+                                            {"param": 4}, {"param": 5},
+                                            {"scratch": "o_part"}, {"scratch": "lse_part"},
+                                            {"param": 7}, {"param": 8}, {"param": 9},
+                                            {"param": 10}, {"param": 11}, {"param": 12}, {"param": 13},
+                                            {"param": 14}, {"param": 15}, {"param": 16}, {"param": 17},
+                                            {"param": 18}, {"param": 19}, {"i32": split_cnt},
+                                        ],
+                                    },
+                                    {
+                                        "module": "spec_round",
+                                        "entry": f"kern_dspark_attn_paged_combine_s{split_cnt}",
+                                        "params": comb_params,
+                                        "grid": [tokens, H, 1],
+                                        "block": [32, 1, 1],
+                                        "pdl": True,
+                                        "args": [{"scratch": "o_part"}, {"scratch": "lse_part"}, {"param": 6}, {"param": 19}],
+                                    },
+                                ],
+                            },
+                        }
+                    },
+                    "programs": {
+                        "run": {
+                            "calls": [
+                                {
+                                    "op": "paged_sm120",
+                                    "args": [
+                                        {"buf": "QKV"},
+                                        {"buf": "QKV", "offset": 3072 * 2},
+                                        {"buf": "QKV", "offset": 4096 * 2},
+                                        {"state": "kv"},
+                                        {"buf": "Pages"},
+                                        {"buf": "Lengths"},
+                                        {"buf": "Out"},
+                                        {"f32": k_scale},
+                                        {"f32": v_scale},
+                                        {"f32": scale},
+                                        {"i64": 5120},
+                                        {"i64": 5120},
+                                        {"i64": 5120},
+                                        {"i64": max_pages},
+                                        {"i64": kv_layer_off},
+                                        {"i64": kv_page_stride},
+                                        {"i64": kv_slot_stride},
+                                        {"i64": kv_head_stride},
+                                        {"i64": kv_v_off},
+                                        {"i32": tokens},
+                                    ],
+                                }
+                            ]
+                        }
+                    },
+                }
+
+                def setup(rt, v):
+                    rt.bind_host({
+                        "kv": (paged_cache.data_ptr(), "u8", list(paged_cache.shape), list(paged_cache.stride())),
+                    })
+                    v["QKV"].copy_(qkv)
+                    v["Pages"].copy_(pages_tbl)
+                    v["Lengths"].copy_(lengths)
+
+                _, views = self._run_manifest(m, setup, "run", {})
+                out = views["Out"].view(seqs, block_size, H, D)
+
+                for i, n in enumerate(context_lens):
+                    qi = qkv[i * 8 : (i + 1) * 8, :3072].view(8, H, D).float()
+                    kl = qkv[i * 8 : (i + 1) * 8, 3072:4096].view(8, HKV, D).float()
+                    vl = qkv[i * 8 : (i + 1) * 8, 4096:5120].view(8, HKV, D).float()
+                    if n > 0:
+                        kh = k_hist_u8[i].view(torch.float8_e4m3fn).float() * k_scale
+                        vh = v_hist_u8[i].view(torch.float8_e4m3fn).float() * v_scale
+                        keys = torch.cat([kh, kl], dim=0)
+                        vals = torch.cat([vh, vl], dim=0)
+                    else:
+                        keys = kl
+                        vals = vl
+                    keys = keys.repeat_interleave(3, dim=1)
+                    vals = vals.repeat_interleave(3, dim=1)
+                    scores = torch.einsum("qhd,khd->hqk", qi, keys) * scale
+                    probs = torch.softmax(scores, dim=-1)
+                    ref = torch.einsum("hqk,khd->qhd", probs, vals).bfloat16()
+                    torch.testing.assert_close(out[i], ref, atol=1.5e-2, rtol=1.5e-2)
+
+    def test_dspark_gemm_and_fused_gate_up_silu_sm120_parity(self):
+        """Verify SM120 256-bit v8.b32 DSpark GEMV/GEMM (BF16 & F32) and fused GateUp+SiLU."""
+        torch = self.torch
+        g = torch.Generator().manual_seed(877)
+        p_bf16 = ["in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32", "i32"]
+        p_f32 = ["in buffer<bf16>", "in buffer<bf16>", "out buffer<f32>", "i32", "i32", "i32"]
+
+        # 1. BF16 output projections across M=1, 8, 16, 24, 32 and realistic DSpark shapes
+        bf16_cases = [
+            ("kern_dspark_gemv_m1_bf16_sm120", 1, 2048, 2304, 640),
+            ("kern_dspark_gemm_m8_bf16_sm120", 8, 2304, 9216, 640),
+            ("kern_dspark_gemm_m16_bf16_sm120", 16, 2304, 3072, 640),
+            ("kern_dspark_gemm_m32_bf16_sm120", 24, 5120, 2304, 640),
+            ("kern_dspark_gemm_m32_bf16_sm120", 32, 2304, 9216, 640),
+        ]
+        for entry, M, N, K, grid_x in bf16_cases:
+            with self.subTest(entry=entry, M=M, N=N, K=K):
+                a = (torch.randn(M, K, generator=g) * 0.25).bfloat16().cuda()
+                w = (torch.randn(N, K, generator=g) * 0.05).bfloat16().cuda()
+                m = {
+                    "schema_version": 7,
+                    "model": "ds-gemm-bf16-test",
+                    "vars": {},
+                    "states": {},
+                    "buffers": {
+                        "A": {"dtype": "bf16", "shape": [M, K], "kind": "input"},
+                        "W": {"dtype": "bf16", "shape": [N, K], "kind": "input"},
+                        "C": {"dtype": "bf16", "shape": [M, N], "kind": "output"},
+                    },
+                    "modules": self._spec_mod("spec_state_commit"),
+                    "ops": {
+                        "proj": {
+                            "params": p_bf16,
+                            "impl": {
+                                "launches": [
+                                    {
+                                        "module": "spec_state_commit",
+                                        "entry": entry,
+                                        "params": p_bf16,
+                                        "grid": [grid_x, 1, 1],
+                                        "block": [256, 1, 1],
+                                        "pdl": True,
+                                        "args": [{"param": j} for j in range(6)],
+                                    }
+                                ]
+                            },
+                        }
+                    },
+                    "programs": {
+                        "run": {
+                            "calls": [{"op": "proj", "args": [{"buf": "A"}, {"buf": "W"}, {"buf": "C"}, {"i32": M}, {"i32": N}, {"i32": K}]}]
+                        }
+                    },
+                }
+
+                def setup(rt, v):
+                    v["A"].copy_(a)
+                    v["W"].copy_(w)
+
+                _, views = self._run_manifest(m, setup, "run", {})
+                ref = (a.float() @ w.float().T).bfloat16()
+                torch.testing.assert_close(views["C"], ref, atol=2e-2, rtol=2e-2)
+
+        # 2. F32 output Markov projections (N=768, K=512 & K=4608)
+        f32_cases = [
+            ("kern_dspark_gemv_m1_f32_sm120", 1, 768, 512),
+            ("kern_dspark_gemm_m8_f32_sm120", 7, 768, 4608),
+            ("kern_dspark_gemm_m8_f32_sm120", 8, 768, 512),
+        ]
+        for entry, M, N, K in f32_cases:
+            with self.subTest(entry=entry, M=M, N=N, K=K):
+                a = (torch.randn(M, K, generator=g) * 0.25).bfloat16().cuda()
+                w = (torch.randn(N, K, generator=g) * 0.05).bfloat16().cuda()
+                m = {
+                    "schema_version": 7,
+                    "model": "ds-gemm-f32-test",
+                    "vars": {},
+                    "states": {},
+                    "buffers": {
+                        "A": {"dtype": "bf16", "shape": [M, K], "kind": "input"},
+                        "W": {"dtype": "bf16", "shape": [N, K], "kind": "input"},
+                        "C": {"dtype": "f32", "shape": [M, N], "kind": "output"},
+                    },
+                    "modules": self._spec_mod("spec_state_commit"),
+                    "ops": {
+                        "proj": {
+                            "params": p_f32,
+                            "impl": {
+                                "launches": [
+                                    {
+                                        "module": "spec_state_commit",
+                                        "entry": entry,
+                                        "params": p_f32,
+                                        "grid": [192, 1, 1],
+                                        "block": [256, 1, 1],
+                                        "pdl": True,
+                                        "args": [{"param": j} for j in range(6)],
+                                    }
+                                ]
+                            },
+                        }
+                    },
+                    "programs": {
+                        "run": {
+                            "calls": [{"op": "proj", "args": [{"buf": "A"}, {"buf": "W"}, {"buf": "C"}, {"i32": M}, {"i32": N}, {"i32": K}]}]
+                        }
+                    },
+                }
+
+                def setup(rt, v):
+                    v["A"].copy_(a)
+                    v["W"].copy_(w)
+
+                _, views = self._run_manifest(m, setup, "run", {})
+                ref = a.float() @ w.float().T
+                torch.testing.assert_close(views["C"], ref, atol=1e-3, rtol=1e-3)
+
+        # 3. Fused GateUp + SiLU*Mul across M=8, 16, 24, 32
+        gu_cases = [
+            ("kern_dspark_gate_up_silu_m8_sm120", 8),
+            ("kern_dspark_gate_up_silu_m16_sm120", 16),
+            ("kern_dspark_gate_up_silu_m32_sm120", 24),
+            ("kern_dspark_gate_up_silu_m32_sm120", 32),
+        ]
+        N_half, K = 1024, 2304
+        for entry, M in gu_cases:
+            with self.subTest(entry=entry, M=M):
+                a = (torch.randn(M, K, generator=g) * 0.25).bfloat16().cuda()
+                w = (torch.randn(2 * N_half, K, generator=g) * 0.05).bfloat16().cuda()
+                m = {
+                    "schema_version": 7,
+                    "model": "ds-gate-up-silu-test",
+                    "vars": {},
+                    "states": {},
+                    "buffers": {
+                        "A": {"dtype": "bf16", "shape": [M, K], "kind": "input"},
+                        "W": {"dtype": "bf16", "shape": [2 * N_half, K], "kind": "input"},
+                        "Y": {"dtype": "bf16", "shape": [M, N_half], "kind": "output"},
+                    },
+                    "modules": self._spec_mod("spec_state_commit"),
+                    "ops": {
+                        "gu": {
+                            "params": p_bf16,
+                            "impl": {
+                                "launches": [
+                                    {
+                                        "module": "spec_state_commit",
+                                        "entry": entry,
+                                        "params": p_bf16,
+                                        "grid": [N_half // 8, 1, 1],
+                                        "block": [256, 1, 1],
+                                        "pdl": True,
+                                        "args": [{"param": j} for j in range(6)],
+                                    }
+                                ]
+                            },
+                        }
+                    },
+                    "programs": {
+                        "run": {
+                            "calls": [{"op": "gu", "args": [{"buf": "A"}, {"buf": "W"}, {"buf": "Y"}, {"i32": M}, {"i32": N_half}, {"i32": K}]}]
+                        }
+                    },
+                }
+
+                def setup(rt, v):
+                    v["A"].copy_(a)
+                    v["W"].copy_(w)
+
+                _, views = self._run_manifest(m, setup, "run", {})
+                gate = (a.float() @ w[:N_half].float().T).bfloat16().float()
+                up = (a.float() @ w[N_half:].float().T).bfloat16().float()
+                ref = (torch.nn.functional.silu(gate) * up).bfloat16()
+                torch.testing.assert_close(views["Y"], ref, atol=2e-2, rtol=2e-2)
+
+    def test_verify_softcap_sample_bitexact_greedy_stochastic_mixed(self):
+        """Verify fused verify_softcap_sample is bit-identical to FlashInfer sampling_op
+        on all-greedy, all-stochastic, mixed greedy+stochastic (including multi-iter RadixTopK
+        with >12 rows!), and all-NaN edge cases."""
+        torch = self.torch
+        g = torch.Generator().manual_seed(888)
+        VP, VU = dm.VOCAB_PADDED, dm.VOCAB_UNPADDED
+
+        cases = [
+            ("all_greedy_16", [0.0] * 16, [0] * 16, [1.0] * 16, [0.0] * 16),
+            ("all_stoch_16", [0.7, 1.1] * 8, [0, 32, 50, 1] * 4, [1.0, 0.9, 0.85, 0.95] * 4, [0.0, 0.05, 0.1, 0.02] * 4),
+            ("mixed_24", [0.0, 0.8, 0.0, 1.2, 0.0, 0.5] * 4, [0, 20, 10, 0, 50, 64] * 4, [1.0, 0.9, 0.8, 1.0, 0.95, 0.85] * 4, [0.0, 0.05, 0.0, 0.0, 0.1, 0.02] * 4),
+        ]
+        for label, temps, topks, topps, minps in cases:
+            with self.subTest(case=label):
+                rows = len(temps)
+                logits_in = torch.randn(rows, VP, generator=g).float().cuda() * 12.0
+                # Put huge values in padded tail to confirm vocab masking
+                logits_in[:, VU:] = 500.0
+                # Test all-NaN greedy row on row 0 of mixed_24 -> must pick 0, not VU
+                if label == "mixed_24":
+                    logits_in[0, :VU] = float("nan")
+
+                temp = torch.tensor(temps, dtype=torch.float32, device="cuda")
+                top_k = torch.tensor(topks, dtype=torch.int32, device="cuda")
+                top_p = torch.tensor(topps, dtype=torch.float32, device="cuda")
+                min_p = torch.tensor(minps, dtype=torch.float32, device="cuda")
+                seed = torch.arange(100, 100 + rows, dtype=torch.int64, device="cuda")
+                lens = torch.arange(50, 50 + rows, dtype=torch.int32, device="cuda")
+
+                p_vm = ["inout buffer<f32>", "f32", "i32", "i32"]
+                ref_op = dm.sampling_op(VP, rows, self.spec["sampling"], self.sampling_target, logits_dtype="f32", axis_var="tok")
+                new_op = dm.verify_softcap_sample_op(VP, VU, 30.0, rows, self.spec["sampling"], self.sampling_target, axis_var="tok")
+
+                m = {
+                    "schema_version": 7,
+                    "model": "verify-softcap-sample-test",
+                    "vars": {"tok": {"max": rows}},
+                    "states": {},
+                    "buffers": {
+                        "logits_ref": {"dtype": "f32", "shape": ["tok", VP], "kind": "inout"},
+                        "logits_new": {"dtype": "f32", "shape": ["tok", VP], "kind": "input"},
+                        "lens": {"dtype": "i32", "shape": ["tok"], "kind": "input"},
+                        "temp": {"dtype": "f32", "shape": ["tok"], "kind": "input"},
+                        "topk": {"dtype": "i32", "shape": ["tok"], "kind": "input"},
+                        "topp": {"dtype": "f32", "shape": ["tok"], "kind": "input"},
+                        "minp": {"dtype": "f32", "shape": ["tok"], "kind": "input"},
+                        "seed": {"dtype": "i64", "shape": ["tok"], "kind": "input"},
+                        "tok_ref": {"dtype": "i64", "shape": ["tok"], "kind": "output"},
+                        "tok_new": {"dtype": "i64", "shape": ["tok"], "kind": "output"},
+                    },
+                    "modules": {
+                        **self._spec_mod("spec_state_commit"),
+                        **self._spec_mod("spec_sampling"),
+                        **self._spec_mod("spec_sample_glue"),
+                        **self._spec_mod("spec_argmax"),
+                    },
+                    "ops": {
+                        "vm": {"params": p_vm, "impl": {"launches": [{"module": "spec_state_commit", "entry": "dspark_verify_mask_vocab_f32", "params": p_vm, "grid": ["tok", dm.ceil_div(VP, 1024), 1], "block": [1024, 1, 1], "args": [{"param": j} for j in range(4)]}]}},
+                        "ref_sample": ref_op,
+                        "new_sample": new_op,
+                    },
+                    "programs": {
+                        "run": {
+                            "calls": [
+                                {"op": "vm", "args": [{"buf": "logits_ref"}, {"f32": 30.0}, {"i32": VP}, {"i32": VU}]},
+                                {"op": "ref_sample", "args": [{"buf": "logits_ref"}, {"buf": "lens"}, {"buf": "temp"}, {"buf": "topk"}, {"buf": "topp"}, {"buf": "minp"}, {"buf": "seed"}, {"buf": "tok_ref"}, {"var": "tok"}]},
+                                {"op": "new_sample", "args": [{"buf": "logits_new"}, {"buf": "lens"}, {"buf": "temp"}, {"buf": "topk"}, {"buf": "topp"}, {"buf": "minp"}, {"buf": "seed"}, {"buf": "tok_new"}, {"var": "tok"}]},
+                            ]
+                        }
+                    },
+                }
+
+                def setup(rt, v):
+                    v["logits_ref"].copy_(logits_in)
+                    v["logits_new"].copy_(logits_in)
+                    v["lens"].copy_(lens)
+                    v["temp"].copy_(temp)
+                    v["topk"].copy_(top_k)
+                    v["topp"].copy_(top_p)
+                    v["minp"].copy_(min_p)
+                    v["seed"].copy_(seed)
+
+                _, views = self._run_manifest(m, setup, "run", {"tok": rows})
+                self.assertTrue(((views["tok_new"] >= 0) & (views["tok_new"] < VU)).all())
+                self.assertTrue(
+                    torch.equal(views["tok_new"], views["tok_ref"]),
+                    f"{label}: mismatch new={views['tok_new'].tolist()} vs ref={views['tok_ref'].tolist()}",
+                )
+                if label == "mixed_24":
+                    self.assertEqual(int(views["tok_new"][0].item()), 0)
+
+    def test_dspark_attn_ring_sm120_parity(self):
+        """Verify SM120 CUDA split-KV ring FP8 attention + PDL combine across wrap-around & null lines."""
+        torch = self.torch
+        g = torch.Generator().manual_seed(899)
+        block_size = 8
+        window = 1024
+        H, HKV, D = 24, 8, 128
+        k_scale = 0.041
+        v_scale = 0.033
+        scale = D**-0.5
+        ring_stride = dm.DSPARK_STATE_BYTES_PER_SEQ
+
+        for split_cnt, context_lens in (
+            (16, [0]),
+            (16, [1200]),
+            (8, [5, 1050]),
+            (5, [0, 70, 1024, 1500]),
+            (4, [0, 5, 64, 70, 512, 1024, 1050, 2345]),
+        ):
+            with self.subTest(splits=split_cnt, context_lens=context_lens):
+                seqs = len(context_lens) + 1  # last seq is padding/null line (len=0)
+                tokens = seqs * block_size
+                qkv = torch.randn(tokens, 5120, generator=g).bfloat16().cuda()
+                k_hist_u8 = [
+                    torch.randn(n, HKV, D, generator=g).bfloat16().to(torch.float8_e4m3fn).cuda().view(torch.uint8)
+                    for n in context_lens
+                ]
+                v_hist_u8 = [
+                    torch.randn(n, HKV, D, generator=g).bfloat16().to(torch.float8_e4m3fn).cuda().view(torch.uint8)
+                    for n in context_lens
+                ]
+
+                ring_cache = torch.zeros((seqs + 1, ring_stride), dtype=torch.uint8, device="cuda")
+                lines = torch.tensor(list(range(1, len(context_lens) + 1)) + [0], dtype=torch.int32, device="cuda")
+                for s_idx, n in enumerate(context_lens):
+                    line = s_idx + 1
+                    start = max(0, n - window)
+                    kf = k_hist_u8[s_idx].reshape(n, 1024)
+                    vf = v_hist_u8[s_idx].reshape(n, 1024)
+                    for p in range(start, n):
+                        slot = p % window
+                        off = slot * 2048
+                        ring_cache[line, off : off + 1024] = kf[p]
+                        ring_cache[line, off + 1024 : off + 2048] = vf[p]
+
+                lengths = torch.tensor([n + block_size for n in context_lens] + [0], dtype=torch.int32, device="cuda")
+
+                split_params = [
+                    "in buffer<bf16>", "in buffer<bf16>", "in buffer<bf16>", "in state",
+                    "in buffer<i32>", "in buffer<i32>", "out buffer<f32>", "out buffer<f32>",
+                    "f32", "f32", "f32", "i64", "i64", "i64", "i64", "i32", "i32",
+                ]
+                comb_params = ["in buffer<f32>", "in buffer<f32>", "out buffer<bf16>", "i32"]
+                m = {
+                    "schema_version": 7,
+                    "model": "dspark-attn-ring-sm120-test",
+                    "vars": {},
+                    "states": {
+                        "dspark_state": {"host": {"dtype": "u8", "shape": [seqs + 1, ring_stride], "strides": [ring_stride, 1]}},
+                    },
+                    "buffers": {
+                        "QKV": {"dtype": "bf16", "shape": [tokens, 5120], "kind": "input"},
+                        "Lines": {"dtype": "i32", "shape": [seqs], "kind": "input"},
+                        "Lengths": {"dtype": "i32", "shape": [seqs], "kind": "input"},
+                        "Out": {"dtype": "bf16", "shape": [tokens, 3072], "kind": "output"},
+                    },
+                    "modules": self._spec_mod("spec_round"),
+                    "ops": {
+                        "ring_sm120": {
+                            "params": [
+                                "in buffer<bf16>", "in buffer<bf16>", "in buffer<bf16>", "in state",
+                                "in buffer<i32>", "in buffer<i32>", "out buffer<bf16>",
+                                "f32", "f32", "f32", "i64", "i64", "i64", "i64", "i32",
+                            ],
+                            "impl": {
+                                "scratch": {
+                                    "o_part": {"dtype": "f32", "shape": [split_cnt, tokens, H, D]},
+                                    "lse_part": {"dtype": "f32", "shape": [split_cnt, tokens, H]},
+                                },
+                                "launches": [
+                                    {
+                                        "module": "spec_round",
+                                        "entry": "kern_dspark_attn_ring_split_sm120",
+                                        "params": split_params,
+                                        "grid": [split_cnt, HKV, seqs],
+                                        "block": [128, 1, 1],
+                                        "args": [
+                                            {"param": 0}, {"param": 1}, {"param": 2}, {"param": 3},
+                                            {"param": 4}, {"param": 5},
+                                            {"scratch": "o_part"}, {"scratch": "lse_part"},
+                                            {"param": 7}, {"param": 8}, {"param": 9},
+                                            {"param": 10}, {"param": 11}, {"param": 12}, {"param": 13},
+                                            {"param": 14}, {"i32": split_cnt},
+                                        ],
+                                    },
+                                    {
+                                        "module": "spec_round",
+                                        "entry": f"kern_dspark_attn_paged_combine_s{split_cnt}",
+                                        "params": comb_params,
+                                        "grid": [tokens, H, 1],
+                                        "block": [32, 1, 1],
+                                        "pdl": True,
+                                        "args": [{"scratch": "o_part"}, {"scratch": "lse_part"}, {"param": 6}, {"param": 14}],
+                                    },
+                                ],
+                            },
+                        }
+                    },
+                    "programs": {
+                        "run": {
+                            "calls": [
+                                {
+                                    "op": "ring_sm120",
+                                    "args": [
+                                        {"buf": "QKV"},
+                                        {"buf": "QKV", "offset": 3072 * 2},
+                                        {"buf": "QKV", "offset": 4096 * 2},
+                                        {"state": "dspark_state"},
+                                        {"buf": "Lines"},
+                                        {"buf": "Lengths"},
+                                        {"buf": "Out"},
+                                        {"f32": k_scale},
+                                        {"f32": v_scale},
+                                        {"f32": scale},
+                                        {"i64": 5120},
+                                        {"i64": 5120},
+                                        {"i64": 5120},
+                                        {"i64": ring_stride},
+                                        {"i32": tokens},
+                                    ],
+                                }
+                            ]
+                        }
+                    },
+                }
+
+                def setup(rt, v):
+                    rt.bind_host({
+                        "dspark_state": (ring_cache.data_ptr(), "u8", list(ring_cache.shape), list(ring_cache.stride())),
+                    })
+                    v["QKV"].copy_(qkv)
+                    v["Lines"].copy_(lines)
+                    v["Lengths"].copy_(lengths)
+                    v["Out"].fill_(999.0)  # canary for padding zeroing
+
+                _, views = self._run_manifest(m, setup, "run", {})
+                out = views["Out"].view(seqs, block_size, H, D)
+                # Padding seq must be zeroed
+                self.assertTrue((out[-1] == 0).all())
+                for i, n in enumerate(context_lens):
+                    qi = qkv[i * 8 : (i + 1) * 8, :3072].view(8, H, D).float()
+                    kl = qkv[i * 8 : (i + 1) * 8, 3072:4096].view(8, HKV, D).float()
+                    vl = qkv[i * 8 : (i + 1) * 8, 4096:5120].view(8, HKV, D).float()
+                    start = max(0, n - window)
+                    if n > start:
+                        kh = k_hist_u8[i][start:].view(torch.float8_e4m3fn).float() * k_scale
+                        vh = v_hist_u8[i][start:].view(torch.float8_e4m3fn).float() * v_scale
+                        keys = torch.cat([kh, kl], dim=0)
+                        vals = torch.cat([vh, vl], dim=0)
+                    else:
+                        keys = kl
+                        vals = vl
+                    keys = keys.repeat_interleave(3, dim=1)
+                    vals = vals.repeat_interleave(3, dim=1)
+                    scores = torch.einsum("qhd,khd->hqk", qi, keys) * scale
+                    probs = torch.softmax(scores, dim=-1)
+                    ref = torch.einsum("hqk,khd->qhd", probs, vals).bfloat16()
+                    torch.testing.assert_close(out[i], ref, atol=1.5e-2, rtol=1.5e-2)
+
 
 if __name__ == "__main__":
     unittest.main()

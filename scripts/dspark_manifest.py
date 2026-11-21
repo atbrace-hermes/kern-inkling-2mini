@@ -727,6 +727,252 @@ def sampling_op(
     }
 
 
+def verify_softcap_sample_op(
+    vocab_padded: int,
+    vocab_unpadded: int,
+    softcap: float,
+    seqs_max: int,
+    metadata: dict,
+    target: dict,
+    axis_var: str = "tokens",
+) -> dict:
+    """Build fused FP32 softcap+mask+argmax+guarded-FlashInfer sampling op for verify logits.
+
+    - Greedy rows (`temperature[r] <= 0.0f`): single vectorized float4 read pass over
+      `logits` with 0 writes to `probs`, and launches 2..5 exit on instruction 1.
+    - Stochastic rows (`temperature[r] > 0.0f`): writes softcapped/masked logits directly
+      into `probs` (eliminating both in-place writeback and `kern_sample_copy_f32`) and runs
+      bit-identical FlashInfer Softmax / Multi-CTA RadixTopK / TopP / MinP.
+    """
+    ctas, chunk, groups, radix_smem = sampling_radix(vocab_padded, metadata, target)
+    chain, glue, commit_mod = "spec_sampling", "spec_sample_glue", "spec_state_commit"
+    sizes = metadata["sizes"]
+    groups = min(groups, seqs_max)
+
+    def launch(mod, entry, params, block, grid, args, smem=None, pdl=False):
+        s = {
+            "entry": entry,
+            "params": params,
+            "block": [block, 1, 1],
+            "grid": grid,
+            "args": args,
+            "module": mod,
+        }
+        if smem is not None:
+            s["shared_mem"] = smem
+        if pdl:
+            s["pdl"] = True
+        return s
+
+    p = lambda idx: {"param": idx}
+    scr = lambda n: {"scratch": n}
+    i32 = lambda v: {"i32": v}
+    i64 = lambda v: {"i64": v}
+    f32 = lambda v: {"f32": v}
+
+    S = axis_var
+    logits, seq_lens, temperature, top_k, top_p, min_p, seed, tokens, seqs = (p(i) for i in range(9))
+    probs = scr("probs")
+
+    return {
+        "params": [
+            "in buffer<f32>",
+            "in buffer<i32>",
+            "in buffer<f32>",
+            "in buffer<i32>",
+            "in buffer<f32>",
+            "in buffer<f32>",
+            "in buffer<i64>",
+            "out buffer<i64>",
+            "i32",
+        ],
+        "impl": {
+            "scratch": {
+                "greedy": {"dtype": "i64", "shape": [S]},
+                "max": {"dtype": "f32", "shape": [S, 64]},
+                "idx": {"dtype": "i32", "shape": [S, 64]},
+                "probs": {"dtype": "f32", "shape": [S, vocab_padded]},
+                "chain_temperature": {"dtype": "f32", "shape": [S]},
+                "chain_top_k": {"dtype": "i32", "shape": [S]},
+                "offset": {"dtype": "u64", "shape": [S]},
+                "states": {"dtype": "u32", "shape": [groups, sizes["state_words"]]},
+                "drawn": {"dtype": "i32", "shape": [S]},
+                "valid": {"dtype": "u8", "shape": [S]},
+            },
+            "launches": [
+                launch(
+                    commit_mod,
+                    "kern_verify_softcap_argmax_prep_partial_f32",
+                    [
+                        "in buffer<f32>",
+                        "in buffer<f32>",
+                        "out buffer<f32>",
+                        "out buffer<f32>",
+                        "out buffer<i32>",
+                        "f32",
+                        "i32",
+                        "i32",
+                    ],
+                    256,
+                    [S, 64, 1],
+                    [
+                        logits,
+                        temperature,
+                        probs,
+                        scr("max"),
+                        scr("idx"),
+                        f32(softcap),
+                        i32(vocab_padded),
+                        i32(vocab_unpadded),
+                    ],
+                ),
+                launch(
+                    commit_mod,
+                    "kern_verify_argmax_final_and_prep",
+                    [
+                        "in buffer<f32>",
+                        "in buffer<i32>",
+                        "in buffer<f32>",
+                        "in buffer<i32>",
+                        "in buffer<i32>",
+                        "out buffer<i64>",
+                        "out buffer<f32>",
+                        "out buffer<i32>",
+                        "out buffer<u64>",
+                        "out buffer<u32>",
+                        "i32",
+                        "i32",
+                        "i32",
+                        "i32",
+                    ],
+                    64,
+                    [S, 1, 1],
+                    [
+                        scr("max"),
+                        scr("idx"),
+                        temperature,
+                        top_k,
+                        seq_lens,
+                        scr("greedy"),
+                        scr("chain_temperature"),
+                        scr("chain_top_k"),
+                        scr("offset"),
+                        scr("states"),
+                        seqs,
+                        i32(vocab_padded),
+                        i32(groups * sizes["state_words"]),
+                        i32(64),
+                    ],
+                    pdl=True,
+                ),
+                launch(
+                    chain,
+                    "kern_verify_online_softmax_f32",
+                    ["inout buffer<f32>", "inout buffer<f32>", "in buffer<f32>", "f32", "i32", "in buffer<f32>"],
+                    BLOCK_SAMPLING,
+                    [S, 1, 1],
+                    [probs, probs, scr("chain_temperature"), f32(1.0), i32(vocab_padded), temperature],
+                    sizes["softmax"],
+                ),
+                launch(
+                    chain,
+                    "kern_verify_radix_topk_f32",
+                    [
+                        "inout buffer<f32>",
+                        "inout buffer<f32>",
+                        "in buffer<i32>",
+                        "i32",
+                        "i32",
+                        "i32",
+                        "inout buffer<u32>",
+                        "i32",
+                        "i32",
+                        "in buffer<f32>",
+                    ],
+                    BLOCK_SAMPLING,
+                    [{"mul": [{"clamp": [S, 0, groups]}, ctas]}, 1, 1],
+                    [
+                        probs,
+                        probs,
+                        scr("chain_top_k"),
+                        i32(0),
+                        i32(vocab_padded),
+                        seqs,
+                        scr("states"),
+                        i32(chunk),
+                        i32(ctas),
+                        temperature,
+                    ],
+                    radix_smem,
+                ),
+                launch(
+                    chain,
+                    "kern_verify_topp_renorm_f32",
+                    ["inout buffer<f32>", "inout buffer<f32>", "in buffer<f32>", "f32", "i32", "in buffer<f32>"],
+                    BLOCK_SAMPLING,
+                    [S, 1, 1],
+                    [probs, probs, top_p, f32(0.0), i32(vocab_padded), temperature],
+                    sizes["topp"],
+                ),
+                launch(
+                    chain,
+                    "kern_verify_minp_sample_f32",
+                    [
+                        "inout buffer<f32>",
+                        "in buffer<f32>",
+                        "out buffer<i32>",
+                        "out buffer<u8>",
+                        "i64",
+                        "f32",
+                        "i32",
+                        "in buffer<i64>",
+                        "i64",
+                        "in buffer<u64>",
+                        "i64",
+                        "i32",
+                        "i32",
+                        "in buffer<f32>",
+                    ],
+                    BLOCK_SAMPLING,
+                    [S, 1, 1],
+                    [
+                        probs,
+                        min_p,
+                        scr("drawn"),
+                        scr("valid"),
+                        i64(0),
+                        f32(0.0),
+                        i32(vocab_padded),
+                        seed,
+                        i64(0),
+                        scr("offset"),
+                        i64(0),
+                        i32(1),
+                        i32(1),
+                        temperature,
+                    ],
+                    sizes["minp"],
+                ),
+                launch(
+                    glue,
+                    "kern_sample_select",
+                    [
+                        "in buffer<f32>",
+                        "in buffer<i32>",
+                        "in buffer<i64>",
+                        "in buffer<u8>",
+                        "out buffer<i64>",
+                        "i32",
+                    ],
+                    BLOCK_SAMPLING,
+                    [1, 1, 1],
+                    [temperature, scr("drawn"), scr("greedy"), scr("valid"), tokens, seqs],
+                ),
+            ],
+        },
+    }
+
+
 # ---------------------------------------------------------------------------
 # Manifest registration & emitters
 # ---------------------------------------------------------------------------
@@ -767,15 +1013,16 @@ def register_modules(
             "dspark_ctx_store_ring_commit",
             f"dspark_ctx_store_paged_direct{suf}",
             f"dspark_ctx_store_paged_commit{suf}",
-            "dspark_attn_ring",
-            f"dspark_attn_paged_partial{suf}" if layout.num_kv_splits > 1 else f"dspark_attn_paged_direct{suf}",
             "dspark_skip_anchor",
             "dspark_markov_ctx_concat",
             "dspark_markov_add_bias",
             "dspark_markov_state_concat",
             "dspark_markov_gate_add",
         }
-        if layout.num_kv_splits > 1:
+        if layout.num_kv_splits <= 1:
+            keep_dsl.add(f"dspark_attn_paged_direct{suf}")
+        elif layout.page_size != 64:
+            keep_dsl.add(f"dspark_attn_paged_partial{suf}")
             keep_dsl.add("dspark_attn_combine_16")
     for name, info in dsl["modules"].items():
         if name in keep_dsl:
@@ -969,12 +1216,11 @@ def register_ops(
     buf("d.branch", "bf16", ["tokens", DSPARK_HIDDEN])
     buf("d.qkv", "bf16", ["tokens", 5120])
     buf("d.attn", "bf16", ["tokens", 3072])
-    if layout.num_kv_splits > 1:
+    if layout.num_kv_splits > 1 and layout.page_size != 64:
         buf("d.attn_o_part", "f32", [layout.num_kv_splits, "tokens", DSPARK_Q_HEADS, DSPARK_HEAD_DIM])
         buf("d.attn_lse_part", "f32", [layout.num_kv_splits, "tokens", DSPARK_Q_HEADS])
-    else:
+    elif layout.num_kv_splits <= 1:
         buf("d.attn_lse_part", "f32", [1])
-    buf("d.gate_up", "bf16", ["tokens", 2 * DSPARK_INTER])
     buf("d.act", "bf16", ["tokens", DSPARK_INTER])
     buf("d.step_hidden", "bf16", ["seqs", DSPARK_NUM_SPEC, DSPARK_HIDDEN])
     buf("d.base_logits", "bf16", ["seqs", DSPARK_NUM_SPEC, VOCAB_PADDED])
@@ -998,9 +1244,187 @@ def register_ops(
     ):
         buf(f"d.sample.{n}", dt, ["tokens"])
 
-    # Builtin GEMM ops
+    # Builtin GEMM ops (kept for huge-N markov.base_logits & standalone tests)
     _gemm_op(ops, "dspark_gemm_bf16", "extern:cublaslt_bf16_tn", "bf16")
     _gemm_op(ops, "dspark_gemm_bf16_f32", "extern:cublas_bf16_tn_f32", "f32")
+
+    # SM120 256-bit v8.b32 direct-register MMA/GEMV with PDL for DSpark & Markov projections
+    _p6 = [{"param": j} for j in range(6)]
+    _bf16_gemm_params = ["in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32", "i32"]
+    _f32_gemm_params = ["in buffer<bf16>", "in buffer<bf16>", "out buffer<f32>", "i32", "i32", "i32"]
+    ops["dspark_proj_bf16"] = {
+        "params": _bf16_gemm_params,
+        "impl": {
+            "launches": [
+                {
+                    "module": "spec_state_commit",
+                    "entry": "kern_dspark_gemv_m1_bf16_sm120",
+                    "params": _bf16_gemm_params,
+                    "grid": [640, 1, 1],
+                    "block": [256, 1, 1],
+                    "pdl": True,
+                    "args": _p6,
+                    "when": {"var": "tokens", "max": 1},
+                },
+                {
+                    "module": "spec_state_commit",
+                    "entry": "kern_dspark_gemm_m8_bf16_sm120",
+                    "params": _bf16_gemm_params,
+                    "grid": [640, 1, 1],
+                    "block": [256, 1, 1],
+                    "pdl": True,
+                    "args": _p6,
+                    "when": {"var": "tokens", "min": 2, "max": 8},
+                },
+                {
+                    "module": "spec_state_commit",
+                    "entry": "kern_dspark_gemm_m16_bf16_sm120",
+                    "params": _bf16_gemm_params,
+                    "grid": [640, 1, 1],
+                    "block": [256, 1, 1],
+                    "pdl": True,
+                    "args": _p6,
+                    "when": {"var": "tokens", "min": 9, "max": 16},
+                },
+                {
+                    "module": "spec_state_commit",
+                    "entry": "kern_dspark_gemm_m32_bf16_sm120",
+                    "params": _bf16_gemm_params,
+                    "grid": [640, 1, 1],
+                    "block": [256, 1, 1],
+                    "pdl": True,
+                    "args": _p6,
+                    "when": {"var": "tokens", "min": 17, "max": 32},
+                },
+                {
+                    "entry": "extern:cublaslt_bf16_tn",
+                    "params": _bf16_gemm_params,
+                    "args": _p6,
+                    "when": {"var": "tokens", "min": 33},
+                },
+            ]
+        },
+    }
+    _rec_silu = dsl["dspark_silu_mul"]
+    ops["dspark_gate_up_silu"] = {
+        "params": _bf16_gemm_params,
+        "impl": {
+            "scratch": {
+                "tmp": {"dtype": "bf16", "shape": ["tokens", 2 * DSPARK_INTER]},
+            },
+            "launches": [
+                {
+                    "module": "spec_state_commit",
+                    "entry": "kern_dspark_gate_up_silu_m8_sm120",
+                    "params": _bf16_gemm_params,
+                    "grid": [ceil_div(DSPARK_INTER, 8), 1, 1],
+                    "block": [256, 1, 1],
+                    "pdl": True,
+                    "args": _p6,
+                    "when": {"var": "tokens", "max": 8},
+                },
+                {
+                    "module": "spec_state_commit",
+                    "entry": "kern_dspark_gate_up_silu_m16_sm120",
+                    "params": _bf16_gemm_params,
+                    "grid": [ceil_div(DSPARK_INTER, 8), 1, 1],
+                    "block": [256, 1, 1],
+                    "pdl": True,
+                    "args": _p6,
+                    "when": {"var": "tokens", "min": 9, "max": 16},
+                },
+                {
+                    "module": "spec_state_commit",
+                    "entry": "kern_dspark_gate_up_silu_m32_sm120",
+                    "params": _bf16_gemm_params,
+                    "grid": [ceil_div(DSPARK_INTER, 8), 1, 1],
+                    "block": [256, 1, 1],
+                    "pdl": True,
+                    "args": _p6,
+                    "when": {"var": "tokens", "min": 17, "max": 32},
+                },
+                {
+                    "entry": "extern:cublaslt_bf16_tn",
+                    "params": _bf16_gemm_params,
+                    "args": [
+                        {"param": 0},
+                        {"param": 1},
+                        {"scratch": "tmp"},
+                        {"param": 3},
+                        _i32(2 * DSPARK_INTER),
+                        {"param": 5},
+                    ],
+                    "when": {"var": "tokens", "min": 33},
+                },
+                {
+                    "module": "dspark_silu_mul",
+                    "entry": _rec_silu["entry"],
+                    "params": ["in buffer<bf16>", "out buffer<bf16>", "i64"] + _rec_silu["abi_tail"],
+                    "grid": ["tokens", ceil_div(DSPARK_INTER, 1024), 1],
+                    "block": _rec_silu["block"],
+                    "shared_mem": _rec_silu["shared_mem"],
+                    "args": [{"scratch": "tmp"}, {"param": 2}, _i64(2 * DSPARK_INTER), _i64(0), _i64(0)],
+                    "when": {"var": "tokens", "min": 33},
+                },
+            ],
+        },
+    }
+    ops["dspark_markov_ctx_proj_f32"] = {
+        "params": _f32_gemm_params,
+        "impl": {
+            "launches": [
+                {
+                    "module": "spec_state_commit",
+                    "entry": "kern_dspark_gemm_m8_f32_sm120",
+                    "params": _f32_gemm_params,
+                    "grid": [192, 1, 1],
+                    "block": [256, 1, 1],
+                    "pdl": True,
+                    "args": _p6,
+                    "when": {"var": "seqs", "max": 1},
+                },
+                {
+                    "entry": "extern:cublas_bf16_tn_f32",
+                    "params": _f32_gemm_params,
+                    "args": _p6,
+                    "when": {"var": "seqs", "min": 2},
+                },
+            ]
+        },
+    }
+    ops["dspark_markov_state_proj_f32"] = {
+        "params": _f32_gemm_params,
+        "impl": {
+            "launches": [
+                {
+                    "module": "spec_state_commit",
+                    "entry": "kern_dspark_gemv_m1_f32_sm120",
+                    "params": _f32_gemm_params,
+                    "grid": [192, 1, 1],
+                    "block": [256, 1, 1],
+                    "pdl": True,
+                    "args": _p6,
+                    "when": {"var": "seqs", "max": 1},
+                },
+                {
+                    "module": "spec_state_commit",
+                    "entry": "kern_dspark_gemm_m8_f32_sm120",
+                    "params": _f32_gemm_params,
+                    "grid": [192, 1, 1],
+                    "block": [256, 1, 1],
+                    "pdl": True,
+                    "args": _p6,
+                    "when": {"var": "seqs", "min": 2, "max": 8},
+                },
+                {
+                    "entry": "extern:cublas_bf16_tn_f32",
+                    "params": _f32_gemm_params,
+                    "args": _p6,
+                    "when": {"var": "seqs", "min": 9},
+                },
+            ]
+        },
+    }
 
     # Derive ops (no vars in grid/args)
     _cuda_op(
@@ -1129,17 +1553,7 @@ def register_ops(
         [1, 1, 1],
         256,
     )
-    if layout.target_verify_logits_dtype == "f32":
-        _cuda_op(
-            ops,
-            "dspark_verify_mask_vocab_f32",
-            "spec_state_commit",
-            "dspark_verify_mask_vocab_f32",
-            ["inout buffer<f32>", "f32", "i32", "i32"],
-            ["tokens", ceil_div(VOCAB_PADDED, 1024), 1],
-            1024,
-        )
-    else:
+    if layout.target_verify_logits_dtype != "f32":
         _cuda_op(
             ops,
             "dspark_verify_mask_vocab_bf16",
@@ -1374,13 +1788,6 @@ def register_ops(
     )
     _triton_op(
         ops,
-        "dspark_silu_mul",
-        dsl["dspark_silu_mul"],
-        ["in buffer<bf16>", "out buffer<bf16>", "i64"],
-        ["tokens", ceil_div(DSPARK_INTER, 1024), 1],
-    )
-    _triton_op(
-        ops,
         "dspark_rms_norm",
         dsl["dspark_rms_norm"],
         ["in buffer<bf16>", "in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>"],
@@ -1440,11 +1847,102 @@ def register_ops(
             ["tokens", 4, 1],
             out_mod_name=mod_n,
         )
-    _triton_op(
-        ops,
-        "dspark_attn_ring",
-        dsl["dspark_attn_ring"],
-        [
+    # SM120 Blackwell CUDA split-KV ring FP8 attention + PDL 1-warp combine.
+    # Saturates 110-SM RTX PRO 5000 across all batch sizes (vs Triton's 8*seqs CTAs):
+    # seqs<=1 -> S=16 (128 CTAs), seqs==2 -> S=8 (128 CTAs), seqs in 3..4 -> S=5 (120/160 CTAs),
+    # seqs>=5 -> S=4 (192 @ g6, 256 @ g8). Keeps op name "dspark_attn_ring" & args[4]=lines_buf.
+    _pr = lambda idx: {"param": idx}
+    _sr = lambda name: {"scratch": name}
+    _ds_ring_params = [
+        "in buffer<bf16>",
+        "in buffer<bf16>",
+        "in buffer<bf16>",
+        "in state",
+        "in buffer<i32>",
+        "in buffer<i32>",
+        "out buffer<bf16>",
+        "f32",
+        "f32",
+        "f32",
+        "i64",
+        "i64",
+        "i64",
+        "i64",
+        "i32",
+    ]
+    _ds_ring_split_params = [
+        "in buffer<bf16>",
+        "in buffer<bf16>",
+        "in buffer<bf16>",
+        "in state",
+        "in buffer<i32>",
+        "in buffer<i32>",
+        "out buffer<f32>",
+        "out buffer<f32>",
+        "f32",
+        "f32",
+        "f32",
+        "i64",
+        "i64",
+        "i64",
+        "i64",
+        "i32",
+        "i32",
+    ]
+    _ds_ring_comb_params = ["in buffer<f32>", "in buffer<f32>", "out buffer<bf16>", "i32"]
+    _ring_launches = []
+    for s_cnt, when_cond in (
+        (16, {"var": "seqs", "max": 1}),
+        (8, {"var": "seqs", "min": 2, "max": 2}),
+        (5, {"var": "seqs", "min": 3, "max": 4}),
+        (4, {"var": "seqs", "min": 5}),
+    ):
+        _ring_launches.append(
+            {
+                "module": "spec_round",
+                "entry": "kern_dspark_attn_ring_split_sm120",
+                "params": _ds_ring_split_params,
+                "grid": [s_cnt, DSPARK_KV_HEADS, "seqs"],
+                "block": [128, 1, 1],
+                "args": [
+                    _pr(0), _pr(1), _pr(2), _pr(3), _pr(4), _pr(5),
+                    _sr("o_part"), _sr("lse_part"),
+                    _pr(7), _pr(8), _pr(9), _pr(10), _pr(11), _pr(12), _pr(13), _pr(14),
+                    _i32(s_cnt),
+                ],
+                "when": when_cond,
+            }
+        )
+        _ring_launches.append(
+            {
+                "module": "spec_round",
+                "entry": f"kern_dspark_attn_paged_combine_s{s_cnt}",
+                "params": _ds_ring_comb_params,
+                "grid": ["tokens", DSPARK_Q_HEADS, 1],
+                "block": [32, 1, 1],
+                "pdl": True,
+                "args": [_sr("o_part"), _sr("lse_part"), _pr(6), _pr(14)],
+                "when": when_cond,
+            }
+        )
+    ops["dspark_attn_ring"] = {
+        "params": _ds_ring_params,
+        "impl": {
+            "scratch": {
+                "o_part": {"dtype": "f32", "shape": [16, "tokens", DSPARK_Q_HEADS, DSPARK_HEAD_DIM]},
+                "lse_part": {"dtype": "f32", "shape": [16, "tokens", DSPARK_Q_HEADS]},
+            },
+            "launches": _ring_launches,
+        },
+    }
+    if layout.num_kv_splits > 1 and layout.page_size == 64:
+        # SM120 Blackwell CUDA transposed-MMA split-KV paged FP8 attention + PDL 1-warp combine.
+        # Wave-matched split counts for 110-SM RTX PRO 5000 (3 CTAs/SM = 330 slots, 0 wave tail):
+        # seqs<=1 -> S=27 (216 CTAs), seqs==2 -> S=20 (320 CTAs),
+        # seqs in 3..4 -> S=10 (240/320 CTAs), seqs>=5 -> S=5 (240 @ g6, 320 @ g8).
+        p = lambda idx: {"param": idx}
+        scr = lambda name: {"scratch": name}
+        ds_paged_params = [
             "in buffer<bf16>",
             "in buffer<bf16>",
             "in buffer<bf16>",
@@ -1460,10 +1958,84 @@ def register_ops(
             "i64",
             "i64",
             "i64",
-        ],
-        [DSPARK_KV_HEADS, "seqs", 1],
-    )
-    if layout.num_kv_splits > 1:
+            "i64",
+            "i64",
+            "i64",
+            "i64",
+            "i32",
+        ]
+        split_params = [
+            "in buffer<bf16>",
+            "in buffer<bf16>",
+            "in buffer<bf16>",
+            "in state",
+            "in buffer<i32>",
+            "in buffer<i32>",
+            "out buffer<f32>",
+            "out buffer<f32>",
+            "f32",
+            "f32",
+            "f32",
+            "i64",
+            "i64",
+            "i64",
+            "i64",
+            "i64",
+            "i64",
+            "i64",
+            "i64",
+            "i64",
+            "i32",
+            "i32",
+        ]
+        comb_params = ["in buffer<f32>", "in buffer<f32>", "out buffer<bf16>", "i32"]
+        launches = []
+        for s_cnt, when_cond in (
+            (27, {"var": "seqs", "max": 1}),
+            (20, {"var": "seqs", "min": 2, "max": 2}),
+            (10, {"var": "seqs", "min": 3, "max": 4}),
+            (5, {"var": "seqs", "min": 5}),
+        ):
+            launches.append(
+                {
+                    "module": "spec_round",
+                    "entry": "kern_dspark_attn_paged_split_sm120",
+                    "params": split_params,
+                    "grid": [s_cnt, DSPARK_KV_HEADS, "seqs"],
+                    "block": [128, 1, 1],
+                    "args": [
+                        p(0), p(1), p(2), p(3), p(4), p(5),
+                        scr("o_part"), scr("lse_part"),
+                        p(7), p(8), p(9), p(10), p(11), p(12), p(13),
+                        p(14), p(15), p(16), p(17), p(18), p(19),
+                        _i32(s_cnt),
+                    ],
+                    "when": when_cond,
+                }
+            )
+            launches.append(
+                {
+                    "module": "spec_round",
+                    "entry": f"kern_dspark_attn_paged_combine_s{s_cnt}",
+                    "params": comb_params,
+                    "grid": ["tokens", DSPARK_Q_HEADS, 1],
+                    "block": [32, 1, 1],
+                    "pdl": True,
+                    "args": [scr("o_part"), scr("lse_part"), p(6), p(19)],
+                    "when": when_cond,
+                }
+            )
+        ops["dspark_attn_paged_sm120"] = {
+            "params": ds_paged_params,
+            "impl": {
+                "scratch": {
+                    "o_part": {"dtype": "f32", "shape": [27, "tokens", DSPARK_Q_HEADS, DSPARK_HEAD_DIM]},
+                    "lse_part": {"dtype": "f32", "shape": [27, "tokens", DSPARK_Q_HEADS]},
+                },
+                "launches": launches,
+            },
+        }
+    elif layout.num_kv_splits > 1:
         mod_p = f"dspark_attn_paged_partial{suf}"
         _triton_op(
             ops,
@@ -1584,15 +2156,25 @@ def register_ops(
 
     # Target verify sampling op
     rows_max = layout.max_seqs * DSPARK_BLOCK_SIZE
-    v_op = sampling_op(
-        VOCAB_PADDED,
-        rows_max,
-        spec["sampling"],
-        sampling_target,
-        logits_dtype=layout.target_verify_logits_dtype,
-        axis_var="tokens",
-    )
-    ops["verify_sample"] = v_op
+    if layout.target_verify_logits_dtype == "f32":
+        ops["verify_softcap_sample"] = verify_softcap_sample_op(
+            VOCAB_PADDED,
+            VOCAB_UNPADDED,
+            SOFTCAP,
+            rows_max,
+            spec["sampling"],
+            sampling_target,
+            axis_var="tokens",
+        )
+    else:
+        ops["verify_sample"] = sampling_op(
+            VOCAB_PADDED,
+            rows_max,
+            spec["sampling"],
+            sampling_target,
+            logits_dtype=layout.target_verify_logits_dtype,
+            axis_var="tokens",
+        )
     return loaded
 
 
@@ -1674,7 +2256,7 @@ def _emit_context_store_calls(
                 label=f"dspark.ctx.{l}.mix_norm",
             ),
             _call(
-                "dspark_gemm_bf16",
+                "dspark_proj_bf16",
                 _b("d.ctx"),
                 _b(f"d.{p}kv_ctx.weight"),
                 _b("d.ctx_kv"),
@@ -1928,7 +2510,7 @@ def emit_round_program(
             )
         calls += [
             _call(
-                "dspark_gemm_bf16",
+                "dspark_proj_bf16",
                 _b("d.x"),
                 _b(f"d.{p}qkv.weight"),
                 _b("d.qkv"),
@@ -1966,14 +2548,41 @@ def emit_round_program(
                     _i64(5120),
                     _i64(5120),
                     _i64(5120),
-                    _i64(3072),
                     _i64(DSPARK_STATE_BYTES_PER_SEQ),
+                    _var("tokens"),
                     label=f"dspark.l{l}.attn_ring",
                 )
             )
             swa_idx += 1
         else:
-            if layout.num_kv_splits > 1:
+            if layout.num_kv_splits > 1 and layout.page_size == 64:
+                calls.append(
+                    _call(
+                        "dspark_attn_paged_sm120",
+                        _b("d.qkv"),
+                        _b("d.qkv", 3072 * 2),
+                        _b("d.qkv", 4096 * 2),
+                        _st(layout.kv_state),
+                        _b("pages"),
+                        _b("lengths"),
+                        _b("d.attn"),
+                        _f32(layout.dspark_k_scale),
+                        _f32(layout.dspark_v_scale),
+                        _f32(DSPARK_HEAD_DIM**-0.5),
+                        _i64(5120),
+                        _i64(5120),
+                        _i64(5120),
+                        _i64(layout.page_columns),
+                        _i64(layout.kv_layer_offset_bytes),
+                        _i64(layout.kv_page_stride_bytes),
+                        _i64(layout.kv_slot_stride_bytes),
+                        _i64(layout.kv_head_stride_bytes),
+                        _i64(layout.kv_v_offset_bytes),
+                        _var("tokens"),
+                        label=f"dspark.l{l}.attn_paged",
+                    )
+                )
+            elif layout.num_kv_splits > 1:
                 calls += [
                     _call(
                         "dspark_attn_paged_partial",
@@ -2044,7 +2653,7 @@ def emit_round_program(
 
         calls += [
             _call(
-                "dspark_gemm_bf16",
+                "dspark_proj_bf16",
                 _b("d.attn"),
                 _b(f"d.{p}self_attn.o_proj.weight"),
                 _b("d.branch"),
@@ -2062,24 +2671,17 @@ def emit_round_program(
                 label=f"dspark.l{l}.post_norm",
             ),
             _call(
-                "dspark_gemm_bf16",
+                "dspark_gate_up_silu",
                 _b("d.x"),
                 _b(f"d.{p}gate_up.weight"),
-                _b("d.gate_up"),
-                _var("tokens"),
-                _i32(2 * DSPARK_INTER),
-                _i32(DSPARK_HIDDEN),
-                label=f"dspark.l{l}.gate_up",
-            ),
-            _call(
-                "dspark_silu_mul",
-                _b("d.gate_up"),
                 _b("d.act"),
-                _i64(2 * DSPARK_INTER),
-                label=f"dspark.l{l}.silu_mul",
+                _var("tokens"),
+                _i32(DSPARK_INTER),
+                _i32(DSPARK_HIDDEN),
+                label=f"dspark.l{l}.gate_up_silu",
             ),
             _call(
-                "dspark_gemm_bf16",
+                "dspark_proj_bf16",
                 _b("d.act"),
                 _b(f"d.{p}mlp.down_proj.weight"),
                 _b("d.branch"),
@@ -2122,7 +2724,7 @@ def emit_round_program(
             label="markov.ctx_concat",
         ),
         _call(
-            "dspark_gemm_bf16_f32",
+            "dspark_markov_ctx_proj_f32",
             _b("d.markov_ctx_in"),
             _b("d.w_ctx"),
             _b("d.markov_ctx"),
@@ -2156,7 +2758,7 @@ def emit_round_program(
                 label=f"markov.s{step}.state_concat",
             ),
             _call(
-                "dspark_gemm_bf16_f32",
+                "dspark_markov_state_proj_f32",
                 _b("d.markov_in"),
                 _b("d.w_state"),
                 _b("d.markov_state_part"),
@@ -2209,47 +2811,71 @@ def emit_round_program(
     calls.extend(target_verify_calls)
 
     # 5. Target softcap + vocab mask + sampling expansion + verify sampling + spec_count
-    mask_op = (
-        "dspark_verify_mask_vocab_f32"
-        if layout.target_verify_logits_dtype == "f32"
-        else "dspark_verify_mask_vocab_bf16"
-    )
     sampling_names = ("temperature", "top_k", "top_p", "min_p", "seed", "lengths")
-    calls += [
-        _call(
-            mask_op,
-            _b(layout.target_verify_logits_buf),
-            _f32(SOFTCAP),
-            _i32(VOCAB_PADDED),
-            _i32(VOCAB_UNPADDED),
-            label="verify.softcap_mask",
-        ),
-        _call(
-            "spec_sampling",
-            *[_b(n) for n in sampling_names],
-            *[_b("d.sample." + n) for n in sampling_names],
-            _i32(DSPARK_BLOCK_SIZE),
-            label="verify.spec_sampling",
-        ),
-        _call(
-            "verify_sample",
-            _b(layout.target_verify_logits_buf),
-            _b("d.sample.lengths"),
-            *[_b("d.sample." + n) for n in sampling_names[:-1]],
-            _b("verify_tokens"),
-            _var("tokens"),
-            label="verify.sample",
-        ),
-        _call(
-            "kern_spec_count",
-            _b("d.draft"),
-            _b("verify_tokens"),
-            _b("accepted"),
-            _i32(DSPARK_BLOCK_SIZE),
-            _i32(DSPARK_NUM_SPEC),
-            label="spec.count",
-        ),
-    ]
+    if layout.target_verify_logits_dtype == "f32":
+        calls += [
+            _call(
+                "spec_sampling",
+                *[_b(n) for n in sampling_names],
+                *[_b("d.sample." + n) for n in sampling_names],
+                _i32(DSPARK_BLOCK_SIZE),
+                label="verify.spec_sampling",
+            ),
+            _call(
+                "verify_softcap_sample",
+                _b(layout.target_verify_logits_buf),
+                _b("d.sample.lengths"),
+                *[_b("d.sample." + n) for n in sampling_names[:-1]],
+                _b("verify_tokens"),
+                _var("tokens"),
+                label="verify.softcap_sample",
+            ),
+            _call(
+                "kern_spec_count",
+                _b("d.draft"),
+                _b("verify_tokens"),
+                _b("accepted"),
+                _i32(DSPARK_BLOCK_SIZE),
+                _i32(DSPARK_NUM_SPEC),
+                label="spec.count",
+            ),
+        ]
+    else:
+        calls += [
+            _call(
+                "dspark_verify_mask_vocab_bf16",
+                _b(layout.target_verify_logits_buf),
+                _f32(SOFTCAP),
+                _i32(VOCAB_PADDED),
+                _i32(VOCAB_UNPADDED),
+                label="verify.softcap_mask",
+            ),
+            _call(
+                "spec_sampling",
+                *[_b(n) for n in sampling_names],
+                *[_b("d.sample." + n) for n in sampling_names],
+                _i32(DSPARK_BLOCK_SIZE),
+                label="verify.spec_sampling",
+            ),
+            _call(
+                "verify_sample",
+                _b(layout.target_verify_logits_buf),
+                _b("d.sample.lengths"),
+                *[_b("d.sample." + n) for n in sampling_names[:-1]],
+                _b("verify_tokens"),
+                _var("tokens"),
+                label="verify.sample",
+            ),
+            _call(
+                "kern_spec_count",
+                _b("d.draft"),
+                _b("verify_tokens"),
+                _b("accepted"),
+                _i32(DSPARK_BLOCK_SIZE),
+                _i32(DSPARK_NUM_SPEC),
+                label="spec.count",
+            ),
+        ]
 
     # 6. Rollback-safe target & DSpark state commits (ONLY 0 .. accepted[seq]-1)
     if target_commit_calls is not None:

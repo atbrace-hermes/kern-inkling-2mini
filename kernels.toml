@@ -129,14 +129,14 @@ flags = "plain"
 includes = []
 
 [kernels."spec_state_commit"]
-sha256 = "1b3c0cf6da15505f7c34d07f5d9eaccba0b58d53c5851e28c38f865e80c75370"
+sha256 = "53e2523863b7a40ec9252f2ad2310f61c7ba0031cc9545b491afb7701821d700"
 milestone = "M4"
 source = "source/spec_state_commit.cu"
 flags = "plain"
 includes = []
 
 [kernels."spec_round"]
-sha256 = "0675c2ba66cbba9000bcf72f29bd0f264d7dd5741f7c6d21e354f7ea26996f08"
+sha256 = "d8a0015756329de5a87e578770b49d03acaef61b742a1a780cd8e9f042fc73b1"
 milestone = "M4"
 source = "source/spec_round.cu"
 flags = "plain"
@@ -157,7 +157,7 @@ flags = "plain"
 includes = []
 
 [kernels."spec_sampling"]
-sha256 = "e99608a8446a41d59dc1602f7b39c65581996dcbe97590bbb54c46421fe0cd9a"
+sha256 = "734186ffc4ec613fb60f5ce35a869c10c087cba9fbb4afc3a29d6bad0c9932f1"
 milestone = "M4"
 source = "source/sampling.cu"
 flags = "plain"
