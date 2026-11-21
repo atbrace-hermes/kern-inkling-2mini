@@ -9,7 +9,11 @@
 //      - Blackwell native 1-instr cvt.rn.bf16x2.e4m3x2 (F2FP.BF16.E4M3)
 //      - Optional dedicated cur-only split (ring_splits < num_splits) to eliminate last-split straggler
 //      - PDL (griddepcontrol) across prologue & combine.
-//   2. kern_attn_verify_combine_s{4,5,8,9,16,17,32}: 1-warp float4 split-KV combine + Gate + Sink.
+//   2. kern_attn_full_verify_split: 2-phase (pure-bulk dist>=1024 + causal/Rel tail)
+//      paged FP8 E4M3 full attention for speculative verify (QLEN=8, PAGE=64 == BN=64).
+//      - 3 CTAs/SM (REG:168, STACK:0, SMEM:33280 B), balanced contiguous page splits
+//      - Wave-matched 1-wave split schedule (S=41/20/10/5 <= 328 CTAs <= 330 slots on PRO 5000).
+//   3. kern_attn_verify_combine_s{4,5,8,9,10,16,17,20,32,41}: 1-warp float4 split-KV combine + Gate + Sink.
 
 #include <cuda_bf16.h>
 #include <cstdint>
@@ -35,6 +39,11 @@ constexpr int kPRow = 72;           // 72 bf16 = 144 B = 36 banks (gid*4 + tig -
 constexpr int64_t kSeqStateBytes = 90005376LL;
 constexpr int64_t kSwaHeadRingBytes = 131072LL;   // 1024 * 128
 constexpr int64_t kSwaHalfVisitBytes = 1048576LL; // 8 * 1024 * 128
+
+constexpr int kPage = 64;                         // == kBN (1 tile == 1 full KV page!)
+constexpr int64_t kKvPageBytes = 1179648LL;       // 9 * 2 * 8 * 64 * 128
+constexpr int64_t kKvHalfPageBytes = 65536LL;     // 8 * 64 * 128
+constexpr int64_t kKvHeadPageBytes = 8192LL;      // 64 * 128
 
 constexpr float kLog2E = 1.4426950408889634f;
 constexpr float kLn2 = 0.6931471805599453f;
@@ -124,6 +133,42 @@ __device__ __forceinline__ void cp_async_ring_tile(
       cp_async_cg_16(&dst[r][swiz_col], src);
     } else {
       const int sz = (k >= 0 && k < past) ? 16 : 0;
+      cp_async_cg_16_pred(&dst[r][swiz_col], src, sz);
+    }
+  }
+}
+
+// Load 64x128 FP8 paged KV tile (K or V) from KVState into dst[64][128] with 16B XOR swizzle.
+// One page is 64 contiguous rows of 128B (8 KB) per kv_head!
+template <bool IS_V>
+__device__ __forceinline__ void cp_async_page_tile(
+    uint8_t (&dst)[kBN][kHeadDim],
+    const uint8_t* __restrict__ KVState,
+    int kv_head,
+    int page,
+    int k0,
+    int seqlen_k,
+    int tid,
+    bool full_valid) {
+  const int c16 = tid & 7;
+  const int r0 = tid >> 3;
+  const int col_byte = c16 << 4;
+  const bool page_ok = (page >= 0);
+  const int64_t safe_page = page_ok ? static_cast<int64_t>(page) : 0LL;
+  const uint8_t* base = KVState
+      + safe_page * kKvPageBytes
+      + static_cast<int64_t>(kv_head) * kKvHeadPageBytes
+      + (IS_V ? kKvHalfPageBytes : 0LL)
+      + col_byte;
+#pragma unroll
+  for (int step = 0; step < 4; ++step) {
+    const int r = r0 + step * 16;
+    const int swiz_col = col_byte ^ ((r & 7) << 4);
+    const uint8_t* src = base + static_cast<int64_t>(r) * kHeadDim;
+    if (full_valid && page_ok) {
+      cp_async_cg_16(&dst[r][swiz_col], src);
+    } else {
+      const int sz = (page_ok && (k0 + r) < seqlen_k) ? 16 : 0;
       cp_async_cg_16_pred(&dst[r][swiz_col], src, sz);
     }
   }
@@ -743,7 +788,435 @@ extern "C" __global__ void __launch_bounds__(kThreads, 3) kern_attn_swa_verify_s
 }
 
 // ---------------------------------------------------------------------------
-// 2. Fast 1-Warp Float4 Split-KV Combine + Gate + Sink Epilogue (SM120)
+// 2. Full Attention Verify Split-KV Kernel (SM120, 3 CTAs/SM, 2-Phase Bulk+Tail)
+// Grid: [num_splits, 8 (kv_heads), seqs], Block: [128, 1, 1]
+// Splits all ceil(seqlen_k / 64) pages contiguously across num_splits.
+// Pages < n_bulk_pages (= max(0, past - 1023) / 64) run the ultra-tight ZERO-Rel,
+// ZERO-mask, pure-HBM-streaming bulk loop (~98-99% of pages at long context!).
+// Pages >= n_bulk_pages run the causal + Rel-bias tail loop seamlessly in the same CTA.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void __launch_bounds__(kThreads, 3) kern_attn_full_verify_split(
+    const bf16* __restrict__ Q,
+    const uint8_t* __restrict__ KVState,
+    const bf16* __restrict__ Rel,
+    const int32_t* __restrict__ BlockTable,
+    const int32_t* __restrict__ SeqLens,
+    float* __restrict__ OPart,
+    float* __restrict__ LsePart,
+    int num_tokens,
+    int table_width,
+    float sm_scale,
+    float v_scale,
+    int num_splits) {
+  const int split = blockIdx.x;
+  const int kv_head = blockIdx.y;
+  const int req = blockIdx.z;
+  const int tid = threadIdx.x;
+  const int w = tid >> 5;
+  const int lane = tid & 31;
+  const int gid = lane >> 2;
+  const int tig = lane & 3;
+
+  const int q_start = req * kQlen;
+  const int seqlen_k = SeqLens[req];
+  const int n_pages = (seqlen_k > 0) ? ((seqlen_k + kPage - 1) >> 6) : 0;
+
+  // Balanced contiguous partition of pages across num_splits.
+  const int base_pages = n_pages / num_splits;
+  const int rem_pages = n_pages % num_splits;
+  const int page_start = split * base_pages + (split < rem_pages ? split : rem_pages);
+  const int page_count = base_pages + (split < rem_pages ? 1 : 0);
+  const int page_end = page_start + page_count;
+
+  if (page_count <= 0) {
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    if (tid < kM) {
+      const int tok = tid / kGroup;
+      const int head = kv_head * kGroup + (tid - tok * kGroup);
+      const int64_t part = (static_cast<int64_t>(split) * num_tokens + (q_start + tok)) * kHeads + head;
+      LsePart[part] = kNegInf;
+    }
+    return;
+  }
+
+  const int past = seqlen_k - kQlen;
+  // Bulk pages: for page p < n_bulk_pages, max key k = (p+1)*64 - 1 <= past - 1024,
+  // so dist >= 1024 == E for all 8 query rows (zero Rel bias, zero causal mask, all 64 keys < seqlen_k!).
+  const int n_bulk_pages = (past >= kRelExtent - 1) ? ((past - (kRelExtent - 1)) >> 6) : 0;
+  const int bulk_end = (page_end < n_bulk_pages) ? page_end : n_bulk_pages;
+  const int bulk_count = (bulk_end > page_start) ? (bulk_end - page_start) : 0;
+  const int tail_start = (page_start > n_bulk_pages) ? page_start : n_bulk_pages;
+  const int tail_count = (page_end > tail_start) ? (page_end - tail_start) : 0;
+
+  const int32_t* bt = BlockTable + static_cast<int64_t>(req) * table_width;
+
+  __shared__ SwaVerifySmem smem;
+
+  // Wait for attn_prologue_full_verify to finish writing Q, Rel, and newest KV page.
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+
+  // Prefetch first page's K (bulk if bulk_count > 0, else first tail page) in parallel with Q load!
+  int cur_page = bt[page_start];
+  if (bulk_count > 0) {
+    cp_async_page_tile<false>(smem.k[0], KVState, kv_head, cur_page, page_start << 6, seqlen_k, tid, true);
+    cp_async_commit();
+  } else {
+    cp_async_page_tile<false>(smem.k[0], KVState, kv_head, cur_page, tail_start << 6, seqlen_k, tid, false);
+    cp_async_rel_tile(smem.rel, Rel, q_start, kv_head, past, tail_start << 6, tid, false);
+    cp_async_commit();
+  }
+
+  // Stage Q[24][128] bf16 (6 KB) into smem.k[1] (free until it==1!), then load into registers.
+  bf16 (*smem_q)[kHeadDim] = reinterpret_cast<bf16 (*)[kHeadDim]>(&smem.k[1][0][0]);
+#pragma unroll
+  for (int step = 0; step < 3; ++step) {
+    const int idx = tid + step * kThreads;
+    const int m = idx >> 4;
+    const int c16 = idx & 15;
+    const int tok = m / kGroup;
+    const int head = kv_head * kGroup + (m - tok * kGroup);
+    const int col_bf16 = c16 << 3;
+    const int sw_col = swiz_q_col(m, col_bf16);
+    const bf16* q_src = Q + (static_cast<int64_t>(q_start + tok) * kHeads + head) * kHeadDim + col_bf16;
+    *reinterpret_cast<uint4*>(&smem_q[m][sw_col]) = *reinterpret_cast<const uint4*>(q_src);
+  }
+  __syncthreads();
+
+  uint32_t q_b0[8][3];
+  uint32_t q_b1[8][3];
+#pragma unroll
+  for (int ds = 0; ds < 8; ++ds) {
+    const int d_step = ds << 4;
+#pragma unroll
+    for (int mt = 0; mt < 3; ++mt) {
+      const int q_m = mt * 8 + gid;
+      const int q_c0 = swiz_q_col(q_m, d_step) + tig * 2;
+      const int q_c1 = swiz_q_col(q_m, d_step + 8) + tig * 2;
+      q_b0[ds][mt] = *reinterpret_cast<const uint32_t*>(&smem_q[q_m][q_c0]);
+      q_b1[ds][mt] = *reinterpret_cast<const uint32_t*>(&smem_q[q_m][q_c1]);
+    }
+  }
+
+  const float qk_scale = sm_scale * kLog2E;
+
+  float m_i[3][2];
+  float l_i[3][2];
+  float acc[2][3][4];
+#pragma unroll
+  for (int mt = 0; mt < 3; ++mt) {
+    m_i[mt][0] = kNegInf; m_i[mt][1] = kNegInf;
+    l_i[mt][0] = 0.0f;    l_i[mt][1] = 0.0f;
+#pragma unroll
+    for (int dt = 0; dt < 2; ++dt) {
+      acc[dt][mt][0] = 0.0f; acc[dt][mt][1] = 0.0f;
+      acc[dt][mt][2] = 0.0f; acc[dt][mt][3] = 0.0f;
+    }
+  }
+
+  int owned_tok[3][2];
+#pragma unroll
+  for (int mt = 0; mt < 3; ++mt) {
+    const int m0 = mt * 8 + tig * 2;
+    owned_tok[mt][0] = m0 / kGroup;
+    owned_tok[mt][1] = (m0 + 1) / kGroup;
+  }
+
+  const int k_local0 = w * 16 + gid;
+  const int k_local1 = k_local0 + 8;
+
+  // ---------------- Phase A: Ultra-Tight Pure-Bulk Loop (dist >= 1024, ZERO Rel, ZERO Mask) ----------------
+  for (int it = 0; it < bulk_count; ++it) {
+    const int cur = it & 1;
+    const int nxt = cur ^ 1;
+    const int p_idx = page_start + it;
+    const int page = cur_page;
+
+    // Issue V_it cp.async while K_it finishes and K_it @ Q^T executes.
+    cp_async_page_tile<true>(smem.v, KVState, kv_head, page, p_idx << 6, seqlen_k, tid, true);
+    cp_async_commit();
+
+    // Wait for K_it (V_it stays in flight!).
+    cp_async_wait<1>();
+    __syncthreads();
+
+    // Phase 1: S^T = K_it @ Q^T (64 x 24), Q directly from registers.
+    float s[3][4];
+    compute_kq_tile_qreg(s, smem.k[cur], q_b0, q_b1, w, gid, tig);
+
+    // Pure bulk rowmax: ZERO Rel loads, ZERO causal/window checks (only page >= 0 guard)!
+    const bool page_ok = (page >= 0);
+#pragma unroll
+    for (int mt = 0; mt < 3; ++mt) {
+      const int m0 = mt * 8 + tig * 2;
+      const int m1 = m0 + 1;
+      const float wm0 = page_ok ? (col_reduce_max8(fmaxf(s[mt][0], s[mt][2])) * qk_scale) : kNegInf;
+      const float wm1 = page_ok ? (col_reduce_max8(fmaxf(s[mt][1], s[mt][3])) * qk_scale) : kNegInf;
+      if (gid == 0) {
+        smem.m[w][m0] = wm0;
+        smem.m[w][m1] = wm1;
+      }
+    }
+    __syncthreads();
+
+    float alpha[3][2];
+#pragma unroll
+    for (int mt = 0; mt < 3; ++mt) {
+      const int m0 = mt * 8 + tig * 2;
+      const int m1 = m0 + 1;
+      const float tm0 = fmaxf(fmaxf(smem.m[0][m0], smem.m[1][m0]), fmaxf(smem.m[2][m0], smem.m[3][m0]));
+      const float tm1 = fmaxf(fmaxf(smem.m[0][m1], smem.m[1][m1]), fmaxf(smem.m[2][m1], smem.m[3][m1]));
+      const float mn0 = fmaxf(m_i[mt][0], tm0);
+      const float mn1 = fmaxf(m_i[mt][1], tm1);
+      const float ms0 = (mn0 == kNegInf) ? 0.0f : mn0;
+      const float ms1 = (mn1 == kNegInf) ? 0.0f : mn1;
+      alpha[mt][0] = ex2_approx(m_i[mt][0] - ms0);
+      alpha[mt][1] = ex2_approx(m_i[mt][1] - ms1);
+      m_i[mt][0] = mn0;
+      m_i[mt][1] = mn1;
+
+      const float p00 = page_ok ? ex2_approx(__fmaf_rn(s[mt][0], qk_scale, -ms0)) : 0.0f;
+      const float p01 = page_ok ? ex2_approx(__fmaf_rn(s[mt][1], qk_scale, -ms1)) : 0.0f;
+      const float p10 = page_ok ? ex2_approx(__fmaf_rn(s[mt][2], qk_scale, -ms0)) : 0.0f;
+      const float p11 = page_ok ? ex2_approx(__fmaf_rn(s[mt][3], qk_scale, -ms1)) : 0.0f;
+
+      smem.p[m0][k_local0] = __float2bfloat16_rn(p00);
+      smem.p[m1][k_local0] = __float2bfloat16_rn(p01);
+      smem.p[m0][k_local1] = __float2bfloat16_rn(p10);
+      smem.p[m1][k_local1] = __float2bfloat16_rn(p11);
+
+      const float wl0 = col_reduce_sum8(p00 + p10);
+      const float wl1 = col_reduce_sum8(p01 + p11);
+      if (gid == 0) {
+        smem.l[w][m0] = wl0;
+        smem.l[w][m1] = wl1;
+      }
+    }
+
+    // Prefetch next page's K (bulk or first tail page!) while V_it finishes and V_it^T @ P_it^T runs!
+    if (it + 1 < bulk_count) {
+      cur_page = bt[p_idx + 1];
+      cp_async_page_tile<false>(smem.k[nxt], KVState, kv_head, cur_page, (p_idx + 1) << 6, seqlen_k, tid, true);
+      cp_async_commit();
+      cp_async_wait<1>();
+    } else if (tail_count > 0) {
+      cur_page = bt[tail_start];
+      cp_async_page_tile<false>(smem.k[0], KVState, kv_head, cur_page, tail_start << 6, seqlen_k, tid, false);
+      cp_async_rel_tile(smem.rel, Rel, q_start, kv_head, past, tail_start << 6, tid, false);
+      cp_async_commit();
+      cp_async_wait<1>();
+    } else {
+      cp_async_wait<0>();
+    }
+    __syncthreads();
+
+    // Update l_i and rescale acc by alpha.
+#pragma unroll
+    for (int mt = 0; mt < 3; ++mt) {
+      const int m0 = mt * 8 + tig * 2;
+      const int m1 = m0 + 1;
+      const float sum0 = (smem.l[0][m0] + smem.l[1][m0]) + (smem.l[2][m0] + smem.l[3][m0]);
+      const float sum1 = (smem.l[0][m1] + smem.l[1][m1]) + (smem.l[2][m1] + smem.l[3][m1]);
+      l_i[mt][0] = __fmaf_rn(l_i[mt][0], alpha[mt][0], sum0);
+      l_i[mt][1] = __fmaf_rn(l_i[mt][1], alpha[mt][1], sum1);
+#pragma unroll
+      for (int dt = 0; dt < 2; ++dt) {
+        acc[dt][mt][0] *= alpha[mt][0];
+        acc[dt][mt][1] *= alpha[mt][1];
+        acc[dt][mt][2] *= alpha[mt][0];
+        acc[dt][mt][3] *= alpha[mt][1];
+      }
+    }
+
+    // Phase 2: O^T += V_it^T @ P_it^T (128 x 24).
+    compute_vp_tile<4>(acc, smem.v, smem.p, w, gid, tig);
+
+    if (it + 1 < bulk_count || tail_count > 0) {
+      __syncthreads();
+    }
+  }
+
+  // ---------------- Phase B: Causal + Rel-Bias Tail Loop (<= 17 pages at long context) ----------------
+  const int rev0 = (kBN - 1) - k_local0;
+  const int rev1 = (kBN - 1) - k_local1;
+  for (int it = 0; it < tail_count; ++it) {
+    const int cur = it & 1;
+    const int nxt = cur ^ 1;
+    const int p_idx = tail_start + it;
+    const int k0 = p_idx << 6;
+    const int page = cur_page;
+
+    // Issue V_it cp.async while K_it + Rel_it finish and K_it @ Q^T runs!
+    cp_async_page_tile<true>(smem.v, KVState, kv_head, page, k0, seqlen_k, tid, false);
+    cp_async_commit();
+
+    // Wait for BOTH K_it and Rel_it (V_it stays in flight!).
+    cp_async_wait<1>();
+    __syncthreads();
+
+    float s[3][4];
+    compute_kq_tile_qreg(s, smem.k[cur], q_b0, q_b1, w, gid, tig);
+
+    const bool page_ok = (page >= 0);
+    const int k_abs0 = k0 + k_local0;
+    const int k_abs1 = k0 + k_local1;
+    const bool kv_ok0 = page_ok && (k_abs0 < seqlen_k);
+    const bool kv_ok1 = page_ok && (k_abs1 < seqlen_k);
+
+#pragma unroll
+    for (int mt = 0; mt < 3; ++mt) {
+      const int m0 = mt * 8 + tig * 2;
+      const int m1 = m0 + 1;
+      const int tok0 = owned_tok[mt][0];
+      const int tok1 = owned_tok[mt][1];
+      const int d_lo0 = (past + tok0) - (k0 + kBN - 1);
+      const int d_lo1 = (past + tok1) - (k0 + kBN - 1);
+      const int sh0 = d_lo0 & 7;
+      const int sh1 = d_lo1 & 7;
+
+      const int dist00 = (past + tok0) - k_abs0;
+      const int dist01 = (past + tok1) - k_abs0;
+      const int dist10 = (past + tok0) - k_abs1;
+      const int dist11 = (past + tok1) - k_abs1;
+      const bool v00 = kv_ok0 && (dist00 >= 0);
+      const bool v01 = kv_ok0 && (dist01 >= 0);
+      const bool v10 = kv_ok1 && (dist10 >= 0);
+      const bool v11 = kv_ok1 && (dist11 >= 0);
+
+      // Note: smem.rel was zero-filled by cp_async_rel_tile for any aligned chunk >= 1024 or < 0,
+      // so for all dist >= 0, smem.rel[m][rev + sh] is exact Rel[dist] when dist < 1024 and 0.0f when dist >= 1024!
+      s[mt][0] = v00 ? __fmaf_rn(s[mt][0], qk_scale, __bfloat162float(smem.rel[m0][rev0 + sh0]) * kLog2E) : kNegInf;
+      s[mt][1] = v01 ? __fmaf_rn(s[mt][1], qk_scale, __bfloat162float(smem.rel[m1][rev0 + sh1]) * kLog2E) : kNegInf;
+      s[mt][2] = v10 ? __fmaf_rn(s[mt][2], qk_scale, __bfloat162float(smem.rel[m0][rev1 + sh0]) * kLog2E) : kNegInf;
+      s[mt][3] = v11 ? __fmaf_rn(s[mt][3], qk_scale, __bfloat162float(smem.rel[m1][rev1 + sh1]) * kLog2E) : kNegInf;
+
+      const float wm0 = col_reduce_max8(fmaxf(s[mt][0], s[mt][2]));
+      const float wm1 = col_reduce_max8(fmaxf(s[mt][1], s[mt][3]));
+      if (gid == 0) {
+        smem.m[w][m0] = wm0;
+        smem.m[w][m1] = wm1;
+      }
+    }
+    __syncthreads();
+
+    float alpha[3][2];
+#pragma unroll
+    for (int mt = 0; mt < 3; ++mt) {
+      const int m0 = mt * 8 + tig * 2;
+      const int m1 = m0 + 1;
+      const float tm0 = fmaxf(fmaxf(smem.m[0][m0], smem.m[1][m0]), fmaxf(smem.m[2][m0], smem.m[3][m0]));
+      const float tm1 = fmaxf(fmaxf(smem.m[0][m1], smem.m[1][m1]), fmaxf(smem.m[2][m1], smem.m[3][m1]));
+      const float mn0 = fmaxf(m_i[mt][0], tm0);
+      const float mn1 = fmaxf(m_i[mt][1], tm1);
+      const float ms0 = (mn0 == kNegInf) ? 0.0f : mn0;
+      const float ms1 = (mn1 == kNegInf) ? 0.0f : mn1;
+      alpha[mt][0] = ex2_approx(m_i[mt][0] - ms0);
+      alpha[mt][1] = ex2_approx(m_i[mt][1] - ms1);
+      m_i[mt][0] = mn0;
+      m_i[mt][1] = mn1;
+
+      const float p00 = ex2_approx(s[mt][0] - ms0);
+      const float p01 = ex2_approx(s[mt][1] - ms1);
+      const float p10 = ex2_approx(s[mt][2] - ms0);
+      const float p11 = ex2_approx(s[mt][3] - ms1);
+
+      smem.p[m0][k_local0] = __float2bfloat16_rn(p00);
+      smem.p[m1][k_local0] = __float2bfloat16_rn(p01);
+      smem.p[m0][k_local1] = __float2bfloat16_rn(p10);
+      smem.p[m1][k_local1] = __float2bfloat16_rn(p11);
+
+      const float wl0 = col_reduce_sum8(p00 + p10);
+      const float wl1 = col_reduce_sum8(p01 + p11);
+      if (gid == 0) {
+        smem.l[w][m0] = wl0;
+        smem.l[w][m1] = wl1;
+      }
+    }
+
+    if (it + 1 < tail_count) {
+      cur_page = bt[p_idx + 1];
+      cp_async_page_tile<false>(smem.k[nxt], KVState, kv_head, cur_page, (p_idx + 1) << 6, seqlen_k, tid, false);
+      cp_async_rel_tile(smem.rel, Rel, q_start, kv_head, past, (p_idx + 1) << 6, tid, false);
+      cp_async_commit();
+      cp_async_wait<1>();
+    } else {
+      cp_async_wait<0>();
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int mt = 0; mt < 3; ++mt) {
+      const int m0 = mt * 8 + tig * 2;
+      const int m1 = m0 + 1;
+      const float sum0 = (smem.l[0][m0] + smem.l[1][m0]) + (smem.l[2][m0] + smem.l[3][m0]);
+      const float sum1 = (smem.l[0][m1] + smem.l[1][m1]) + (smem.l[2][m1] + smem.l[3][m1]);
+      l_i[mt][0] = __fmaf_rn(l_i[mt][0], alpha[mt][0], sum0);
+      l_i[mt][1] = __fmaf_rn(l_i[mt][1], alpha[mt][1], sum1);
+#pragma unroll
+      for (int dt = 0; dt < 2; ++dt) {
+        acc[dt][mt][0] *= alpha[mt][0];
+        acc[dt][mt][1] *= alpha[mt][1];
+        acc[dt][mt][2] *= alpha[mt][0];
+        acc[dt][mt][3] *= alpha[mt][1];
+      }
+    }
+
+    compute_vp_tile<4>(acc, smem.v, smem.p, w, gid, tig);
+
+    if (it + 1 < tail_count) {
+      __syncthreads();
+    }
+  }
+
+  // Launch dependent combine kernel (preloads Gate/Sink and waits at gdc_wait).
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+
+  __syncthreads();
+  float (*smem_o)[kHeadDim] = reinterpret_cast<float (*)[kHeadDim]>(&smem.k[0][0][0]);
+
+#pragma unroll
+  for (int mt = 0; mt < 3; ++mt) {
+    const int m0 = mt * 8 + tig * 2;
+    const int m1 = m0 + 1;
+    const float inv0 = (l_i[mt][0] == 0.0f) ? 0.0f : (v_scale / l_i[mt][0]);
+    const float inv1 = (l_i[mt][1] == 0.0f) ? 0.0f : (v_scale / l_i[mt][1]);
+#pragma unroll
+    for (int dt = 0; dt < 2; ++dt) {
+      const int d0 = w * 32 + dt * 16 + gid;
+      const int d1 = d0 + 8;
+      smem_o[m0][d0] = acc[dt][mt][0] * inv0;
+      smem_o[m1][d0] = acc[dt][mt][1] * inv1;
+      smem_o[m0][d1] = acc[dt][mt][2] * inv0;
+      smem_o[m1][d1] = acc[dt][mt][3] * inv1;
+    }
+    if (w == 0 && gid == 0) {
+      const int tok0 = owned_tok[mt][0];
+      const int tok1 = owned_tok[mt][1];
+      const int h0 = kv_head * kGroup + (m0 - tok0 * kGroup);
+      const int h1 = kv_head * kGroup + (m1 - tok1 * kGroup);
+      const float lse0 = (l_i[mt][0] == 0.0f) ? kNegInf : (m_i[mt][0] + lg2_approx(l_i[mt][0]));
+      const float lse1 = (l_i[mt][1] == 0.0f) ? kNegInf : (m_i[mt][1] + lg2_approx(l_i[mt][1]));
+      LsePart[(static_cast<int64_t>(split) * num_tokens + (q_start + tok0)) * kHeads + h0] = lse0;
+      LsePart[(static_cast<int64_t>(split) * num_tokens + (q_start + tok1)) * kHeads + h1] = lse1;
+    }
+  }
+  __syncthreads();
+
+#pragma unroll
+  for (int step = 0; step < 6; ++step) {
+    const int idx = tid + step * kThreads;
+    const int m = idx >> 5;
+    const int d4 = (idx & 31) << 2;
+    const int tok = m / kGroup;
+    const int head = kv_head * kGroup + (m - tok * kGroup);
+    const int64_t part = (static_cast<int64_t>(split) * num_tokens + (q_start + tok)) * kHeads + head;
+    *reinterpret_cast<float4*>(OPart + part * kHeadDim + d4) =
+        *reinterpret_cast<const float4*>(&smem_o[m][d4]);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 3. Fast 1-Warp Float4 Split-KV Combine + Gate + Sink Epilogue (SM120)
 // Grid: [num_tokens, 24 (heads), 1], Block: [32, 1, 1]
 // ---------------------------------------------------------------------------
 template <int NUM_SPLITS>
@@ -776,8 +1249,14 @@ __device__ __forceinline__ void attn_verify_combine_impl(
   const int64_t split_stride = static_cast<int64_t>(num_tokens) * kHeads;
 
   float lse_s = (lane < NUM_SPLITS) ? LsePart[static_cast<int64_t>(lane) * split_stride + base_row_head] : kNegInf;
-
+  float lse_s1 = kNegInf;
   float lse_max = lse_s;
+  if constexpr (NUM_SPLITS > 32) {
+    lse_s1 = ((lane + 32) < NUM_SPLITS)
+        ? LsePart[static_cast<int64_t>(lane + 32) * split_stride + base_row_head]
+        : kNegInf;
+    lse_max = fmaxf(lse_s, lse_s1);
+  }
 #pragma unroll
   for (int off = 16; off >= 1; off >>= 1) {
     lse_max = fmaxf(lse_max, __shfl_xor_sync(0xffffffffu, lse_max, off));
@@ -790,7 +1269,12 @@ __device__ __forceinline__ void attn_verify_combine_impl(
   }
 
   float w_lane = (lane < NUM_SPLITS) ? ex2_approx(lse_s - lse_max) : 0.0f;
+  float w_lane1 = 0.0f;
   float w_sum = w_lane;
+  if constexpr (NUM_SPLITS > 32) {
+    w_lane1 = ((lane + 32) < NUM_SPLITS) ? ex2_approx(lse_s1 - lse_max) : 0.0f;
+    w_sum = w_lane + w_lane1;
+  }
 #pragma unroll
   for (int off = 16; off >= 1; off >>= 1) {
     w_sum += __shfl_xor_sync(0xffffffffu, w_sum, off);
@@ -818,6 +1302,21 @@ __device__ __forceinline__ void attn_verify_combine_impl(
     o2 = __fmaf_rn(ws, v.z, o2);
     o3 = __fmaf_rn(ws, v.w, o3);
   }
+  if constexpr (NUM_SPLITS > 32) {
+    const float w_norm_lane1 = w_lane1 * inv_w_sum;
+    uint32_t active_mask1 = __ballot_sync(0xffffffffu, w_lane1 > 0.0f);
+    while (active_mask1 != 0u) {
+      const int b = __ffs(active_mask1) - 1;
+      active_mask1 &= (active_mask1 - 1u);
+      const float ws = __shfl_sync(0xffffffffu, w_norm_lane1, b);
+      const int64_t part = static_cast<int64_t>(b + 32) * split_stride + base_row_head;
+      const float4 v = *reinterpret_cast<const float4*>(OPart + part * kHeadDim + d4);
+      o0 = __fmaf_rn(ws, v.x, o0);
+      o1 = __fmaf_rn(ws, v.y, o1);
+      o2 = __fmaf_rn(ws, v.z, o2);
+      o3 = __fmaf_rn(ws, v.w, o3);
+    }
+  }
 
   const float lse_nat = (lg2_approx(w_sum) + lse_max) * kLn2;
   const float sink_scale = sigmoid_fast(lse_nat - sink_val);
@@ -843,7 +1342,10 @@ DEFINE_COMBINE(4)
 DEFINE_COMBINE(5)
 DEFINE_COMBINE(8)
 DEFINE_COMBINE(9)
+DEFINE_COMBINE(10)
 DEFINE_COMBINE(16)
 DEFINE_COMBINE(17)
+DEFINE_COMBINE(20)
 DEFINE_COMBINE(32)
+DEFINE_COMBINE(41)
 #undef DEFINE_COMBINE

@@ -1098,39 +1098,65 @@ def register_ops(
         },
     }
 
+    # Full Verify: SM120 CUDA 2-phase bulk+tail split-KV + 1-warp float4 PDL combine
+    # Wave-matched 1-wave split counts for 110-SM PRO 5000 (3 CTAs/SM = 330 slots, 0 wave tail)
+    # and 188-SM PRO 6000 (564 slots):
+    #   seqs<=1: S=41 (328 CTAs), seqs==2: S=20 (320 CTAs),
+    #   seqs in 3..4: S=10 (240/320 CTAs), seqs>=5: S=5 (200..320 CTAs).
+    full_verify_split_params = [
+        "in buffer<bf16>", "in state", "in buffer<bf16>",
+        "in buffer<i32>", "in buffer<i32>",
+        "out buffer<f32>", "out buffer<f32>",
+        "i32", "i32", "f32", "f32", "i32",
+    ]
+    full_verify_launches: list[dict[str, Any]] = []
+    for num_splits, when_cond in (
+        (41, {"var": "seqs", "max": 1}),
+        (20, {"var": "seqs", "min": 2, "max": 2}),
+        (10, {"var": "seqs", "min": 3, "max": 4}),
+        (5, {"var": "seqs", "min": 5}),
+    ):
+        full_verify_launches.append(
+            {
+                "module": "rel_verify_sm120",
+                "entry": "kern_attn_full_verify_split",
+                "params": full_verify_split_params,
+                "grid": [num_splits, 8, "seqs"],
+                "block": [128, 1, 1],
+                "args": [
+                    {"param": 0}, {"param": 1}, {"param": 2},
+                    {"param": 5}, {"param": 6},
+                    {"scratch": "o_part"}, {"scratch": "lse_part"},
+                    {"param": 8}, _i32(page_columns), {"param": 11}, {"param": 12},
+                    _i32(num_splits),
+                ],
+                "when": when_cond,
+            }
+        )
+        full_verify_launches.append(
+            {
+                "module": "rel_verify_sm120",
+                "entry": f"kern_attn_verify_combine_s{num_splits}",
+                "params": combine_params,
+                "grid": ["tokens", HEADS, 1],
+                "block": [32, 1, 1],
+                "args": [
+                    {"scratch": "o_part"}, {"scratch": "lse_part"},
+                    {"param": 3}, {"param": 4}, {"param": 7},
+                    {"param": 8}, {"param": 9}, {"param": 10},
+                ],
+                "pdl": True,
+                "when": when_cond,
+            }
+        )
     ops["attn_full_verify"] = {
         "params": full_if_params,
         "impl": {
             "scratch": {
-                "o_part": {"dtype": "f32", "shape": [32, "tokens", HEADS, HEAD_DIM]},
-                "lse_part": {"dtype": "f32", "shape": [32, "tokens", HEADS]},
+                "o_part": {"dtype": "f32", "shape": [41, "tokens", HEADS, HEAD_DIM]},
+                "lse_part": {"dtype": "f32", "shape": [41, "tokens", HEADS]},
             },
-            "launches": [
-                _triton_launch(
-                    dsl,
-                    "attn_full_verify",
-                    full_k_params_part,
-                    [1, 8 * 32, "seqs"],
-                    [
-                        {"param": 0}, {"param": 1}, {"param": 2}, {"param": 3}, {"param": 4},
-                        {"param": 5}, {"param": 6}, {"scratch": "o_part"}, {"scratch": "lse_part"},
-                        {"param": 8}, _i32(page_columns), {"param": 9}, {"param": 10},
-                        {"param": 11}, {"param": 12},
-                    ],
-                ),
-                _triton_launch(
-                    dsl,
-                    "attn_combine_s32",
-                    combine_params,
-                    ["tokens", HEADS, 4],
-                    [
-                        {"scratch": "o_part"}, {"scratch": "lse_part"},
-                        {"param": 3}, {"param": 4}, {"param": 7},
-                        {"param": 8}, {"param": 9}, {"param": 10},
-                    ],
-                    pdl=True,
-                ),
-            ],
+            "launches": full_verify_launches,
         },
     }
 

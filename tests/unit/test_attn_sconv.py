@@ -1268,6 +1268,129 @@ class TestM3AttnSconv(unittest.TestCase):
                     ).view(8, 3072)
                     torch.testing.assert_close(v["t.attn_y"][r0:r1], y_ref, rtol=3e-2, atol=3e-2)
 
+    def test_full_verify_bulk_tail_and_batch_parity(self):
+        """Exercise attn_full_verify across sub-64, sub-1024 (negative d_lo), bulk/tail boundaries, shuffled pages, all split regimes (seqs=1,2,4,8), and 1M context."""
+        rt, v = self.rt, self.v
+        v["t.k_scale"].fill_(0.05)
+        v["t.v_scale"].fill_(0.025)
+        v["t.q_l2"].fill_(1.0)
+        v["t.r_l2"].fill_(1.0)
+        v["t.rel_proj"].normal_(mean=0.0, std=0.2)
+
+        for past, seqs in (
+            (0, 1), (1, 1), (7, 1), (31, 1), (63, 1), (65, 1),
+            (511, 1), (1023, 1), (1024, 1), (1087, 1), (1474, 1),
+            (1472, 2), (1472, 4), (1152, 8),
+        ):
+            with self.subTest(past=past, seqs=seqs):
+                n_pf_pages = (past + 63) // 64
+                # Use non-contiguous shuffled page IDs to catch any page-stride or BlockTable indexing bug.
+                perm = torch.randperm(40, device="cuda", dtype=torch.int32)
+                pf_pages = perm[:n_pf_pages]
+                v["pages"].fill_(-1)
+
+                k_pf = torch.randn((past, 1024), dtype=torch.bfloat16, device="cuda") * 0.4 if past > 0 else None
+                v_pf = torch.randn((past, 1024), dtype=torch.bfloat16, device="cuda") * 0.4 if past > 0 else None
+                if past > 0:
+                    v["pages"][0, :n_pf_pages].copy_(pf_pages)
+                    v["positions"][:past].copy_(torch.arange(past, dtype=torch.int64, device="cuda"))
+                    v["lengths"][0] = past
+                    v["t.q_in"][:past].zero_()
+                    v["t.r_in"][:past].zero_()
+                    v["t.k_in"][:past].copy_(k_pf)
+                    v["t.v_in"][:past].copy_(v_pf)
+                    v["t.gate"][:past].zero_()
+                    v["t.sink"][:past].zero_()
+                    rt.run("full_prefill", {"tokens": past})
+
+                T = seqs * 8
+                n_tot_pages = (past + 8 + 63) // 64
+                extra_cursor = n_pf_pages
+                for si in range(seqs):
+                    if n_pf_pages > 0:
+                        v["pages"][si, :n_pf_pages].copy_(pf_pages)
+                    for p in range(n_pf_pages, n_tot_pages):
+                        v["pages"][si, p] = perm[extra_cursor]
+                        extra_cursor += 1
+                v["positions"][:T].copy_(torch.arange(past, past + 8, dtype=torch.int64, device="cuda").repeat(seqs))
+                v["valid"][:T].fill_(1)
+                v["lengths"][:seqs].fill_(past + 8)
+
+                q_v = torch.randn((T, 3072), dtype=torch.bfloat16, device="cuda") * 0.6
+                r_v = torch.randn((T, 384), dtype=torch.bfloat16, device="cuda") * 0.6
+                k_v = torch.randn((T, 1024), dtype=torch.bfloat16, device="cuda") * 0.4
+                v_v = torch.randn((T, 1024), dtype=torch.bfloat16, device="cuda") * 0.4
+                g_v = torch.randn((T, 3072), dtype=torch.bfloat16, device="cuda")
+                s_v = torch.randn((T, 24), dtype=torch.bfloat16, device="cuda")
+                v["t.q_in"][:T].copy_(q_v)
+                v["t.r_in"][:T].copy_(r_v)
+                v["t.k_in"][:T].copy_(k_v)
+                v["t.v_in"][:T].copy_(v_v)
+                v["t.gate"][:T].copy_(g_v)
+                v["t.sink"][:T].copy_(s_v)
+
+                rt.run("full_verify", {"tokens": T, "seqs": seqs})
+                self.assertFalse(torch.isnan(v["t.attn_y"][:T]).any())
+
+                for si in range(seqs):
+                    r0, r1 = si * 8, (si + 1) * 8
+                    k_all = (torch.cat([k_pf, k_v[r0:r1]], dim=0) if past > 0 else k_v[r0:r1]).view(past + 8, 8, 128).float()
+                    kn = k_all.pow(2).sum(dim=-1, keepdim=True).sqrt()
+                    kc = k_all * torch.clamp(22.627416997969522 / (kn + 1e-6), max=1.0)
+                    v_all = (torch.cat([v_pf, v_v[r0:r1]], dim=0) if past > 0 else v_v[r0:r1]).view(past + 8, 8, 128)
+                    y_ref = ref_rel_attention(
+                        v["t.q_clip_out"][r0:r1],
+                        ref_quant_fp8_dequant(kc, 0.05),
+                        ref_quant_fp8_dequant(ref_v_rmsnorm(v_all), 0.025),
+                        v["t.rel_bias_out"][r0:r1], g_v[r0:r1].view(8, 24, 128), s_v[r0:r1],
+                        past=past,
+                    ).view(8, 3072)
+                    torch.testing.assert_close(v["t.attn_y"][r0:r1], y_ref, rtol=3e-2, atol=3e-2)
+
+        # Simulated 1M context verify (seqlen_k=1,048,576, 16,384 aliased pages -> page 0; seqs=1 vs seqs=2 consistency)
+        P = 64
+        k_base = torch.randn((P, 1024), dtype=torch.bfloat16, device="cuda") * 0.25
+        v_base = torch.randn((P, 1024), dtype=torch.bfloat16, device="cuda") * 0.25
+        v["t.rel_proj"].zero_()
+        v["pages"].fill_(-1)
+        v["pages"][0, 0] = 0
+        v["positions"][:P].copy_(torch.arange(P, dtype=torch.int64, device="cuda"))
+        v["lengths"][0] = P
+        v["t.q_in"][:P].zero_()
+        v["t.r_in"][:P].zero_()
+        v["t.k_in"][:P].copy_(k_base)
+        v["t.v_in"][:P].copy_(v_base)
+        v["t.gate"][:P].zero_()
+        v["t.sink"][:P].zero_()
+        rt.run("full_prefill", {"tokens": P})
+
+        v["pages"][0, :16384].fill_(0)
+        v["pages"][1, :16384].fill_(0)
+        v["positions"][:16].copy_(torch.arange(1_048_568, 1_048_576, dtype=torch.int64, device="cuda").repeat(2))
+        v["lengths"][:2].fill_(1_048_576)
+        v["valid"][:16].fill_(1)
+        q1 = torch.randn((8, 3072), dtype=torch.bfloat16, device="cuda") * 0.5
+        g1 = torch.randn((8, 3072), dtype=torch.bfloat16, device="cuda")
+        s1 = torch.randn((8, 24), dtype=torch.bfloat16, device="cuda")
+        v["t.q_in"][:8].copy_(q1)
+        v["t.q_in"][8:16].copy_(q1)
+        v["t.r_in"][:16].zero_()
+        v["t.k_in"][:8].copy_(k_base[56:64])
+        v["t.k_in"][8:16].copy_(k_base[56:64])
+        v["t.v_in"][:8].copy_(v_base[56:64])
+        v["t.v_in"][8:16].copy_(v_base[56:64])
+        v["t.gate"][:8].copy_(g1)
+        v["t.gate"][8:16].copy_(g1)
+        v["t.sink"][:8].copy_(s1)
+        v["t.sink"][8:16].copy_(s1)
+        rt.run("full_verify", {"tokens": 8, "seqs": 1})
+        self.assertFalse(torch.isnan(v["t.attn_y"][:8]).any())
+        y_1m_s1 = v["t.attn_y"][:8].clone()
+        rt.run("full_verify", {"tokens": 16, "seqs": 2})
+        self.assertFalse(torch.isnan(v["t.attn_y"][:16]).any())
+        torch.testing.assert_close(v["t.attn_y"][:8], y_1m_s1, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(v["t.attn_y"][8:16], y_1m_s1, rtol=1e-2, atol=1e-2)
+
     def test_cuda_graph_capture_replay(self):
         rt, v = self.rt, self.v
         if True:

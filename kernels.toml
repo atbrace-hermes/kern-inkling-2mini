@@ -107,7 +107,7 @@ flags = "plain"
 includes = []
 
 [kernels."rel_verify_sm120"]
-sha256 = "8334b8ced8b70b087b6d30ec1eedca6e1cb16f4787a7e0242e2c3b7dc185a60d"
+sha256 = "49d884a94869d50278b1af6dd085300fac89be93cac0fb86f396dc5b85a891b5"
 milestone = "M3"
 source = "source/rel_verify_sm120.cu"
 flags = "plain"
