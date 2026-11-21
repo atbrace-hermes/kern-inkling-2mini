@@ -787,6 +787,80 @@ class TestM1KernelsGPU(unittest.TestCase):
             torch.testing.assert_close(got_logits[:, : lm.UNPADDED_VOCAB], logits_ref[:, : lm.UNPADDED_VOCAB], atol=0.5, rtol=5e-2)
             self.assertEqual(int(views["next_token"][0].item()), int(logits_ref.argmax(dim=-1).item()))
 
+    def test_cross_pass_4q_bitexact_parity(self):
+        """Verify 4-stream kern_cross_pass_attn_res_4q_f32 is 100% bit-identical to 1-stream."""
+        import torch
+
+        torch.manual_seed(66)
+        D = lm.H
+        max_t = 64
+        m = {
+            "schema_version": 7,
+            "model": "test-cp-4q",
+            "vars": {"tokens": {"max": max_t}},
+            "states": {},
+            "buffers": {
+                "prev": {"dtype": "bf16", "shape": [2, "tokens", D], "kind": "input"},
+                "q": {"dtype": "f32", "shape": [4, D], "kind": "input"},
+                "out_1q": {"dtype": "f32", "shape": [4, "tokens", D], "kind": "output"},
+                "out_4q": {"dtype": "f32", "shape": [4, "tokens", D], "kind": "output"},
+            },
+            "modules": {"norm_attnres": self._mod("norm_attnres")},
+            "ops": {
+                "cp_1q": {
+                    "params": ["in buffer<bf16>", "in buffer<f32>", "out buffer<f32>", "i64", "i64", "i32", "i32", "i32", "f32"],
+                    "impl": {
+                        "launches": [
+                            {
+                                "module": "norm_attnres",
+                                "entry": "kern_cross_pass_attn_res_f32",
+                                "params": ["in buffer<bf16>", "in buffer<f32>", "out buffer<f32>", "i64", "i64", "i32", "i32", "i32", "f32"],
+                                "grid": ["tokens", 1, 1],
+                                "block": [256, 1, 1],
+                                "pdl": True,
+                                "args": [{"param": j} for j in range(9)],
+                            }
+                        ]
+                    },
+                },
+                "cp_4q": {
+                    "params": ["in buffer<bf16>", "in buffer<f32>", "out buffer<f32>", "i64", "i64", "i32", "f32"],
+                    "impl": {
+                        "launches": [
+                            {
+                                "module": "norm_attnres",
+                                "entry": "kern_cross_pass_attn_res_4q_f32",
+                                "params": ["in buffer<bf16>", "in buffer<f32>", "out buffer<f32>", "i64", "i64", "i32", "f32"],
+                                "grid": ["tokens", 4, 1],
+                                "block": [256, 1, 1],
+                                "pdl": True,
+                                "args": [{"param": j} for j in range(7)],
+                            }
+                        ]
+                    },
+                },
+            },
+            "programs": {
+                "run": {
+                    "calls": [
+                        {"op": "cp_1q", "args": [lm.b("prev"), lm.b("q"), lm.b("out_1q"), lm.i64(max_t * D), lm.i64(max_t * D), {"var": "tokens"}, lm.i32(D), lm.i32(4), lm.f32(1e-6)]},
+                        {"op": "cp_4q", "args": [lm.b("prev"), lm.b("q"), lm.b("out_4q"), lm.i64(max_t * D), lm.i64(max_t * D), {"var": "tokens"}, lm.f32(1e-6)]},
+                    ]
+                }
+            },
+        }
+        rt, views = self._run_manifest(m)
+        prev = torch.randn(2, max_t, D, dtype=torch.bfloat16)
+        q = torch.randn(4, D, dtype=torch.float32) * lm.INV_SQRT_H
+        views["prev"].copy_(prev)
+        views["q"].copy_(q)
+        for T in (1, 8, 32, 64):
+            with self.subTest(T=T):
+                torch.cuda.synchronize()
+                rt.run("run", {"tokens": T})
+                torch.cuda.synchronize()
+                self.assertTrue(torch.equal(views["out_4q"][:, :T], views["out_1q"][:, :T]))
+
 
 if __name__ == "__main__":
     unittest.main()

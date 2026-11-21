@@ -49,6 +49,8 @@ extern "C" __global__ __launch_bounds__(256, 4) void kern_ctrl_rms_concat_2strea
   const int lane = tid & 31;
   const int warp = tid >> 5;
 
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+
   const float* src = (stream == 0 ? in_f32 : msg_f32) + static_cast<long long>(t) * kD;
   float x[9];
   float sq = 0.0f;
@@ -93,6 +95,8 @@ extern "C" __global__ __launch_bounds__(256, 4) void kern_ctrl_rms_concat_f32_bf
     float eps) {
   const int t = blockIdx.x;
   if (t >= T) return;
+
+  asm volatile("griddepcontrol.wait;" ::: "memory");
 
   const float* in_row = in_f32 + static_cast<long long>(t) * D;
   const float* msg_row = msg_f32 + static_cast<long long>(t) * D;
@@ -196,6 +200,8 @@ extern "C" __global__ __launch_bounds__(256, 4) void kern_ctrl_merge_rmsnorm_f32
   const int t = blockIdx.x;
   if (t >= T) return;
 
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+
   const float* in_row = in_f32 + static_cast<long long>(t) * D;
   const float* msg_row = msg_f32 + static_cast<long long>(t) * D;
   const float* fg_row = fg_f32 + static_cast<long long>(t) * (2 * D);
@@ -229,6 +235,7 @@ extern "C" __global__ __launch_bounds__(256, 4) void kern_ctrl_merge_rmsnorm_f32
       }
     }
     __syncthreads();
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     const float rstd = s_red8[0];
 #pragma unroll
     for (int i = 0; i < 9; ++i) {

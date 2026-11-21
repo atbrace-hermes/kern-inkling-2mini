@@ -103,6 +103,14 @@ __device__ __forceinline__ void attn_res_fast_2304(
   const int warp = tid >> 5;
   const long long row_off = static_cast<long long>(t) * kFastD;
 
+  // Prefetch immutable query[0] BEFORE pdl_wait (overlaps with predecessor epilogue).
+  float qv0[kElemsPerThread];
+#pragma unroll
+  for (int i = 0; i < kElemsPerThread; ++i) {
+    qv0[i] = __ldg(&queries[tid + i * kFastBlock]);
+  }
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+
   // Load all N_STACK sources once as packed BF16 pairs in registers (0 spills) + last source as FP32.
   uint32_t s_pair[N_STACK][4];
   __nv_bfloat16 s_tail[N_STACK];
@@ -140,11 +148,6 @@ __device__ __forceinline__ void attn_res_fast_2304(
   float dots[NUM_Q][N_SRC];
 
   {
-    float qv[kElemsPerThread];
-#pragma unroll
-    for (int i = 0; i < kElemsPerThread; ++i) {
-      qv[i] = queries[tid + i * kFastBlock];
-    }
 #pragma unroll
     for (int n = 0; n < N_STACK; ++n) {
       float sq = 0.0f, dp = 0.0f;
@@ -152,14 +155,14 @@ __device__ __forceinline__ void attn_res_fast_2304(
       for (int p = 0; p < 4; ++p) {
         float2 f2 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&s_pair[n][p]));
         sq += f2.x * f2.x;
-        dp += qv[2 * p] * f2.x;
+        dp += qv0[2 * p] * f2.x;
         sq += f2.y * f2.y;
-        dp += qv[2 * p + 1] * f2.y;
+        dp += qv0[2 * p + 1] * f2.y;
       }
       {
         float x8 = __bfloat162float(s_tail[n]);
         sq += x8 * x8;
-        dp += qv[8] * x8;
+        dp += qv0[8] * x8;
       }
       sum_sq[n] = sq;
       dots[0][n] = dp;
@@ -169,7 +172,7 @@ __device__ __forceinline__ void attn_res_fast_2304(
 #pragma unroll
       for (int i = 0; i < kElemsPerThread; ++i) {
         sq += last_x[i] * last_x[i];
-        dp += qv[i] * last_x[i];
+        dp += qv0[i] * last_x[i];
       }
       sum_sq[N_STACK] = sq;
       dots[0][N_STACK] = dp;
@@ -260,6 +263,7 @@ __device__ __forceinline__ void attn_res_fast_2304(
     }
   }
   __syncthreads();
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 
   // Pass 2: mix in registers in EXACT n = 0..N_STACK order (zero global re-reads!).
   if constexpr (!WRITE_NORMED) {
@@ -379,6 +383,7 @@ __device__ __forceinline__ void cross_pass_fast_2304(
   const int lane = tid & 31;
   const int warp = tid >> 5;
   const long long row_off = static_cast<long long>(t) * kFastD;
+  asm volatile("griddepcontrol.wait;" ::: "memory");
 
   const __nv_bfloat16* p0 = prev_blocks + row_off;
   const __nv_bfloat16* p1 = prev_blocks + block_stride + row_off;
@@ -450,6 +455,7 @@ __device__ __forceinline__ void cross_pass_fast_2304(
     }
   }
   __syncthreads();
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 
 #pragma unroll
   for (int q = 0; q < 4; ++q) {
@@ -486,6 +492,7 @@ __device__ __noinline__ void attn_res_generic(
     bool has_partial) {
   const int t = blockIdx.x;
   if (t >= T) return;
+  asm volatile("griddepcontrol.wait;" ::: "memory");
 
   const int n_sources = n_stack + (has_partial ? 1 : 0);
   if (n_sources <= 0 || n_sources > kMaxSources || num_q <= 0 || num_q > kMaxQueries) {
@@ -873,6 +880,96 @@ extern "C" __global__ void kern_cross_pass_attn_res_f32(
   attn_res_generic<false, false>(
       prev_blocks, nullptr, nullptr, queries, nullptr, out_msgs, nullptr,
       block_stride, out_q_stride, T, D, 2, num_q, eps, eps, false);
+}
+
+// 4-stream bit-identical Cross-Pass AttnRes for small T (T <= 64): 4x more CTAs saturate SMs.
+// Grid: [T, 4, 1], Block: [256, 1, 1]
+extern "C" __global__ __launch_bounds__(256, 4) void kern_cross_pass_attn_res_4q_f32(
+    const __nv_bfloat16* __restrict__ prev_blocks,
+    const float* __restrict__ queries,
+    float* __restrict__ out_msgs,
+    long long block_stride,
+    long long out_q_stride,
+    int T,
+    float eps) {
+  const int t = blockIdx.x;
+  const int q = blockIdx.y;
+  if (t >= T) return;
+
+  constexpr float kInvD = 1.0f / static_cast<float>(kFastD);
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const long long row_off = static_cast<long long>(t) * kFastD;
+
+  // Prefetch immutable query vector BEFORE pdl_wait!
+  const float* q_ptr = queries + static_cast<long long>(q) * kFastD;
+  float qv[kElemsPerThread];
+#pragma unroll
+  for (int i = 0; i < kElemsPerThread; ++i) {
+    qv[i] = __ldg(&q_ptr[tid + i * kFastBlock]);
+  }
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+
+  const __nv_bfloat16* p0 = prev_blocks + row_off;
+  const __nv_bfloat16* p1 = prev_blocks + block_stride + row_off;
+
+  float s0[kElemsPerThread], s1[kElemsPerThread];
+  float sq0 = 0.0f, sq1 = 0.0f, a = 0.0f, b = 0.0f;
+#pragma unroll
+  for (int i = 0; i < kElemsPerThread; ++i) {
+    int d = tid + i * kFastBlock;
+    s0[i] = __bfloat162float(p0[d]);
+    s1[i] = __bfloat162float(p1[d]);
+    sq0 += s0[i] * s0[i];
+    sq1 += s1[i] * s1[i];
+    a += qv[i] * s0[i];
+    b += qv[i] * s1[i];
+  }
+
+  __shared__ float s_red[kFastWarps][4];
+  __shared__ float s_w[2];
+  sq0 = warp_reduce_sum(sq0);
+  sq1 = warp_reduce_sum(sq1);
+  a = warp_reduce_sum(a);
+  b = warp_reduce_sum(b);
+  if (lane == 0) {
+    s_red[warp][0] = sq0;
+    s_red[warp][1] = sq1;
+    s_red[warp][2] = a;
+    s_red[warp][3] = b;
+  }
+  __syncthreads();
+
+  if (warp == 0) {
+    float v0 = warp_reduce_sum((lane < kFastWarps) ? s_red[lane][0] : 0.0f);
+    float v1 = warp_reduce_sum((lane < kFastWarps) ? s_red[lane][1] : 0.0f);
+    float inv0 = rsqrt_approx_f32(v0 * kInvD + eps);
+    float inv1 = rsqrt_approx_f32(v1 * kInvD + eps);
+    float l0 = warp_reduce_sum((lane < kFastWarps) ? s_red[lane][2] : 0.0f) * inv0;
+    float l1 = warp_reduce_sum((lane < kFastWarps) ? s_red[lane][3] : 0.0f) * inv1;
+    if (lane == 0) {
+      float ml = fmaxf(l0, l1);
+      float e0 = expf(l0 - ml);
+      float e1 = expf(l1 - ml);
+      float inv_s = 1.0f / (e0 + e1);
+      s_w[0] = e0 * inv_s * inv0;
+      s_w[1] = e1 * inv_s * inv1;
+    }
+  }
+  __syncthreads();
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+
+  const float w0 = s_w[0];
+  const float w1 = s_w[1];
+  float* dst = out_msgs + static_cast<long long>(q) * out_q_stride + row_off;
+#pragma unroll
+  for (int i = 0; i < kElemsPerThread; ++i) {
+    float mix = 0.0f;
+    mix += w0 * s0[i];
+    mix += w1 * s1[i];
+    dst[tid + i * kFastBlock] = mix;
+  }
 }
 
 // Elementwise FP32 scaling (for derive pre-scaling queries by 1/48).

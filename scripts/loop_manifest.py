@@ -187,23 +187,22 @@ def register_ops(
         if mod not in modules:
             raise KeyError(f"Module `{mod}` must be registered before register_ops()")
 
-    def single_op(name: str, mod: str, entry: str, params: list[str], grid: list, block: int = 256) -> None:
+    def single_op(name: str, mod: str, entry: str, params: list[str], grid: list, block: int = 256, pdl: bool = False) -> None:
         if name in ops:
             return
+        launch = {
+            "module": mod,
+            "entry": entry,
+            "params": params,
+            "grid": grid,
+            "block": [block, 1, 1],
+            "args": [{"param": j} for j in range(len(params))],
+        }
+        if pdl:
+            launch["pdl"] = True
         ops[name] = {
             "params": params,
-            "impl": {
-                "launches": [
-                    {
-                        "module": mod,
-                        "entry": entry,
-                        "params": params,
-                        "grid": grid,
-                        "block": [block, 1, 1],
-                        "args": [{"param": j} for j in range(len(params))],
-                    }
-                ]
-            },
+            "impl": {"launches": [launch]},
         }
 
     # Embedding & norms
@@ -246,6 +245,7 @@ def register_ops(
             "f32",
         ],
         ["tokens", 1, 1],
+        pdl=True,
     )
     single_op(
         "attn_res_addend_norm_bf16",
@@ -268,6 +268,7 @@ def register_ops(
             "f32",
         ],
         ["tokens", 1, 1],
+        pdl=True,
     )
     single_op(
         "attn_res_mix_f32",
@@ -287,6 +288,7 @@ def register_ops(
             "f32",
         ],
         ["tokens", 1, 1],
+        pdl=True,
     )
     single_op(
         "attn_res_addend_mix_f32",
@@ -307,12 +309,10 @@ def register_ops(
             "f32",
         ],
         ["tokens", 1, 1],
+        pdl=True,
     )
-    single_op(
-        "cross_pass_attn_res_f32",
-        "norm_attnres",
-        "kern_cross_pass_attn_res_f32",
-        [
+    if "cross_pass_attn_res_f32" not in ops:
+        cp_params = [
             "in buffer<bf16>",
             "in buffer<f32>",
             "out buffer<f32>",
@@ -322,9 +322,43 @@ def register_ops(
             "i32",
             "i32",
             "f32",
-        ],
-        ["tokens", 1, 1],
-    )
+        ]
+        p_cp = lambda idx: {"param": idx}
+        ops["cross_pass_attn_res_f32"] = {
+            "params": cp_params,
+            "impl": {
+                "launches": [
+                    {
+                        "module": "norm_attnres",
+                        "entry": "kern_cross_pass_attn_res_4q_f32",
+                        "params": [
+                            "in buffer<bf16>",
+                            "in buffer<f32>",
+                            "out buffer<f32>",
+                            "i64",
+                            "i64",
+                            "i32",
+                            "f32",
+                        ],
+                        "grid": ["tokens", 4, 1],
+                        "block": [256, 1, 1],
+                        "pdl": True,
+                        "args": [p_cp(0), p_cp(1), p_cp(2), p_cp(3), p_cp(4), p_cp(5), p_cp(8)],
+                        "when": {"var": "tokens", "max": 64},
+                    },
+                    {
+                        "module": "norm_attnres",
+                        "entry": "kern_cross_pass_attn_res_f32",
+                        "params": cp_params,
+                        "grid": ["tokens", 1, 1],
+                        "block": [256, 1, 1],
+                        "pdl": True,
+                        "args": [p_cp(j) for j in range(9)],
+                        "when": {"var": "tokens", "min": 65},
+                    },
+                ]
+            },
+        }
 
     # Helpers: query scaling (for derive), copies, taps, residual adds
     single_op(
@@ -394,6 +428,7 @@ def register_ops(
                         "params": ["in buffer<f32>", "in buffer<f32>", "out buffer<bf16>", "i32", "f32"],
                         "grid": ["tokens", 2, 1],
                         "block": [256, 1, 1],
+                        "pdl": True,
                         "args": [p(0), p(1), scr("cat"), p(6), p(7)],
                         "when": {"var": "tokens", "max": 64},
                     },
@@ -403,6 +438,7 @@ def register_ops(
                         "params": ["in buffer<f32>", "in buffer<f32>", "out buffer<bf16>", "i32", "i32", "f32"],
                         "grid": ["tokens", 1, 1],
                         "block": [256, 1, 1],
+                        "pdl": True,
                         "args": [p(0), p(1), scr("cat"), p(6), i32(H), p(7)],
                         "when": {"var": "tokens", "min": 65},
                     },
@@ -431,6 +467,7 @@ def register_ops(
                         ],
                         "grid": ["tokens", 1, 1],
                         "block": [256, 1, 1],
+                        "pdl": True,
                         "args": [p(0), p(1), scr("fg"), p(4), p(5), p(6), i32(H), p(7)],
                     },
                 ],
