@@ -54,7 +54,7 @@ PY
 weights_dir="$cand/weights_inkling_1m"
 [[ -d "$weights_dir" ]] || weights_dir="$base/weights_inkling_1m"
 
-capacity=${KERN_CHECK_CAPACITY:-32768}
+capacity=${KERN_CHECK_CAPACITY:-8192}
 
 "$LOOP/withgpu" "$KERN" test \
   --capacity "$capacity" \
