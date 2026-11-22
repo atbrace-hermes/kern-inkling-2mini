@@ -440,3 +440,140 @@ extern "C" __global__ __launch_bounds__(256, 4) void kern_ctrl_merge_rmsnorm_3x_
     out_row[d] = __float2bfloat16_rn(__fmul_rn(__fmul_rn(merged[i], rstd), w));
   }
 }
+
+// ---------------------------------------------------------------------------
+// Single-stream strided s4 (strict no-FMA FP32 gated merge + RMSNorm -> BF16)
+// for prefill (T >= 65) in fused pre_attn_mix_cross_ctrl_{swa,full}, allowing
+// sequential reuse of a single L2-resident fg scratch buffer across 3 streams.
+// Grid: [T, 1, 1], Block: [256, 1, 1], pdl: True
+// ---------------------------------------------------------------------------
+extern "C" __global__ __launch_bounds__(256, 4) void kern_ctrl_merge_rmsnorm_stream_f32_bf16(
+    const float* __restrict__ in_f32,
+    const float* __restrict__ msg_f32,
+    const float* __restrict__ fg_f32,
+    const __nv_bfloat16* __restrict__ norm_w,
+    __nv_bfloat16* __restrict__ out_bf16,
+    long long in_stride,
+    long long msg_stride,
+    long long out_stride,
+    long long norm_stride,
+    int stream_idx,
+    int T,
+    float eps) {
+  const int t = blockIdx.x;
+  if (t >= T) return;
+
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+
+  const long long s = static_cast<long long>(stream_idx);
+  const float* in_row = in_f32 + s * in_stride + static_cast<long long>(t) * kD;
+  const float* msg_row = msg_f32 + s * msg_stride + static_cast<long long>(t) * kD;
+  const float* fg_row = fg_f32 + static_cast<long long>(t) * (2 * kD);
+  const __nv_bfloat16* nw = norm_w + s * norm_stride;
+  __nv_bfloat16* out_row = out_bf16 + s * out_stride + static_cast<long long>(t) * kD;
+
+  float merged[9];
+  float sq = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 9; ++i) {
+    int d = tid + i * 256;
+    float wf = tanhf(__ldcs(&fg_row[d]));
+    float wg = tanhf(__ldcs(&fg_row[kD + d]));
+    float m = __fadd_rn(__fmul_rn(__fsub_rn(1.0f, wf), in_row[d]), __fmul_rn(wg, msg_row[d]));
+    merged[i] = m;
+    sq = __fadd_rn(sq, __fmul_rn(m, m));
+  }
+  __shared__ float s_red8[8];
+  sq = warp_reduce_sum(sq);
+  if (lane == 0) s_red8[warp] = sq;
+  __syncthreads();
+  if (warp == 0) {
+    float v = warp_reduce_sum((lane < 8) ? s_red8[lane] : 0.0f);
+    if (lane == 0) {
+      s_red8[0] = rsqrt_approx_f32(__fadd_rn(__fmul_rn(v, 1.0f / static_cast<float>(kD)), eps));
+    }
+  }
+  __syncthreads();
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+  const float rstd = s_red8[0];
+#pragma unroll
+  for (int i = 0; i < 9; ++i) {
+    int d = tid + i * 256;
+    float w = __bfloat162float(__ldg(&nw[d]));
+    out_row[d] = __float2bfloat16_rn(__fmul_rn(__fmul_rn(merged[i], rstd), w));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Single-stream strided s1 (strict no-FMA FP32 RMSNorm + concat -> BF16)
+// for large prefill (T >= 769) where keeping a single L2-resident cat0/fg0
+// buffer sequentially across streams 0/1/2 avoids L2 eviction.
+// Grid: [T, 1, 1], Block: [256, 1, 1], pdl: True
+// ---------------------------------------------------------------------------
+extern "C" __global__ __launch_bounds__(256, 4) void kern_ctrl_rms_concat_stream_f32_bf16(
+    const float* __restrict__ in_f32,
+    const float* __restrict__ msg_f32,
+    __nv_bfloat16* __restrict__ cat_bf16,
+    long long in_stride,
+    long long msg_stride,
+    int stream_idx,
+    int T,
+    float eps) {
+  const int t = blockIdx.x;
+  if (t >= T) return;
+
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+
+  const long long s = static_cast<long long>(stream_idx);
+  const float* in_row = in_f32 + s * in_stride + static_cast<long long>(t) * kD;
+  const float* msg_row = msg_f32 + s * msg_stride + static_cast<long long>(t) * kD;
+  __nv_bfloat16* cat_row = cat_bf16 + static_cast<long long>(t) * (2 * kD);
+
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+
+  float rx[9], rm[9];
+  float sq0 = 0.0f, sq1 = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 9; ++i) {
+    int d = tid + i * 256;
+    float a = in_row[d];
+    float b = msg_row[d];
+    rx[i] = a;
+    rm[i] = b;
+    sq0 = __fadd_rn(sq0, __fmul_rn(a, a));
+    sq1 = __fadd_rn(sq1, __fmul_rn(b, b));
+  }
+  __shared__ float s_red8[8][2];
+  sq0 = warp_reduce_sum(sq0);
+  sq1 = warp_reduce_sum(sq1);
+  if (lane == 0) {
+    s_red8[warp][0] = sq0;
+    s_red8[warp][1] = sq1;
+  }
+  __syncthreads();
+  if (warp == 0) {
+    float v0 = warp_reduce_sum((lane < 8) ? s_red8[lane][0] : 0.0f);
+    float v1 = warp_reduce_sum((lane < 8) ? s_red8[lane][1] : 0.0f);
+    if (lane == 0) {
+      constexpr float kInvD = 1.0f / static_cast<float>(kD);
+      s_red8[0][0] = rsqrt_approx_f32(__fadd_rn(__fmul_rn(v0, kInvD), eps));
+      s_red8[0][1] = rsqrt_approx_f32(__fadd_rn(__fmul_rn(v1, kInvD), eps));
+    }
+  }
+  __syncthreads();
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+  const float rstd_in = s_red8[0][0];
+  const float rstd_msg = s_red8[0][1];
+#pragma unroll
+  for (int i = 0; i < 9; ++i) {
+    int d = tid + i * 256;
+    cat_row[d] = __float2bfloat16_rn(__fmul_rn(rx[i], rstd_in));
+    cat_row[kD + d] = __float2bfloat16_rn(__fmul_rn(rm[i], rstd_msg));
+  }
+}

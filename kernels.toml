@@ -28,14 +28,14 @@ cutlass = ["third_party/flashinfer/3rdparty/cutlass/include", "third_party/flash
 
 # M1 CUDA modules
 [kernels."norm_attnres"]
-sha256 = "823a735e964a901a0635305a28874d8138d242b067320fcd60f67a6b1eb82f8e"
+sha256 = "8a5c542c1c5de60b188b59137d6ab040a5b7d2e27c00d9d9521fafaa43ee84c1"
 milestone = "M1"
 source = "source/norm_attnres.cu"
 flags = "plain"
 includes = []
 
 [kernels."loop_controller"]
-sha256 = "9a954b02217cb19f46c8510b59af348ba438a0dedc39fe92a0f38ac3e76c3a76"
+sha256 = "c4e4018d9961542dae97e1c9d2ef48ad300b51a4411b9cf4a43b2854d4b35347"
 milestone = "M1"
 source = "source/loop_controller.cu"
 flags = "strict_fp32"

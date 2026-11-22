@@ -270,95 +270,96 @@ def register_ops(
         ["tokens", 1, 1],
         pdl=True,
     )
-    single_op(
-        "attn_res_mix_f32",
-        "norm_attnres",
-        "kern_attn_res_mix_f32",
-        [
-            "in buffer<bf16>",
-            "in buffer<bf16>",
-            "in buffer<f32>",
-            "out buffer<f32>",
-            "i64",
-            "i64",
-            "i32",
-            "i32",
-            "i32",
-            "i32",
-            "f32",
-        ],
-        ["tokens", 1, 1],
-        pdl=True,
-    )
-    single_op(
-        "attn_res_addend_mix_f32",
-        "norm_attnres",
-        "kern_attn_res_addend_mix_f32",
-        [
-            "in buffer<bf16>",
-            "in buffer<bf16>",
-            "in buffer<bf16>",
-            "in buffer<f32>",
-            "out buffer<f32>",
-            "i64",
-            "i64",
-            "i32",
-            "i32",
-            "i32",
-            "i32",
-            "f32",
-        ],
-        ["tokens", 1, 1],
-        pdl=True,
-    )
-    if "cross_pass_attn_res_f32" not in ops:
-        cp_params = [
-            "in buffer<bf16>",
-            "in buffer<f32>",
-            "out buffer<f32>",
-            "i64",
-            "i64",
-            "i32",
-            "i32",
-            "i32",
-            "f32",
-        ]
-        p_cp = lambda idx: {"param": idx}
-        ops["cross_pass_attn_res_f32"] = {
-            "params": cp_params,
-            "impl": {
-                "launches": [
-                    {
-                        "module": "norm_attnres",
-                        "entry": "kern_cross_pass_attn_res_4q_f32",
-                        "params": [
-                            "in buffer<bf16>",
-                            "in buffer<f32>",
-                            "out buffer<f32>",
-                            "i64",
-                            "i64",
-                            "i32",
-                            "f32",
-                        ],
-                        "grid": ["tokens", 4, 1],
-                        "block": [256, 1, 1],
-                        "pdl": True,
-                        "args": [p_cp(0), p_cp(1), p_cp(2), p_cp(3), p_cp(4), p_cp(5), p_cp(8)],
-                        "when": {"var": "tokens", "max": 64},
-                    },
-                    {
-                        "module": "norm_attnres",
-                        "entry": "kern_cross_pass_attn_res_f32",
-                        "params": cp_params,
-                        "grid": ["tokens", 1, 1],
-                        "block": [256, 1, 1],
-                        "pdl": True,
-                        "args": [p_cp(j) for j in range(9)],
-                        "when": {"var": "tokens", "min": 65},
-                    },
-                ]
-            },
-        }
+    if include_sample_copy:
+        single_op(
+            "attn_res_mix_f32",
+            "norm_attnres",
+            "kern_attn_res_mix_f32",
+            [
+                "in buffer<bf16>",
+                "in buffer<bf16>",
+                "in buffer<f32>",
+                "out buffer<f32>",
+                "i64",
+                "i64",
+                "i32",
+                "i32",
+                "i32",
+                "i32",
+                "f32",
+            ],
+            ["tokens", 1, 1],
+            pdl=True,
+        )
+        single_op(
+            "attn_res_addend_mix_f32",
+            "norm_attnres",
+            "kern_attn_res_addend_mix_f32",
+            [
+                "in buffer<bf16>",
+                "in buffer<bf16>",
+                "in buffer<bf16>",
+                "in buffer<f32>",
+                "out buffer<f32>",
+                "i64",
+                "i64",
+                "i32",
+                "i32",
+                "i32",
+                "i32",
+                "f32",
+            ],
+            ["tokens", 1, 1],
+            pdl=True,
+        )
+        if "cross_pass_attn_res_f32" not in ops:
+            cp_params = [
+                "in buffer<bf16>",
+                "in buffer<f32>",
+                "out buffer<f32>",
+                "i64",
+                "i64",
+                "i32",
+                "i32",
+                "i32",
+                "f32",
+            ]
+            p_cp = lambda idx: {"param": idx}
+            ops["cross_pass_attn_res_f32"] = {
+                "params": cp_params,
+                "impl": {
+                    "launches": [
+                        {
+                            "module": "norm_attnres",
+                            "entry": "kern_cross_pass_attn_res_4q_f32",
+                            "params": [
+                                "in buffer<bf16>",
+                                "in buffer<f32>",
+                                "out buffer<f32>",
+                                "i64",
+                                "i64",
+                                "i32",
+                                "f32",
+                            ],
+                            "grid": ["tokens", 4, 1],
+                            "block": [256, 1, 1],
+                            "pdl": True,
+                            "args": [p_cp(0), p_cp(1), p_cp(2), p_cp(3), p_cp(4), p_cp(5), p_cp(8)],
+                            "when": {"var": "tokens", "max": 64},
+                        },
+                        {
+                            "module": "norm_attnres",
+                            "entry": "kern_cross_pass_attn_res_f32",
+                            "params": cp_params,
+                            "grid": ["tokens", 1, 1],
+                            "block": [256, 1, 1],
+                            "pdl": True,
+                            "args": [p_cp(j) for j in range(9)],
+                            "when": {"var": "tokens", "min": 65},
+                        },
+                    ]
+                },
+            }
 
     # Helpers: query scaling (for derive), copies, taps, residual adds
     single_op(
@@ -368,13 +369,39 @@ def register_ops(
         ["in buffer<f32>", "out buffer<f32>", "i64", "f32"],
         [ceil_div(12 * 4 * H, 256), 1, 1],
     )
-    single_op(
-        "copy_bf16",
-        "norm_attnres",
-        "kern_copy_bf16",
-        ["in buffer<bf16>", "out buffer<bf16>", "i64"],
-        [ceil_div(mul("tokens", H), 256), 1, 1],
-    )
+    def split_vec8_op(name: str, entry_small: str, entry_vec8: str, params: list[str]) -> None:
+        if name in ops:
+            return
+        if max_tokens <= 64:
+            single_op(name, "norm_attnres", entry_small, params, [ceil_div(mul("tokens", H), 256), 1, 1])
+            return
+        ops[name] = {
+            "params": params,
+            "impl": {
+                "launches": [
+                    {
+                        "module": "norm_attnres",
+                        "entry": entry_small,
+                        "params": params,
+                        "grid": [ceil_div(mul("tokens", H), 256), 1, 1],
+                        "block": [256, 1, 1],
+                        "args": [{"param": j} for j in range(len(params))],
+                        "when": {"var": "tokens", "max": 64},
+                    },
+                    {
+                        "module": "norm_attnres",
+                        "entry": entry_vec8,
+                        "params": params,
+                        "grid": [ceil_div(mul("tokens", H), 2048), 1, 1],
+                        "block": [256, 1, 1],
+                        "args": [{"param": j} for j in range(len(params))],
+                        "when": {"var": "tokens", "min": 65},
+                    },
+                ]
+            },
+        }
+
+    split_vec8_op("copy_bf16", "kern_copy_bf16", "kern_copy_bf16_vec8", ["in buffer<bf16>", "out buffer<bf16>", "i64"])
     single_op(
         "tap_bf16",
         "norm_attnres",
@@ -382,25 +409,21 @@ def register_ops(
         ["in buffer<bf16>", "out buffer<bf16>", "i32", "i32", "i32", "i32"],
         ["tokens", 1, 1],
     )
-    single_op(
+    split_vec8_op(
         "add2_bf16",
-        "norm_attnres",
         "kern_residual_add2_bf16",
+        "kern_residual_add2_bf16_vec8",
         ["in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i64"],
-        [ceil_div(mul("tokens", H), 256), 1, 1],
     )
-    single_op(
+    split_vec8_op(
         "add3_bf16",
-        "norm_attnres",
         "kern_residual_add3_bf16",
+        "kern_residual_add3_bf16_vec8",
         ["in buffer<bf16>", "in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i64"],
-        [ceil_div(mul("tokens", H), 256), 1, 1],
     )
 
-    # Rank-64 gated loop controller: (in_f32, msg_f32, w_down, w_fg, norm_w, out_bf16, T, eps)
-    # 100% bit-identical single-pass register-cached s1/s4 around cuBLASLt/cuBLAS s2/s3,
-    # with 2-stream grid=[tokens, 2, 1] s1 for small T (<= 64) to double SM occupancy.
-    if "loop_controller" not in ops:
+    # Rank-64 gated loop controller: standalone op for unit tests; fused ops for full model.
+    if include_sample_copy and "loop_controller" not in ops:
         ctrl_params = [
             "in buffer<f32>",
             "in buffer<f32>",
@@ -474,136 +497,540 @@ def register_ops(
             },
         }
 
-    # Bit-identical 3-stream batched loop controller for round/decode (T <= 64):
-    # merges 3x s1 + 3x s4 launches for ctrl.{attn,k,v} into 1x s1 + 1x s4 (tripling SM occupancy
-    # and sharing in_f32 RMSNorm on SWA layers) while keeping cuBLASLt/cuBLAS s2/s3 identical.
+    # Production fused AttnRes + Cross-Pass + Loop Controller ops (100% bit-identical):
     if not include_sample_copy:
-        for op3_name, s1_grid_y in (("loop_controller_3x_swa", 4), ("loop_controller_3x_full", 6)):
-            if op3_name not in ops:
-                ctrl3_params = [
-                    "in buffer<f32>",    # 0: in_f32 (mix_qkv)
-                    "in buffer<f32>",    # 1: msg_f32 (msg_buf)
-                    "in buffer<bf16>",   # 2: w_down_0 (attn)
-                    "in buffer<bf16>",   # 3: w_fg_0
-                    "in buffer<bf16>",   # 4: w_down_1 (k)
-                    "in buffer<bf16>",   # 5: w_fg_1
-                    "in buffer<bf16>",   # 6: w_down_2 (v)
-                    "in buffer<bf16>",   # 7: w_fg_2
-                    "in buffer<bf16>",   # 8: norm_w (attn_norm or qkv_input_norm)
-                    "out buffer<bf16>",  # 9: out_bf16 (x_qkv)
-                    "i64",               # 10: in_stride (0 for SWA, max_tokens*H for Full)
-                    "i64",               # 11: msg_stride (max_tokens*H)
-                    "i64",               # 12: out_stride (max_tokens*H)
-                    "i64",               # 13: norm_stride (0 for SWA, H for Full)
-                    "i32",               # 14: T
-                    "f32",               # 15: eps
+        # Low-register high-occupancy AttnRes + RMSNorm (1q and 3q-split for round)
+        ar1q_params = [
+            "in buffer<bf16>",
+            "in buffer<bf16>",
+            "in buffer<f32>",
+            "in buffer<bf16>",
+            "out buffer<bf16>",
+            "i64",
+            "i64",
+            "i32",
+            "i32",
+            "f32",
+            "f32",
+        ]
+        single_op(
+            "attn_res_norm_1q_bf16",
+            "norm_attnres",
+            "kern_attn_res_norm_1q_bf16",
+            ar1q_params,
+            ["tokens", 1, 1],
+            pdl=True,
+        )
+        if "attn_res_norm_3q_bf16" not in ops:
+            p3q = lambda idx: {"param": idx}
+            ops["attn_res_norm_3q_bf16"] = {
+                "params": ar1q_params,
+                "impl": {
+                    "launches": [
+                        {
+                            "module": "norm_attnres",
+                            "entry": "kern_attn_res_norm_1q_bf16",
+                            "params": ar1q_params,
+                            "grid": ["tokens", 3, 1],
+                            "block": [256, 1, 1],
+                            "pdl": True,
+                            "args": [p3q(j) for j in range(11)],
+                            "when": {"var": "tokens", "max": 64},
+                        },
+                        {
+                            "module": "norm_attnres",
+                            "entry": "kern_attn_res_norm_bf16",
+                            "params": [
+                                "in buffer<bf16>",
+                                "in buffer<bf16>",
+                                "in buffer<f32>",
+                                "in buffer<bf16>",
+                                "out buffer<bf16>",
+                                "i64",
+                                "i64",
+                                "i32",
+                                "i32",
+                                "i32",
+                                "i32",
+                                "f32",
+                                "f32",
+                            ],
+                            "grid": ["tokens", 1, 1],
+                            "block": [256, 1, 1],
+                            "pdl": True,
+                            "args": [
+                                p3q(0),
+                                p3q(1),
+                                p3q(2),
+                                p3q(3),
+                                p3q(4),
+                                p3q(5),
+                                p3q(6),
+                                p3q(7),
+                                i32(H),
+                                p3q(8),
+                                i32(3),
+                                p3q(9),
+                                p3q(10),
+                            ],
+                            "when": {"var": "tokens", "min": 65},
+                        },
+                    ]
+                },
+            }
+
+        # Fused Pre-Attention: attn_res_mix + cross_pass_attn_res + 3x loop_controller (s1..s4)
+        for op_name, lowm_grid_y, num_q_val in (
+            ("pre_attn_mix_cross_ctrl_swa", 5, 1),
+            ("pre_attn_mix_cross_ctrl_full", 7, 3),
+        ):
+            if op_name not in ops:
+                pa_params = [
+                    "in buffer<bf16>",   # 0: stack
+                    "in buffer<bf16>",   # 1: partial
+                    "in buffer<f32>",    # 2: attn_q
+                    "in buffer<bf16>",   # 3: prev_blocks
+                    "in buffer<f32>",    # 4: cross_q
+                    "in buffer<bf16>",   # 5: w_down_0
+                    "in buffer<bf16>",   # 6: w_fg_0
+                    "in buffer<bf16>",   # 7: w_down_1
+                    "in buffer<bf16>",   # 8: w_fg_1
+                    "in buffer<bf16>",   # 9: w_down_2
+                    "in buffer<bf16>",   # 10: w_fg_2
+                    "in buffer<bf16>",   # 11: norm_w
+                    "out buffer<f32>",   # 12: mix_qkv
+                    "out buffer<f32>",   # 13: msg_buf
+                    "out buffer<bf16>",  # 14: x_qkv
+                    "i64",               # 15: stack_stride (max_tokens*H)
+                    "i64",               # 16: out_q_stride (max_tokens*H)
+                    "i64",               # 17: in_stride (0 SWA, max_tokens*H Full)
+                    "i64",               # 18: norm_stride (0 SWA, H Full)
+                    "i32",               # 19: T
+                    "i32",               # 20: n_stack
+                    "f32",               # 21: eps
                 ]
-                p3 = lambda idx: {"param": idx}
-                scr3 = lambda name: {"scratch": name}
-                ops[op3_name] = {
-                    "params": ctrl3_params,
+                pa = lambda idx: {"param": idx}
+                ps = lambda name: {"scratch": name}
+                s1_params = [
+                    "in buffer<bf16>",
+                    "in buffer<bf16>",
+                    "in buffer<f32>",
+                    "in buffer<bf16>",
+                    "in buffer<f32>",
+                    "out buffer<f32>",
+                    "out buffer<f32>",
+                    "out buffer<bf16>",
+                    "out buffer<bf16>",
+                    "out buffer<bf16>",
+                    "i64",
+                    "i64",
+                    "i64",
+                    "i32",
+                    "i32",
+                    "f32",
+                ]
+                s1_args = [
+                    pa(0), pa(1), pa(2), pa(3), pa(4),
+                    pa(12), pa(13), ps("cat0"), ps("cat1"), ps("cat2"),
+                    pa(15), pa(16), pa(17), pa(19), pa(20), pa(21),
+                ]
+                s1_stream_params = [
+                    "in buffer<f32>",
+                    "in buffer<f32>",
+                    "out buffer<bf16>",
+                    "i64",
+                    "i64",
+                    "i32",
+                    "i32",
+                    "f32",
+                ]
+                s4_stream_params = [
+                    "in buffer<f32>",
+                    "in buffer<f32>",
+                    "in buffer<f32>",
+                    "in buffer<bf16>",
+                    "out buffer<bf16>",
+                    "i64",
+                    "i64",
+                    "i64",
+                    "i64",
+                    "i32",
+                    "i32",
+                    "f32",
+                ]
+                mid_when = {"var": "tokens", "min": 65, "max": 768}
+                big_when = {"var": "tokens", "min": 769}
+                pa_launches: list[dict[str, Any]] = [
+                    # --- Low-M (T <= 64, round/decode): 1x fused s1 + 3x s2 + 3x s3 + 1x 3-stream s4 ---
+                    {
+                        "module": "norm_attnres",
+                        "entry": "kern_pre_attn_mix_cross_s1_lowm",
+                        "params": s1_params,
+                        "grid": ["tokens", lowm_grid_y, 1],
+                        "block": [256, 1, 1],
+                        "pdl": True,
+                        "args": s1_args,
+                        "when": {"var": "tokens", "max": 64},
+                    },
+                    {
+                        "entry": "extern:cublaslt_bf16_tn",
+                        "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32", "i32"],
+                        "args": [ps("cat0"), pa(5), ps("h0"), pa(19), i32(RANK), i32(2 * H)],
+                        "when": {"var": "tokens", "max": 64},
+                    },
+                    {
+                        "entry": "extern:cublaslt_bf16_tn",
+                        "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32", "i32"],
+                        "args": [ps("cat1"), pa(7), ps("h1"), pa(19), i32(RANK), i32(2 * H)],
+                        "when": {"var": "tokens", "max": 64},
+                    },
+                    {
+                        "entry": "extern:cublaslt_bf16_tn",
+                        "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32", "i32"],
+                        "args": [ps("cat2"), pa(9), ps("h2"), pa(19), i32(RANK), i32(2 * H)],
+                        "when": {"var": "tokens", "max": 64},
+                    },
+                    {
+                        "entry": "extern:cublas_bf16_tn_f32",
+                        "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<f32>", "i32", "i32", "i32"],
+                        "args": [ps("h0"), pa(6), ps("fg0"), pa(19), i32(2 * H), i32(RANK)],
+                        "when": {"var": "tokens", "max": 64},
+                    },
+                    {
+                        "entry": "extern:cublas_bf16_tn_f32",
+                        "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<f32>", "i32", "i32", "i32"],
+                        "args": [ps("h1"), pa(8), ps("fg1"), pa(19), i32(2 * H), i32(RANK)],
+                        "when": {"var": "tokens", "max": 64},
+                    },
+                    {
+                        "entry": "extern:cublas_bf16_tn_f32",
+                        "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<f32>", "i32", "i32", "i32"],
+                        "args": [ps("h2"), pa(10), ps("fg2"), pa(19), i32(2 * H), i32(RANK)],
+                        "when": {"var": "tokens", "max": 64},
+                    },
+                    {
+                        "module": "loop_controller",
+                        "entry": "kern_ctrl_merge_rmsnorm_3x_f32_bf16",
+                        "params": [
+                            "in buffer<f32>",
+                            "in buffer<f32>",
+                            "in buffer<f32>",
+                            "in buffer<f32>",
+                            "in buffer<f32>",
+                            "in buffer<bf16>",
+                            "out buffer<bf16>",
+                            "i64",
+                            "i64",
+                            "i64",
+                            "i64",
+                            "i32",
+                            "f32",
+                        ],
+                        "grid": ["tokens", 3, 1],
+                        "block": [256, 1, 1],
+                        "pdl": True,
+                        "args": [
+                            pa(12), pa(13), ps("fg0"), ps("fg1"), ps("fg2"),
+                            pa(11), pa(14), pa(17), pa(16), pa(16), pa(18), pa(19), pa(21),
+                        ],
+                        "when": {"var": "tokens", "max": 64},
+                    },
+                    # --- Mid Prefill (65 <= T <= 768, fits in 96 MiB L2): 1x fused s1 + 3x (s2->s3->s4) ---
+                    {
+                        "module": "norm_attnres",
+                        "entry": "kern_pre_attn_mix_cross_s1_prefill",
+                        "params": s1_params,
+                        "grid": ["tokens", 2, 1],
+                        "block": [256, 1, 1],
+                        "pdl": True,
+                        "args": s1_args,
+                        "when": mid_when,
+                    },
+                ]
+                for s_idx, (cat_s, h_s, wd_p, wfg_p) in enumerate((("cat0", "h0", 5, 6), ("cat1", "h1", 7, 8), ("cat2", "h2", 9, 10))):
+                    pa_launches.extend([
+                        {
+                            "entry": "extern:cublaslt_bf16_tn",
+                            "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32", "i32"],
+                            "args": [ps(cat_s), pa(wd_p), ps(h_s), pa(19), i32(RANK), i32(2 * H)],
+                            "when": mid_when,
+                        },
+                        {
+                            "entry": "extern:cublas_bf16_tn_f32",
+                            "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<f32>", "i32", "i32", "i32"],
+                            "args": [ps(h_s), pa(wfg_p), ps("fg0"), pa(19), i32(2 * H), i32(RANK)],
+                            "when": mid_when,
+                        },
+                        {
+                            "module": "loop_controller",
+                            "entry": "kern_ctrl_merge_rmsnorm_stream_f32_bf16",
+                            "params": s4_stream_params,
+                            "grid": ["tokens", 1, 1],
+                            "block": [256, 1, 1],
+                            "pdl": True,
+                            "args": [pa(12), pa(13), ps("fg0"), pa(11), pa(14), pa(17), pa(16), pa(16), pa(18), i32(s_idx), pa(19), pa(21)],
+                            "when": mid_when,
+                        },
+                    ])
+                # --- Large Prefill (T >= 769, e.g. c=2048): L2-friendly sequential cat0/h0/fg0 reuse ---
+                pa_launches.extend([
+                    {
+                        "module": "norm_attnres",
+                        "entry": "kern_attn_res_mix_f32",
+                        "params": [
+                            "in buffer<bf16>",
+                            "in buffer<bf16>",
+                            "in buffer<f32>",
+                            "out buffer<f32>",
+                            "i64",
+                            "i64",
+                            "i32",
+                            "i32",
+                            "i32",
+                            "i32",
+                            "f32",
+                        ],
+                        "grid": ["tokens", 1, 1],
+                        "block": [256, 1, 1],
+                        "pdl": True,
+                        "args": [pa(0), pa(1), pa(2), pa(12), pa(15), pa(16), pa(19), i32(H), pa(20), i32(num_q_val), pa(21)],
+                        "when": big_when,
+                    },
+                    {
+                        "module": "norm_attnres",
+                        "entry": "kern_cross_pass_attn_res_f32",
+                        "params": [
+                            "in buffer<bf16>",
+                            "in buffer<f32>",
+                            "out buffer<f32>",
+                            "i64",
+                            "i64",
+                            "i32",
+                            "i32",
+                            "i32",
+                            "f32",
+                        ],
+                        "grid": ["tokens", 1, 1],
+                        "block": [256, 1, 1],
+                        "pdl": True,
+                        "args": [pa(3), pa(4), pa(13), pa(15), pa(16), pa(19), i32(H), i32(4), pa(21)],
+                        "when": big_when,
+                    },
+                ])
+                for s_idx, (wd_p, wfg_p) in enumerate(((5, 6), (7, 8), (9, 10))):
+                    pa_launches.extend([
+                        {
+                            "module": "loop_controller",
+                            "entry": "kern_ctrl_rms_concat_stream_f32_bf16",
+                            "params": s1_stream_params,
+                            "grid": ["tokens", 1, 1],
+                            "block": [256, 1, 1],
+                            "pdl": True,
+                            "args": [pa(12), pa(13), ps("cat0"), pa(17), pa(16), i32(s_idx), pa(19), pa(21)],
+                            "when": big_when,
+                        },
+                        {
+                            "entry": "extern:cublaslt_bf16_tn",
+                            "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32", "i32"],
+                            "args": [ps("cat0"), pa(wd_p), ps("h0"), pa(19), i32(RANK), i32(2 * H)],
+                            "when": big_when,
+                        },
+                        {
+                            "entry": "extern:cublas_bf16_tn_f32",
+                            "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<f32>", "i32", "i32", "i32"],
+                            "args": [ps("h0"), pa(wfg_p), ps("fg0"), pa(19), i32(2 * H), i32(RANK)],
+                            "when": big_when,
+                        },
+                        {
+                            "module": "loop_controller",
+                            "entry": "kern_ctrl_merge_rmsnorm_stream_f32_bf16",
+                            "params": s4_stream_params,
+                            "grid": ["tokens", 1, 1],
+                            "block": [256, 1, 1],
+                            "pdl": True,
+                            "args": [pa(12), pa(13), ps("fg0"), pa(11), pa(14), pa(17), pa(16), pa(16), pa(18), i32(s_idx), pa(19), pa(21)],
+                            "when": big_when,
+                        },
+                    ])
+                ops[op_name] = {
+                    "params": pa_params,
                     "impl": {
                         "scratch": {
                             "cat0": {"dtype": "bf16", "shape": ["tokens", 2 * H]},
-                            "cat1": {"dtype": "bf16", "shape": ["tokens", 2 * H]},
-                            "cat2": {"dtype": "bf16", "shape": ["tokens", 2 * H]},
+                            "cat1": {"dtype": "bf16", "shape": [768, 2 * H]},
+                            "cat2": {"dtype": "bf16", "shape": [768, 2 * H]},
                             "h0": {"dtype": "bf16", "shape": ["tokens", RANK]},
-                            "h1": {"dtype": "bf16", "shape": ["tokens", RANK]},
-                            "h2": {"dtype": "bf16", "shape": ["tokens", RANK]},
+                            "h1": {"dtype": "bf16", "shape": [768, RANK]},
+                            "h2": {"dtype": "bf16", "shape": [768, RANK]},
                             "fg0": {"dtype": "f32", "shape": ["tokens", 2 * H]},
-                            "fg1": {"dtype": "f32", "shape": ["tokens", 2 * H]},
-                            "fg2": {"dtype": "f32", "shape": ["tokens", 2 * H]},
+                            "fg1": {"dtype": "f32", "shape": [64, 2 * H]},
+                            "fg2": {"dtype": "f32", "shape": [64, 2 * H]},
                         },
-                        "launches": [
-                            {
-                                "module": "loop_controller",
-                                "entry": "kern_ctrl_rms_concat_3x_f32_bf16",
-                                "params": [
-                                    "in buffer<f32>",
-                                    "in buffer<f32>",
-                                    "out buffer<bf16>",
-                                    "out buffer<bf16>",
-                                    "out buffer<bf16>",
-                                    "i64",
-                                    "i64",
-                                    "i32",
-                                    "f32",
-                                ],
-                                "grid": ["tokens", s1_grid_y, 1],
-                                "block": [256, 1, 1],
-                                "pdl": True,
-                                "args": [p3(0), p3(1), scr3("cat0"), scr3("cat1"), scr3("cat2"), p3(10), p3(11), p3(14), p3(15)],
-                            },
-                            {
-                                "entry": "extern:cublaslt_bf16_tn",
-                                "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32", "i32"],
-                                "args": [scr3("cat0"), p3(2), scr3("h0"), p3(14), i32(RANK), i32(2 * H)],
-                            },
-                            {
-                                "entry": "extern:cublaslt_bf16_tn",
-                                "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32", "i32"],
-                                "args": [scr3("cat1"), p3(4), scr3("h1"), p3(14), i32(RANK), i32(2 * H)],
-                            },
-                            {
-                                "entry": "extern:cublaslt_bf16_tn",
-                                "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32", "i32"],
-                                "args": [scr3("cat2"), p3(6), scr3("h2"), p3(14), i32(RANK), i32(2 * H)],
-                            },
-                            {
-                                "entry": "extern:cublas_bf16_tn_f32",
-                                "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<f32>", "i32", "i32", "i32"],
-                                "args": [scr3("h0"), p3(3), scr3("fg0"), p3(14), i32(2 * H), i32(RANK)],
-                            },
-                            {
-                                "entry": "extern:cublas_bf16_tn_f32",
-                                "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<f32>", "i32", "i32", "i32"],
-                                "args": [scr3("h1"), p3(5), scr3("fg1"), p3(14), i32(2 * H), i32(RANK)],
-                            },
-                            {
-                                "entry": "extern:cublas_bf16_tn_f32",
-                                "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<f32>", "i32", "i32", "i32"],
-                                "args": [scr3("h2"), p3(7), scr3("fg2"), p3(14), i32(2 * H), i32(RANK)],
-                            },
-                            {
-                                "module": "loop_controller",
-                                "entry": "kern_ctrl_merge_rmsnorm_3x_f32_bf16",
-                                "params": [
-                                    "in buffer<f32>",
-                                    "in buffer<f32>",
-                                    "in buffer<f32>",
-                                    "in buffer<f32>",
-                                    "in buffer<f32>",
-                                    "in buffer<bf16>",
-                                    "out buffer<bf16>",
-                                    "i64",
-                                    "i64",
-                                    "i64",
-                                    "i64",
-                                    "i32",
-                                    "f32",
-                                ],
-                                "grid": ["tokens", 3, 1],
-                                "block": [256, 1, 1],
-                                "pdl": True,
-                                "args": [
-                                    p3(0),
-                                    p3(1),
-                                    scr3("fg0"),
-                                    scr3("fg1"),
-                                    scr3("fg2"),
-                                    p3(8),
-                                    p3(9),
-                                    p3(10),
-                                    p3(11),
-                                    p3(12),
-                                    p3(13),
-                                    p3(14),
-                                    p3(15),
-                                ],
-                            },
-                        ],
+                        "launches": pa_launches,
                     },
                 }
+
+        # Fused Pre-MLP: attn_res_{mix,addend_mix} + loop_controller (s1..s4) for ALL T
+        if "pre_mlp_mix_ctrl" not in ops:
+            pm = lambda idx: {"param": idx}
+            pms = lambda name: {"scratch": name}
+            ops["pre_mlp_mix_ctrl"] = {
+                "params": [
+                    "in buffer<bf16>",   # 0: stack
+                    "in buffer<bf16>",   # 1: partial (attn_out)
+                    "in buffer<f32>",    # 2: mlp_q
+                    "in buffer<f32>",    # 3: msg_f32 (msg_buf[3])
+                    "in buffer<bf16>",   # 4: w_down
+                    "in buffer<bf16>",   # 5: w_fg
+                    "in buffer<bf16>",   # 6: norm_w
+                    "out buffer<f32>",   # 7: mix_mlp
+                    "out buffer<bf16>",  # 8: x_mlp
+                    "i64",               # 9: stack_stride
+                    "i32",               # 10: T
+                    "i32",               # 11: n_stack
+                    "f32",               # 12: eps
+                ],
+                "impl": {
+                    "scratch": {
+                        "cat": {"dtype": "bf16", "shape": ["tokens", 2 * H]},
+                        "h": {"dtype": "bf16", "shape": ["tokens", RANK]},
+                        "fg": {"dtype": "f32", "shape": ["tokens", 2 * H]},
+                    },
+                    "launches": [
+                        {
+                            "module": "norm_attnres",
+                            "entry": "kern_pre_mlp_mix_s1_f32_bf16",
+                            "params": [
+                                "in buffer<bf16>",
+                                "in buffer<bf16>",
+                                "in buffer<f32>",
+                                "in buffer<f32>",
+                                "out buffer<f32>",
+                                "out buffer<bf16>",
+                                "i64",
+                                "i32",
+                                "i32",
+                                "f32",
+                            ],
+                            "grid": ["tokens", 2, 1],
+                            "block": [256, 1, 1],
+                            "pdl": True,
+                            "args": [pm(0), pm(1), pm(2), pm(3), pm(7), pms("cat"), pm(9), pm(10), pm(11), pm(12)],
+                        },
+                        {
+                            "entry": "extern:cublaslt_bf16_tn",
+                            "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32", "i32"],
+                            "args": [pms("cat"), pm(4), pms("h"), pm(10), i32(RANK), i32(2 * H)],
+                        },
+                        {
+                            "entry": "extern:cublas_bf16_tn_f32",
+                            "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<f32>", "i32", "i32", "i32"],
+                            "args": [pms("h"), pm(5), pms("fg"), pm(10), i32(2 * H), i32(RANK)],
+                        },
+                        {
+                            "module": "loop_controller",
+                            "entry": "kern_ctrl_merge_rmsnorm_f32_bf16",
+                            "params": [
+                                "in buffer<f32>",
+                                "in buffer<f32>",
+                                "in buffer<f32>",
+                                "in buffer<bf16>",
+                                "out buffer<bf16>",
+                                "i32",
+                                "i32",
+                                "f32",
+                            ],
+                            "grid": ["tokens", 1, 1],
+                            "block": [256, 1, 1],
+                            "pdl": True,
+                            "args": [pm(7), pm(3), pms("fg"), pm(6), pm(8), pm(10), i32(H), pm(12)],
+                        },
+                    ],
+                },
+            }
+
+        if "pre_mlp_addend_mix_ctrl" not in ops:
+            pma = lambda idx: {"param": idx}
+            pmas = lambda name: {"scratch": name}
+            ops["pre_mlp_addend_mix_ctrl"] = {
+                "params": [
+                    "in buffer<bf16>",   # 0: stack
+                    "in buffer<bf16>",   # 1: partial
+                    "in buffer<bf16>",   # 2: addend (attn_out)
+                    "in buffer<f32>",    # 3: mlp_q
+                    "in buffer<f32>",    # 4: msg_f32 (msg_buf[3])
+                    "in buffer<bf16>",   # 5: w_down
+                    "in buffer<bf16>",   # 6: w_fg
+                    "in buffer<bf16>",   # 7: norm_w
+                    "out buffer<f32>",   # 8: mix_mlp
+                    "out buffer<bf16>",  # 9: x_mlp
+                    "i64",               # 10: stack_stride
+                    "i32",               # 11: T
+                    "i32",               # 12: n_stack
+                    "f32",               # 13: eps
+                ],
+                "impl": {
+                    "scratch": {
+                        "cat": {"dtype": "bf16", "shape": ["tokens", 2 * H]},
+                        "h": {"dtype": "bf16", "shape": ["tokens", RANK]},
+                        "fg": {"dtype": "f32", "shape": ["tokens", 2 * H]},
+                    },
+                    "launches": [
+                        {
+                            "module": "norm_attnres",
+                            "entry": "kern_pre_mlp_addend_mix_s1_f32_bf16",
+                            "params": [
+                                "in buffer<bf16>",
+                                "in buffer<bf16>",
+                                "in buffer<bf16>",
+                                "in buffer<f32>",
+                                "in buffer<f32>",
+                                "out buffer<f32>",
+                                "out buffer<bf16>",
+                                "i64",
+                                "i32",
+                                "i32",
+                                "f32",
+                            ],
+                            "grid": ["tokens", 2, 1],
+                            "block": [256, 1, 1],
+                            "pdl": True,
+                            "args": [
+                                pma(0), pma(1), pma(2), pma(3), pma(4),
+                                pma(8), pmas("cat"), pma(10), pma(11), pma(12), pma(13),
+                            ],
+                        },
+                        {
+                            "entry": "extern:cublaslt_bf16_tn",
+                            "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32", "i32"],
+                            "args": [pmas("cat"), pma(5), pmas("h"), pma(11), i32(RANK), i32(2 * H)],
+                        },
+                        {
+                            "entry": "extern:cublas_bf16_tn_f32",
+                            "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<f32>", "i32", "i32", "i32"],
+                            "args": [pmas("h"), pma(6), pmas("fg"), pma(11), i32(2 * H), i32(RANK)],
+                        },
+                        {
+                            "module": "loop_controller",
+                            "entry": "kern_ctrl_merge_rmsnorm_f32_bf16",
+                            "params": [
+                                "in buffer<f32>",
+                                "in buffer<f32>",
+                                "in buffer<f32>",
+                                "in buffer<bf16>",
+                                "out buffer<bf16>",
+                                "i32",
+                                "i32",
+                                "f32",
+                            ],
+                            "grid": ["tokens", 1, 1],
+                            "block": [256, 1, 1],
+                            "pdl": True,
+                            "args": [pma(8), pma(4), pmas("fg"), pma(7), pma(9), pma(11), i32(H), pma(13)],
+                        },
+                    ],
+                },
+            }
 
     # Unembed + softcap + vocab mask + FP32 argmax
     single_op(
@@ -798,6 +1225,7 @@ def emit_layer_calls(
         )
 
     # Pre-attention input preparation
+    use_fused = (mode in ("round", "decode")) or (max_tokens >= 64)
     if pass_idx == 0:
         if phys_idx == 0:
             pre_attn.append(
@@ -805,6 +1233,27 @@ def emit_layer_calls(
                     "label": f"v{visit_idx}.l0.attn_norm",
                     "op": "rms_norm_bf16",
                     "args": [b("partial"), b("w.l0.attn_norm"), b("x_qkv"), T_var, i32(H), i32(1), f32(EPS)],
+                }
+            )
+        elif use_fused:
+            norm_w = b(f"w.l{phys_idx}.qkv_input_norm") if is_full else b(f"w.l{phys_idx}.attn_norm")
+            pre_attn.append(
+                {
+                    "label": f"v{visit_idx}.l{phys_idx}.attn_res_norm",
+                    "op": "attn_res_norm_3q_bf16" if is_full else "attn_res_norm_1q_bf16",
+                    "args": [
+                        b("stack"),
+                        b("partial"),
+                        b(f"c.attn_q.{phys_idx - 1}"),
+                        norm_w,
+                        b("x_qkv"),
+                        i64(stack_stride),
+                        i64(out_q_stride),
+                        T_var,
+                        i32(n_blocks),
+                        f32(EPS),
+                        f32(EPS),
+                    ],
                 }
             )
         else:
@@ -834,54 +1283,21 @@ def emit_layer_calls(
     else:
         c = phys_idx - CORE_START
         num_q = 3 if is_full else 1
-        pre_attn.append(
-            {
-                "label": f"v{visit_idx}.l{phys_idx}.attn_res_mix",
-                "op": "attn_res_mix_f32",
-                "args": [
-                    b("stack"),
-                    b("partial"),
-                    b(f"c.attn_q.{phys_idx - 1}"),
-                    b("mix_qkv"),
-                    i64(stack_stride),
-                    i64(out_q_stride),
-                    T_var,
-                    i32(H),
-                    i32(n_blocks),
-                    i32(num_q),
-                    f32(EPS),
-                ],
-            }
-        )
-        pre_attn.append(
-            {
-                "label": f"v{visit_idx}.l{phys_idx}.cross_pass",
-                "op": "cross_pass_attn_res_f32",
-                "args": [
-                    b("prev_blocks"),
-                    b("c.cross_pass_q", c * 4 * H * 4),
-                    b("msg_buf"),
-                    i64(max_tokens * H),
-                    i64(out_q_stride),
-                    T_var,
-                    i32(H),
-                    i32(4),
-                    f32(EPS),
-                ],
-            }
-        )
-        if mode in ("round", "decode"):
-            op3 = "loop_controller_3x_full" if is_full else "loop_controller_3x_swa"
+        if use_fused:
+            op_pa = "pre_attn_mix_cross_ctrl_full" if is_full else "pre_attn_mix_cross_ctrl_swa"
             nw_buf = b(f"w.l{phys_idx}.qkv_input_norm") if is_full else b(f"w.l{phys_idx}.attn_norm")
             in_stride = (max_tokens * H) if is_full else 0
             norm_stride = H if is_full else 0
             pre_attn.append(
                 {
-                    "label": f"v{visit_idx}.l{phys_idx}.ctrl.qkv",
-                    "op": op3,
+                    "label": f"v{visit_idx}.l{phys_idx}.pre_attn_ctrl",
+                    "op": op_pa,
                     "args": [
-                        b("mix_qkv"),
-                        b("msg_buf"),
+                        b("stack"),
+                        b("partial"),
+                        b(f"c.attn_q.{phys_idx - 1}"),
+                        b("prev_blocks"),
+                        b("c.cross_pass_q", c * 4 * H * 4),
                         b(f"w.l{phys_idx}.ctrl.attn.down"),
                         b(f"w.l{phys_idx}.ctrl.attn.fg"),
                         b(f"w.l{phys_idx}.ctrl.k.down"),
@@ -889,17 +1305,56 @@ def emit_layer_calls(
                         b(f"w.l{phys_idx}.ctrl.v.down"),
                         b(f"w.l{phys_idx}.ctrl.v.fg"),
                         nw_buf,
+                        b("mix_qkv"),
+                        b("msg_buf"),
                         b("x_qkv"),
+                        i64(stack_stride),
+                        i64(out_q_stride),
                         i64(in_stride),
-                        i64(max_tokens * H),
-                        i64(max_tokens * H),
                         i64(norm_stride),
                         T_var,
+                        i32(n_blocks),
                         f32(EPS),
                     ],
                 }
             )
         else:
+            pre_attn.append(
+                {
+                    "label": f"v{visit_idx}.l{phys_idx}.attn_res_mix",
+                    "op": "attn_res_mix_f32",
+                    "args": [
+                        b("stack"),
+                        b("partial"),
+                        b(f"c.attn_q.{phys_idx - 1}"),
+                        b("mix_qkv"),
+                        i64(stack_stride),
+                        i64(out_q_stride),
+                        T_var,
+                        i32(H),
+                        i32(n_blocks),
+                        i32(num_q),
+                        f32(EPS),
+                    ],
+                }
+            )
+            pre_attn.append(
+                {
+                    "label": f"v{visit_idx}.l{phys_idx}.cross_pass",
+                    "op": "cross_pass_attn_res_f32",
+                    "args": [
+                        b("prev_blocks"),
+                        b("c.cross_pass_q", c * 4 * H * 4),
+                        b("msg_buf"),
+                        i64(max_tokens * H),
+                        i64(out_q_stride),
+                        T_var,
+                        i32(H),
+                        i32(4),
+                        f32(EPS),
+                    ],
+                }
+            )
             stream_norms = (
                 ("q_input_norm", "k_input_norm", "v_input_norm")
                 if is_full
@@ -937,23 +1392,66 @@ def emit_layer_calls(
         )
         mlp_n_stack = n_blocks + 1
         if pass_idx == 0:
+            if use_fused:
+                pre_mlp.append(
+                    {
+                        "label": f"v{visit_idx}.l{phys_idx}.mlp_attn_res_norm",
+                        "op": "attn_res_norm_1q_bf16",
+                        "args": [
+                            b("stack"),
+                            b("attn_out"),
+                            b(f"c.mlp_q.{phys_idx}"),
+                            b(f"w.l{phys_idx}.mlp_norm"),
+                            b("x_mlp"),
+                            i64(stack_stride),
+                            i64(out_q_stride),
+                            T_var,
+                            i32(mlp_n_stack),
+                            f32(EPS),
+                            f32(EPS),
+                        ],
+                    }
+                )
+            else:
+                pre_mlp.append(
+                    {
+                        "label": f"v{visit_idx}.l{phys_idx}.mlp_attn_res_norm",
+                        "op": "attn_res_norm_bf16",
+                        "args": [
+                            b("stack"),
+                            b("attn_out"),
+                            b(f"c.mlp_q.{phys_idx}"),
+                            b(f"w.l{phys_idx}.mlp_norm"),
+                            b("x_mlp"),
+                            i64(stack_stride),
+                            i64(out_q_stride),
+                            T_var,
+                            i32(H),
+                            i32(mlp_n_stack),
+                            i32(1),
+                            f32(EPS),
+                            f32(EPS),
+                        ],
+                    }
+                )
+        elif use_fused:
             pre_mlp.append(
                 {
-                    "label": f"v{visit_idx}.l{phys_idx}.mlp_attn_res_norm",
-                    "op": "attn_res_norm_bf16",
+                    "label": f"v{visit_idx}.l{phys_idx}.pre_mlp_ctrl",
+                    "op": "pre_mlp_mix_ctrl",
                     "args": [
                         b("stack"),
                         b("attn_out"),
                         b(f"c.mlp_q.{phys_idx}"),
+                        b("msg_buf", 3 * max_tokens * H * 4),
+                        b(f"w.l{phys_idx}.ctrl.mlp.down"),
+                        b(f"w.l{phys_idx}.ctrl.mlp.fg"),
                         b(f"w.l{phys_idx}.mlp_norm"),
+                        b("mix_mlp"),
                         b("x_mlp"),
                         i64(stack_stride),
-                        i64(out_q_stride),
                         T_var,
-                        i32(H),
                         i32(mlp_n_stack),
-                        i32(1),
-                        f32(EPS),
                         f32(EPS),
                     ],
                 }
@@ -1015,6 +1513,29 @@ def emit_layer_calls(
                         i32(mlp_n_stack),
                         i32(1),
                         f32(EPS),
+                        f32(EPS),
+                    ],
+                }
+            )
+        elif use_fused:
+            pre_mlp.append(
+                {
+                    "label": f"v{visit_idx}.l{phys_idx}.pre_mlp_ctrl",
+                    "op": "pre_mlp_addend_mix_ctrl",
+                    "args": [
+                        b("stack"),
+                        b("partial"),
+                        b("attn_out"),
+                        b(f"c.mlp_q.{phys_idx}"),
+                        b("msg_buf", 3 * max_tokens * H * 4),
+                        b(f"w.l{phys_idx}.ctrl.mlp.down"),
+                        b(f"w.l{phys_idx}.ctrl.mlp.fg"),
+                        b(f"w.l{phys_idx}.mlp_norm"),
+                        b("mix_mlp"),
+                        b("x_mlp"),
+                        i64(stack_stride),
+                        T_var,
+                        i32(mlp_n_stack),
                         f32(EPS),
                     ],
                 }
