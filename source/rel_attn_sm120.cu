@@ -20,6 +20,7 @@ constexpr int kKvHeads = 8;
 constexpr int kGroup = 3;
 constexpr int kHeadDim = 128;
 constexpr int kRelExtent = 1024;
+constexpr int kRelRow = 72;  // 72 bf16 = 144 B = 9 x 16B chunks (36 banks -> minimal bank conflicts)
 constexpr int kSwaRing = 1024;
 constexpr int kSwaWindow = 1024;
 constexpr int kBlockN = 64;
@@ -83,12 +84,12 @@ __device__ __forceinline__ void ldmatrix_x4(
       : "r"(addr));
 }
 
-__device__ __forceinline__ void ldmatrix_x4_trans(
-    uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3, const void* smem_ptr) {
+__device__ __forceinline__ void ldmatrix_x2_trans_b8(
+    uint32_t& d0, uint32_t& d1, uint32_t& d2, uint32_t& d3, const void* smem_ptr) {
   uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
   asm volatile(
-      "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-      : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+      "ldmatrix.sync.aligned.m16n16.x2.trans.shared.b8 {%0, %1, %2, %3}, [%4];\n"
+      : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3)
       : "r"(addr));
 }
 
@@ -103,16 +104,23 @@ __device__ __forceinline__ void mma_m16n8k16_bf16(
       : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
-// Swizzle 16-byte chunk index (0..15) by row & 7 for bank-conflict-free [64][128] f16 smem.
-__device__ __forceinline__ int swizzle_c16(int row, int c16) {
+// Swizzle 16B chunk index (0..7) by row & 7 for bank-conflict-free [64, 128] FP8 smem.
+__device__ __forceinline__ int swizzle_fp8_c16(int row, int c16) {
   return c16 ^ (row & 7);
 }
 
-// Cooperatively issue 16B cp.async.cg for one [64, 128] FP8 tile (K or V) from SWA ring or KCur/VCur.
+// Permute key index within each 16-row V tile so ldmatrix.m16n16.x2.trans.b8 + cvt.rn.bf16x2.e4m3x2
+// directly matches the Q@K^T C-fragment register layout of P with zero warp shuffles.
+__device__ __forceinline__ int permute_v_row_16(int row) {
+  return (row & ~15) | (row & 1) | ((row & 8) >> 2) | ((row & 6) << 1);
+}
+
+// Cooperatively issue 16B cp.async.cg for one [64, 128] FP8 tile (K swizzled, V permuted+swizzled)
+// from SWA ring or KCur/VCur directly into FP8 SMEM (zero SMEM dequantization!).
 template <int THREADS>
-__device__ __forceinline__ void load_swa_kv_stage(
-    uint8_t* __restrict__ smem_k_fp8,
-    uint8_t* __restrict__ smem_v_fp8,
+__device__ __forceinline__ void load_swa_kv_stage_swizzled(
+    uint4* __restrict__ smem_k_swiz,
+    uint4* __restrict__ smem_v_swiz,
     const uint8_t* __restrict__ ring_k_base,
     const uint8_t* __restrict__ ring_v_base,
     const uint8_t* __restrict__ kcur_head_base,
@@ -121,56 +129,80 @@ __device__ __forceinline__ void load_swa_kv_stage(
     int past,
     int seqlen_k,
     int tid) {
-  // [64, 128] FP8 = 512 chunks of 16 bytes (8 chunks/row).
-  constexpr int kChunksPerRow = kHeadDim / 16;  // 8
-  constexpr int kTotalChunks = kBlockN * kChunksPerRow;  // 512
+  constexpr int kTotalChunks = kBlockN * (kHeadDim / 16);  // 512
+  const bool all_ring = (k0 + kBlockN <= past);
+  const bool all_cur = (k0 >= past) && (k0 + kBlockN <= seqlen_k);
 #pragma unroll
   for (int idx = tid; idx < kTotalChunks; idx += THREADS) {
-    const int row = idx >> 3;         // 0..63
-    const int col = (idx & 7) << 4;   // 0, 16, ..., 112
-    const int key = k0 + row;
-    const bool valid = (key >= 0) && (key < seqlen_k);
-    const int src_bytes = valid ? 16 : 0;
-    const uint8_t* k_src;
-    const uint8_t* v_src;
-    if (key < past) {
+    const int row = idx >> 3;        // 0..63
+    const int c16 = idx & 7;         // 0..7
+    const int col = c16 << 4;        // 0, 16, ..., 112
+    const int k_swiz = swizzle_fp8_c16(row, c16);
+    const int v_row = permute_v_row_16(row);
+    const int v_swiz = swizzle_fp8_c16(v_row, c16);
+    if (all_ring) {
+      const int key = k0 + row;
       const int64_t off = (static_cast<int64_t>(key & (kSwaRing - 1)) << 7) + col;
-      k_src = ring_k_base + off;
-      v_src = ring_v_base + off;
-    } else {
-      const int cur_tok = valid ? (key - past) : 0;
+      cp_async_cg_16(&smem_k_swiz[row * 8 + k_swiz], ring_k_base + off, 16);
+      cp_async_cg_16(&smem_v_swiz[v_row * 8 + v_swiz], ring_v_base + off, 16);
+    } else if (all_cur) {
+      const int cur_tok = (k0 - past) + row;
       const int64_t off = static_cast<int64_t>(cur_tok) * (kKvHeads * kHeadDim) + col;
-      k_src = kcur_head_base + off;
-      v_src = vcur_head_base + off;
+      cp_async_cg_16(&smem_k_swiz[row * 8 + k_swiz], kcur_head_base + off, 16);
+      cp_async_cg_16(&smem_v_swiz[v_row * 8 + v_swiz], vcur_head_base + off, 16);
+    } else {
+      const int key = k0 + row;
+      const bool valid = (key >= 0) && (key < seqlen_k);
+      const int src_bytes = valid ? 16 : 0;
+      const uint8_t* k_src;
+      const uint8_t* v_src;
+      if (key < past) {
+        const int64_t off = (static_cast<int64_t>(key & (kSwaRing - 1)) << 7) + col;
+        k_src = ring_k_base + off;
+        v_src = ring_v_base + off;
+      } else {
+        const int cur_tok = valid ? (key - past) : 0;
+        const int64_t off = static_cast<int64_t>(cur_tok) * (kKvHeads * kHeadDim) + col;
+        k_src = kcur_head_base + off;
+        v_src = vcur_head_base + off;
+      }
+      cp_async_cg_16(&smem_k_swiz[row * 8 + k_swiz], k_src, src_bytes);
+      cp_async_cg_16(&smem_v_swiz[v_row * 8 + v_swiz], v_src, src_bytes);
     }
-    cp_async_cg_16(smem_k_fp8 + row * kHeadDim + col, k_src, src_bytes);
-    cp_async_cg_16(smem_v_fp8 + row * kHeadDim + col, v_src, src_bytes);
   }
 }
 
-// Cooperatively convert [32, 128] FP8 smem -> swizzled [32, 128] BF16 smem (8 elements per uint4 store).
-template <int THREADS>
-__device__ __forceinline__ void dequant_fp8_32_to_swizzled_bf16(
-    const uint8_t* __restrict__ src_fp8,
-    uint4* __restrict__ dst_bf16_swizzled,
+// Cooperatively issue coalesced 16B cp.async.cg for Rel[block_m0..+BLOCK_M-1, head, d_align..+71].
+template <int THREADS, int BLOCK_M>
+__device__ __forceinline__ void load_swa_rel_stage(
+    bf16* __restrict__ smem_rel,
+    const bf16* __restrict__ Rel,
+    int block_m0,
+    int head,
+    int past,
+    int k0,
+    int num_tokens,
     int tid) {
-  // 32 rows x 16 chunks of 8 elements (16B in bf16, 8B in fp8) = 512 chunks.
-  constexpr int kTotalChunks = 32 * (kHeadDim / 8);  // 512
+  constexpr int kChunksPerRow = 9;  // 9 * 8 bf16 = 72 bf16 = 144 B
+  constexpr int kTotalChunks = BLOCK_M * kChunksPerRow;
+  const int rel_head_off = head * kRelExtent;
 #pragma unroll
   for (int idx = tid; idx < kTotalChunks; idx += THREADS) {
-    const int row = idx >> 4;        // 0..31
-    const int c16 = idx & 15;        // 0..15 (8 bf16s = 16 bytes)
-    const uint64_t raw8 = *reinterpret_cast<const uint64_t*>(src_fp8 + row * kHeadDim + (c16 << 3));
-    uint4 out;
-    out.x = cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(raw8));
-    out.y = cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(raw8 >> 16));
-    out.z = cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(raw8 >> 32));
-    out.w = cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(raw8 >> 48));
-    dst_bf16_swizzled[row * 16 + swizzle_c16(row, c16)] = out;
+    const int rm = idx / kChunksPerRow;
+    const int ch = idx - rm * kChunksPerRow;
+    const int tok = block_m0 + rm;
+    const int d_lo = (past + tok) - (k0 + kBlockN - 1);
+    const int d_align = d_lo & ~7;
+    const int d_c = d_align + (ch << 3);
+    const bool ok = (tok < num_tokens) && (static_cast<unsigned>(d_c) < static_cast<unsigned>(kRelExtent));
+    const int safe_tok = (tok < num_tokens) ? tok : 0;
+    const int safe_dc = ok ? d_c : 0;
+    const bf16* src = Rel + static_cast<int64_t>(safe_tok) * (kHeads * kRelExtent) + rel_head_off + safe_dc;
+    cp_async_cg_16(smem_rel + rm * kRelRow + (ch << 3), src, ok ? 16 : 0);
   }
 }
 
-template <int NUM_WARPS>
+template <int NUM_WARPS, int REL_STAGES>
 __device__ __forceinline__ void run_swa_prefill_impl(
     const bf16* __restrict__ Q,
     const uint8_t* __restrict__ SeqState,
@@ -189,6 +221,7 @@ __device__ __forceinline__ void run_swa_prefill_impl(
     float v_scale) {
   constexpr int THREADS = NUM_WARPS * 32;
   constexpr int BLOCK_M = NUM_WARPS * 16;
+  constexpr int kRelStageBytes = BLOCK_M * kRelRow * static_cast<int>(sizeof(bf16));
 
   const int tid = threadIdx.x;
   const int warp = tid >> 5;
@@ -209,7 +242,8 @@ __device__ __forceinline__ void run_swa_prefill_impl(
 
   const int line = Lines[0];
   if (line <= 0) {
-    // Null seq_state line -> zero output.
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     const int d_col = tig * 2;
     const uint32_t zero2 = 0u;
     if (valid0) {
@@ -239,14 +273,12 @@ __device__ __forceinline__ void run_swa_prefill_impl(
   const int n_lo = k_lo / kBlockN;
   const int n_hi = (k_hi + kBlockN - 1) / kBlockN;
 
-  // Dynamic shared memory layout (48 KB total for both m64 and m128):
-  //   k_fp8[stage]    = smem + (stage << 13)         (2 x 8 KB = 16 KB)
-  //   v_fp8[stage]    = smem + 16384 + (stage << 13) (2 x 8 KB = 16 KB)
-  //   k_bf16[32*128]  = smem + 32768                 (8 KB, swizzled)
-  //   v_bf16[32*128]  = smem + 40960                 (8 KB, swizzled)
+  // Dynamic shared memory layout (zero SMEM FP8->BF16 dequantization!):
+  //   kv[stage=0..1]: 2 * (8 KB K + 8 KB V) = 32 KB (smem + stage * 16384)
+  //   rel[0..REL_STAGES-1]: REL_STAGES * BLOCK_M * 72 * 2 B (smem + 32768 + s * kRelStageBytes)
+  //   m128 (REL_STAGES=2): 32768 + 36864 = 69,632 B (1 CTA/SM, 8 warps/SM)
+  //   m64  (REL_STAGES=1): 32768 +  9216 = 41,984 B (2 CTAs/SM, 8 warps/SM)
   extern __shared__ __align__(16) uint8_t smem[];
-  uint4* k_bf16_swiz = reinterpret_cast<uint4*>(smem + 32768);
-  uint4* v_bf16_swiz = reinterpret_cast<uint4*>(smem + 40960);
 
   const uint8_t* ring_k_base = SeqState + static_cast<int64_t>(line) * kSeqStateBytes + static_cast<int64_t>(kv_head) * kSwaHeadRingBytes;
   const uint8_t* ring_v_base = ring_k_base + kSwaHalfVisitBytes;
@@ -255,18 +287,33 @@ __device__ __forceinline__ void run_swa_prefill_impl(
 
   asm volatile("griddepcontrol.wait;" ::: "memory");
 
-  // Load Q [16, 128] for this warp directly into BF16 MMA registers q_reg[8][4] (zero conversion!).
+  // Prime stage 0 (KV + Rel) BEFORE loading Q into registers to hide latency.
+  if (n_lo < n_hi) {
+    const int k0_first = n_lo * kBlockN;
+    load_swa_kv_stage_swizzled<THREADS>(
+        reinterpret_cast<uint4*>(smem),
+        reinterpret_cast<uint4*>(smem + 8192),
+        ring_k_base, ring_v_base, kcur_head_base, vcur_head_base,
+        k0_first, past, seqlen_k, tid);
+    load_swa_rel_stage<THREADS, BLOCK_M>(
+        reinterpret_cast<bf16*>(smem + 32768),
+        Rel, block_m0, head, past, k0_first, num_tokens, tid);
+    cp_async_commit();
+  }
+
+  // Load Q [16, 128] BF16 directly into registers matching in-register FP8->BF16 K layout.
   uint32_t q_reg[8][4];
   const bf16* q_row0 = valid0 ? (Q + static_cast<int64_t>(r0) * (kHeads * kHeadDim) + head * kHeadDim) : nullptr;
   const bf16* q_row1 = valid1 ? (Q + static_cast<int64_t>(r1) * (kHeads * kHeadDim) + head * kHeadDim) : nullptr;
 #pragma unroll
   for (int ks = 0; ks < 8; ++ks) {
-    const int d0 = ks * 16 + tig * 2;
-    const int d1 = d0 + 8;
-    q_reg[ks][0] = valid0 ? *reinterpret_cast<const uint32_t*>(q_row0 + d0) : 0u;
-    q_reg[ks][1] = valid1 ? *reinterpret_cast<const uint32_t*>(q_row1 + d0) : 0u;
-    q_reg[ks][2] = valid0 ? *reinterpret_cast<const uint32_t*>(q_row0 + d1) : 0u;
-    q_reg[ks][3] = valid1 ? *reinterpret_cast<const uint32_t*>(q_row1 + d1) : 0u;
+    const int d_base = ks * 16 + tig * 4;
+    uint2 qv0 = valid0 ? *reinterpret_cast<const uint2*>(q_row0 + d_base) : make_uint2(0u, 0u);
+    uint2 qv1 = valid1 ? *reinterpret_cast<const uint2*>(q_row1 + d_base) : make_uint2(0u, 0u);
+    q_reg[ks][0] = qv0.x;
+    q_reg[ks][1] = qv1.x;
+    q_reg[ks][2] = qv0.y;
+    q_reg[ks][3] = qv1.y;
   }
 
   float acc[16][4];
@@ -287,34 +334,30 @@ __device__ __forceinline__ void run_swa_prefill_impl(
   const int pos1 = past + r1;
   const int warp_pos_lo = past + m0;
   const int warp_pos_hi = past + min(m0 + 16, num_tokens) - 1;
-  const bf16* rel_row0 = valid0 ? (Rel + static_cast<int64_t>(r0) * (kHeads * kRelExtent) + head * kRelExtent) : nullptr;
-  const bf16* rel_row1 = valid1 ? (Rel + static_cast<int64_t>(r1) * (kHeads * kRelExtent) + head * kRelExtent) : nullptr;
-
-  // Prime pipeline stage 0.
-  if (n_lo < n_hi) {
-    load_swa_kv_stage<THREADS>(
-        smem, smem + 16384,
-        ring_k_base, ring_v_base, kcur_head_base, vcur_head_base,
-        n_lo * kBlockN, past, seqlen_k, tid);
-    cp_async_commit();
-  }
+  const int rm0 = warp * 16 + gid;
+  const int rm1 = rm0 + 8;
 
   const int k_ld_row_off = ((lane >> 4) << 3) + (lane & 7);
   const int k_ld_c16_off = (lane >> 3) & 1;
-  const int v_ld_row_off = lane & 15;
-  const int v_ld_c16_off = lane >> 4;
 
   for (int n = n_lo; n < n_hi; ++n) {
     const int stage = (n - n_lo) & 1;
     const int next_stage = stage ^ 1;
     const int k0 = n * kBlockN;
 
-    // Issue async copy for next tile (overlapped with current tile's compute).
+    // Issue next tile's KV (+ Rel if double-buffered) overlapped with current tile's compute!
     if (n + 1 < n_hi) {
-      load_swa_kv_stage<THREADS>(
-          smem + (next_stage << 13), smem + 16384 + (next_stage << 13),
+      const int k0_next = (n + 1) * kBlockN;
+      load_swa_kv_stage_swizzled<THREADS>(
+          reinterpret_cast<uint4*>(smem + next_stage * 16384),
+          reinterpret_cast<uint4*>(smem + next_stage * 16384 + 8192),
           ring_k_base, ring_v_base, kcur_head_base, vcur_head_base,
-          (n + 1) * kBlockN, past, seqlen_k, tid);
+          k0_next, past, seqlen_k, tid);
+      if constexpr (REL_STAGES == 2) {
+        load_swa_rel_stage<THREADS, BLOCK_M>(
+            reinterpret_cast<bf16*>(smem + 32768 + next_stage * kRelStageBytes),
+            Rel, block_m0, head, past, k0_next, num_tokens, tid);
+      }
       cp_async_commit();
       cp_async_wait<1>();
     } else {
@@ -322,181 +365,228 @@ __device__ __forceinline__ void run_swa_prefill_impl(
     }
     __syncthreads();
 
-    // Process two 32-col sub-tiles (matches baseline BLOCK_N=32 softmax order & halves live s regs).
+    const uint4* k_swiz = reinterpret_cast<const uint4*>(smem + stage * 16384);
+    const uint4* v_swiz = reinterpret_cast<const uint4*>(smem + stage * 16384 + 8192);
+    const bf16* rel_cur = reinterpret_cast<const bf16*>(
+        smem + 32768 + ((REL_STAGES == 2) ? (stage * kRelStageBytes) : 0));
+
+    // Warp-level skip if none of this warp's 16 query rows can attend to [k0 .. k0+63].
+    const bool warp_active =
+        (m0 < num_tokens) &&
+        (k0 <= warp_pos_hi) &&
+        (k0 + kBlockN - 1 >= warp_pos_lo - (kSwaWindow - 1));
+
+    const int sh0 = (pos0 - (k0 + kBlockN - 1)) & 7;
+    const int sh1 = (pos1 - (k0 + kBlockN - 1)) & 7;
+    const bf16* srel0 = rel_cur + rm0 * kRelRow + sh0;
+    const bf16* srel1 = rel_cur + rm1 * kRelRow + sh1;
+
+    // Process two 32-key sub-tiles (matches baseline BLOCK_N=32 softmax order & halves live s/pa regs!).
 #pragma unroll
     for (int half = 0; half < 2; ++half) {
       const int k_sub = k0 + half * 32;
-      if (half > 0) {
-        __syncthreads();
-      }
-      // Cooperatively dequantize 32 rows of K and V from FP8 -> swizzled BF16 SMEM.
-      dequant_fp8_32_to_swizzled_bf16<THREADS>(smem + (stage << 13) + (half << 12), k_bf16_swiz, tid);
-      dequant_fp8_32_to_swizzled_bf16<THREADS>(smem + 16384 + (stage << 13) + (half << 12), v_bf16_swiz, tid);
-      __syncthreads();
-
-      // 1. Q @ K^T -> s[4][4] (16 x 32)
-      float s[4][4];
-#pragma unroll
-      for (int ni = 0; ni < 4; ++ni) {
-        s[ni][0] = 0.0f;
-        s[ni][1] = 0.0f;
-        s[ni][2] = 0.0f;
-        s[ni][3] = 0.0f;
-      }
-
-#pragma unroll
-      for (int ks = 0; ks < 8; ++ks) {
-        const int c16_base = ks * 2 + k_ld_c16_off;
-#pragma unroll
-        for (int np = 0; np < 2; ++np) {
-          const int r = np * 16 + k_ld_row_off;
-          uint32_t b0, b1, b2, b3;
-          ldmatrix_x4(b0, b1, b2, b3, &k_bf16_swiz[r * 16 + swizzle_c16(r, c16_base)]);
-          mma_m16n8k16_bf16(
-              s[np * 2][0], s[np * 2][1], s[np * 2][2], s[np * 2][3],
-              q_reg[ks][0], q_reg[ks][1], q_reg[ks][2], q_reg[ks][3],
-              b0, b1);
-          mma_m16n8k16_bf16(
-              s[np * 2 + 1][0], s[np * 2 + 1][1], s[np * 2 + 1][2], s[np * 2 + 1][3],
-              q_reg[ks][0], q_reg[ks][1], q_reg[ks][2], q_reg[ks][3],
-              b2, b3);
-        }
-      }
-
-      // 2. Scale + Rel bias + causal/window mask
-      const bool all_visible =
-          (k_sub + 31 <= warp_pos_lo) &&
-          (warp_pos_hi - k_sub < kSwaWindow) &&
-          (k_sub + 32 <= seqlen_k) &&
-          (m0 + 16 <= num_tokens);
-
-      if (all_visible) {
-#pragma unroll
-        for (int ni = 0; ni < 4; ++ni) {
-          const int col0 = k_sub + ni * 8 + tig * 2;
-          const int d0 = pos0 - col0;
-          const int d1 = pos1 - col0;
-          const float b00 = __bfloat162float(__ldg(rel_row0 + d0));
-          const float b01 = __bfloat162float(__ldg(rel_row0 + d0 - 1));
-          const float b10 = __bfloat162float(__ldg(rel_row1 + d1));
-          const float b11 = __bfloat162float(__ldg(rel_row1 + d1 - 1));
-          s[ni][0] = __fmaf_rn(s[ni][0], qk_scale, __fmul_rn(b00, kLog2E));
-          s[ni][1] = __fmaf_rn(s[ni][1], qk_scale, __fmul_rn(b01, kLog2E));
-          s[ni][2] = __fmaf_rn(s[ni][2], qk_scale, __fmul_rn(b10, kLog2E));
-          s[ni][3] = __fmaf_rn(s[ni][3], qk_scale, __fmul_rn(b11, kLog2E));
-        }
-      } else {
-#pragma unroll
-        for (int ni = 0; ni < 4; ++ni) {
-          const int col0 = k_sub + ni * 8 + tig * 2;
-          const int col1 = col0 + 1;
-          const bool kv0 = (col0 < seqlen_k);
-          const bool kv1 = (col1 < seqlen_k);
-
-          const int d00 = pos0 - col0;
-          const int d01 = pos0 - col1;
-          const bool vis00 = kv0 && (static_cast<unsigned>(d00) < static_cast<unsigned>(kSwaWindow));
-          const bool vis01 = kv1 && (static_cast<unsigned>(d01) < static_cast<unsigned>(kSwaWindow));
-          if (vis00) {
-            float b = valid0 ? __bfloat162float(__ldg(rel_row0 + d00)) : 0.0f;
-            s[ni][0] = __fmaf_rn(s[ni][0], qk_scale, __fmul_rn(b, kLog2E));
-          } else {
-            s[ni][0] = -INFINITY;
-          }
-          if (vis01) {
-            float b = valid0 ? __bfloat162float(__ldg(rel_row0 + d01)) : 0.0f;
-            s[ni][1] = __fmaf_rn(s[ni][1], qk_scale, __fmul_rn(b, kLog2E));
-          } else {
-            s[ni][1] = -INFINITY;
-          }
-
-          const int d10 = pos1 - col0;
-          const int d11 = pos1 - col1;
-          const bool vis10 = kv0 && (static_cast<unsigned>(d10) < static_cast<unsigned>(kSwaWindow));
-          const bool vis11 = kv1 && (static_cast<unsigned>(d11) < static_cast<unsigned>(kSwaWindow));
-          if (vis10) {
-            float b = valid1 ? __bfloat162float(__ldg(rel_row1 + d10)) : 0.0f;
-            s[ni][2] = __fmaf_rn(s[ni][2], qk_scale, __fmul_rn(b, kLog2E));
-          } else {
-            s[ni][2] = -INFINITY;
-          }
-          if (vis11) {
-            float b = valid1 ? __bfloat162float(__ldg(rel_row1 + d11)) : 0.0f;
-            s[ni][3] = __fmaf_rn(s[ni][3], qk_scale, __fmul_rn(b, kLog2E));
-          } else {
-            s[ni][3] = -INFINITY;
-          }
-        }
-      }
-
-      // 3. Online softmax + P @ V for this 32-col sub-tile
-      float row_max0 = m_i0;
-      float row_max1 = m_i1;
-#pragma unroll
-      for (int j = 0; j < 4; ++j) {
-        row_max0 = fmaxf(row_max0, fmaxf(s[j][0], s[j][1]));
-        row_max1 = fmaxf(row_max1, fmaxf(s[j][2], s[j][3]));
-      }
-      row_max0 = fmaxf(row_max0, __shfl_xor_sync(0xffffffffu, row_max0, 1));
-      row_max0 = fmaxf(row_max0, __shfl_xor_sync(0xffffffffu, row_max0, 2));
-      row_max1 = fmaxf(row_max1, __shfl_xor_sync(0xffffffffu, row_max1, 1));
-      row_max1 = fmaxf(row_max1, __shfl_xor_sync(0xffffffffu, row_max1, 2));
-
-      const float m_safe0 = (row_max0 == -INFINITY) ? 0.0f : row_max0;
-      const float m_safe1 = (row_max1 == -INFINITY) ? 0.0f : row_max1;
-      const float alpha0 = ex2_approx(m_i0 - m_safe0);
-      const float alpha1 = ex2_approx(m_i1 - m_safe1);
-      m_i0 = row_max0;
-      m_i1 = row_max1;
+      const bool sub_active =
+          warp_active &&
+          (k_sub <= warp_pos_hi) &&
+          (k_sub + 31 >= warp_pos_lo - (kSwaWindow - 1));
 
       uint32_t pa[2][4];
-      float psum0 = 0.0f;
-      float psum1 = 0.0f;
-#pragma unroll
-      for (int kp_sub = 0; kp_sub < 2; ++kp_sub) {
-        const float p00 = ex2_approx(s[kp_sub * 2][0] - m_safe0);
-        const float p01 = ex2_approx(s[kp_sub * 2][1] - m_safe0);
-        const float p02 = ex2_approx(s[kp_sub * 2][2] - m_safe1);
-        const float p03 = ex2_approx(s[kp_sub * 2][3] - m_safe1);
-        const float p10 = ex2_approx(s[kp_sub * 2 + 1][0] - m_safe0);
-        const float p11 = ex2_approx(s[kp_sub * 2 + 1][1] - m_safe0);
-        const float p12 = ex2_approx(s[kp_sub * 2 + 1][2] - m_safe1);
-        const float p13 = ex2_approx(s[kp_sub * 2 + 1][3] - m_safe1);
-        psum0 += (p00 + p01) + (p10 + p11);
-        psum1 += (p02 + p03) + (p12 + p13);
-        pa[kp_sub][0] = pack_f32x2_to_bf16x2(p00, p01);
-        pa[kp_sub][1] = pack_f32x2_to_bf16x2(p02, p03);
-        pa[kp_sub][2] = pack_f32x2_to_bf16x2(p10, p11);
-        pa[kp_sub][3] = pack_f32x2_to_bf16x2(p12, p13);
-      }
-      psum0 += __shfl_xor_sync(0xffffffffu, psum0, 1);
-      psum0 += __shfl_xor_sync(0xffffffffu, psum0, 2);
-      psum1 += __shfl_xor_sync(0xffffffffu, psum1, 1);
-      psum1 += __shfl_xor_sync(0xffffffffu, psum1, 2);
-      l_i0 = __fmaf_rn(l_i0, alpha0, psum0);
-      l_i1 = __fmaf_rn(l_i1, alpha1, psum1);
+      float alpha0 = 1.0f;
+      float alpha1 = 1.0f;
 
-      const int r_k0 = v_ld_row_off;
-      const int r_k1 = 16 + v_ld_row_off;
+      if (sub_active) {
+        // 1. Q @ K^T -> s[4][4] (16 x 32) via ldmatrix_x4 on FP8 K + 1-instr cvt.rn.bf16x2.e4m3x2
+        float s[4][4];
 #pragma unroll
-      for (int dp = 0; dp < 8; ++dp) {
-        const int c16 = dp * 2 + v_ld_c16_off;
-        acc[dp * 2][0] = __fmul_rn(acc[dp * 2][0], alpha0);
-        acc[dp * 2][1] = __fmul_rn(acc[dp * 2][1], alpha0);
-        acc[dp * 2][2] = __fmul_rn(acc[dp * 2][2], alpha1);
-        acc[dp * 2][3] = __fmul_rn(acc[dp * 2][3], alpha1);
-        acc[dp * 2 + 1][0] = __fmul_rn(acc[dp * 2 + 1][0], alpha0);
-        acc[dp * 2 + 1][1] = __fmul_rn(acc[dp * 2 + 1][1], alpha0);
-        acc[dp * 2 + 1][2] = __fmul_rn(acc[dp * 2 + 1][2], alpha1);
-        acc[dp * 2 + 1][3] = __fmul_rn(acc[dp * 2 + 1][3], alpha1);
-        uint32_t vb0, vb1, vb2, vb3;
-        ldmatrix_x4_trans(vb0, vb1, vb2, vb3, &v_bf16_swiz[r_k0 * 16 + swizzle_c16(r_k0, c16)]);
-        mma_m16n8k16_bf16(acc[dp * 2][0], acc[dp * 2][1], acc[dp * 2][2], acc[dp * 2][3], pa[0][0], pa[0][1], pa[0][2], pa[0][3], vb0, vb1);
-        mma_m16n8k16_bf16(acc[dp * 2 + 1][0], acc[dp * 2 + 1][1], acc[dp * 2 + 1][2], acc[dp * 2 + 1][3], pa[0][0], pa[0][1], pa[0][2], pa[0][3], vb2, vb3);
-        ldmatrix_x4_trans(vb0, vb1, vb2, vb3, &v_bf16_swiz[r_k1 * 16 + swizzle_c16(r_k1, c16)]);
-        mma_m16n8k16_bf16(acc[dp * 2][0], acc[dp * 2][1], acc[dp * 2][2], acc[dp * 2][3], pa[1][0], pa[1][1], pa[1][2], pa[1][3], vb0, vb1);
-        mma_m16n8k16_bf16(acc[dp * 2 + 1][0], acc[dp * 2 + 1][1], acc[dp * 2 + 1][2], acc[dp * 2 + 1][3], pa[1][0], pa[1][1], pa[1][2], pa[1][3], vb2, vb3);
+        for (int np_l = 0; np_l < 2; ++np_l) {
+          const int np = half * 2 + np_l;
+          float s0_0 = 0.0f, s0_1 = 0.0f, s0_2 = 0.0f, s0_3 = 0.0f;
+          float s1_0 = 0.0f, s1_1 = 0.0f, s1_2 = 0.0f, s1_3 = 0.0f;
+          const int r = np * 16 + k_ld_row_off;
+#pragma unroll
+          for (int ks2 = 0; ks2 < 4; ++ks2) {
+            const int c16_base = ks2 * 2 + k_ld_c16_off;
+            uint32_t b0, b1, b2, b3;
+            ldmatrix_x4(b0, b1, b2, b3, &k_swiz[r * 8 + swizzle_fp8_c16(r, c16_base)]);
+
+            const int ks_lo = ks2 * 2;
+            const int ks_hi = ks_lo + 1;
+
+            mma_m16n8k16_bf16(s0_0, s0_1, s0_2, s0_3,
+                              q_reg[ks_lo][0], q_reg[ks_lo][1], q_reg[ks_lo][2], q_reg[ks_lo][3],
+                              cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(b0)),
+                              cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(b0 >> 16)));
+            mma_m16n8k16_bf16(s1_0, s1_1, s1_2, s1_3,
+                              q_reg[ks_lo][0], q_reg[ks_lo][1], q_reg[ks_lo][2], q_reg[ks_lo][3],
+                              cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(b2)),
+                              cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(b2 >> 16)));
+            mma_m16n8k16_bf16(s0_0, s0_1, s0_2, s0_3,
+                              q_reg[ks_hi][0], q_reg[ks_hi][1], q_reg[ks_hi][2], q_reg[ks_hi][3],
+                              cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(b1)),
+                              cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(b1 >> 16)));
+            mma_m16n8k16_bf16(s1_0, s1_1, s1_2, s1_3,
+                              q_reg[ks_hi][0], q_reg[ks_hi][1], q_reg[ks_hi][2], q_reg[ks_hi][3],
+                              cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(b3)),
+                              cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(b3 >> 16)));
+          }
+          s[np_l * 2][0] = s0_0;
+          s[np_l * 2][1] = s0_1;
+          s[np_l * 2][2] = s0_2;
+          s[np_l * 2][3] = s0_3;
+          s[np_l * 2 + 1][0] = s1_0;
+          s[np_l * 2 + 1][1] = s1_1;
+          s[np_l * 2 + 1][2] = s1_2;
+          s[np_l * 2 + 1][3] = s1_3;
+        }
+
+        // 2. Scale + SMEM Rel bias + causal/window mask + row max
+        const bool all_visible =
+            (k_sub + 31 <= warp_pos_lo) &&
+            (warp_pos_hi - k_sub < kSwaWindow) &&
+            (k_sub + 32 <= seqlen_k) &&
+            (m0 + 16 <= num_tokens);
+
+        float row_max0 = m_i0;
+        float row_max1 = m_i1;
+
+        if (all_visible) {
+#pragma unroll
+          for (int ni = 0; ni < 4; ++ni) {
+            const int rev0 = (kBlockN - 1) - (half * 32 + ni * 8 + tig * 2);
+            const int rev1 = rev0 - 1;
+            const float b00 = __bfloat162float(srel0[rev0]);
+            const float b01 = __bfloat162float(srel0[rev1]);
+            const float b10 = __bfloat162float(srel1[rev0]);
+            const float b11 = __bfloat162float(srel1[rev1]);
+            s[ni][0] = __fmaf_rn(s[ni][0], qk_scale, __fmul_rn(b00, kLog2E));
+            s[ni][1] = __fmaf_rn(s[ni][1], qk_scale, __fmul_rn(b01, kLog2E));
+            s[ni][2] = __fmaf_rn(s[ni][2], qk_scale, __fmul_rn(b10, kLog2E));
+            s[ni][3] = __fmaf_rn(s[ni][3], qk_scale, __fmul_rn(b11, kLog2E));
+            row_max0 = fmaxf(row_max0, fmaxf(s[ni][0], s[ni][1]));
+            row_max1 = fmaxf(row_max1, fmaxf(s[ni][2], s[ni][3]));
+          }
+        } else {
+#pragma unroll
+          for (int ni = 0; ni < 4; ++ni) {
+            const int col_local0 = half * 32 + ni * 8 + tig * 2;
+            const int col0 = k0 + col_local0;
+            const int col1 = col0 + 1;
+            const int rev0 = (kBlockN - 1) - col_local0;
+            const int rev1 = rev0 - 1;
+            const bool kv0 = (col0 < seqlen_k);
+            const bool kv1 = (col1 < seqlen_k);
+
+            const int d00 = pos0 - col0;
+            const int d01 = pos0 - col1;
+            const bool vis00 = kv0 && (static_cast<unsigned>(d00) < static_cast<unsigned>(kSwaWindow));
+            const bool vis01 = kv1 && (static_cast<unsigned>(d01) < static_cast<unsigned>(kSwaWindow));
+            s[ni][0] = vis00 ? __fmaf_rn(s[ni][0], qk_scale, __fmul_rn(__bfloat162float(srel0[rev0]), kLog2E)) : -INFINITY;
+            s[ni][1] = vis01 ? __fmaf_rn(s[ni][1], qk_scale, __fmul_rn(__bfloat162float(srel0[rev1]), kLog2E)) : -INFINITY;
+
+            const int d10 = pos1 - col0;
+            const int d11 = pos1 - col1;
+            const bool vis10 = kv0 && (static_cast<unsigned>(d10) < static_cast<unsigned>(kSwaWindow));
+            const bool vis11 = kv1 && (static_cast<unsigned>(d11) < static_cast<unsigned>(kSwaWindow));
+            s[ni][2] = vis10 ? __fmaf_rn(s[ni][2], qk_scale, __fmul_rn(__bfloat162float(srel1[rev0]), kLog2E)) : -INFINITY;
+            s[ni][3] = vis11 ? __fmaf_rn(s[ni][3], qk_scale, __fmul_rn(__bfloat162float(srel1[rev1]), kLog2E)) : -INFINITY;
+
+            row_max0 = fmaxf(row_max0, fmaxf(s[ni][0], s[ni][1]));
+            row_max1 = fmaxf(row_max1, fmaxf(s[ni][2], s[ni][3]));
+          }
+        }
+
+        // 3. Exact online softmax -> BF16 P registers pa[2][4]
+        row_max0 = fmaxf(row_max0, __shfl_xor_sync(0xffffffffu, row_max0, 1));
+        row_max0 = fmaxf(row_max0, __shfl_xor_sync(0xffffffffu, row_max0, 2));
+        row_max1 = fmaxf(row_max1, __shfl_xor_sync(0xffffffffu, row_max1, 1));
+        row_max1 = fmaxf(row_max1, __shfl_xor_sync(0xffffffffu, row_max1, 2));
+
+        const float m_safe0 = (row_max0 == -INFINITY) ? 0.0f : row_max0;
+        const float m_safe1 = (row_max1 == -INFINITY) ? 0.0f : row_max1;
+        alpha0 = ex2_approx(m_i0 - m_safe0);
+        alpha1 = ex2_approx(m_i1 - m_safe1);
+        m_i0 = row_max0;
+        m_i1 = row_max1;
+
+        float psum0 = 0.0f;
+        float psum1 = 0.0f;
+#pragma unroll
+        for (int kp = 0; kp < 2; ++kp) {
+          const float p00 = ex2_approx(s[kp * 2][0] - m_safe0);
+          const float p01 = ex2_approx(s[kp * 2][1] - m_safe0);
+          const float p02 = ex2_approx(s[kp * 2][2] - m_safe1);
+          const float p03 = ex2_approx(s[kp * 2][3] - m_safe1);
+          const float p10 = ex2_approx(s[kp * 2 + 1][0] - m_safe0);
+          const float p11 = ex2_approx(s[kp * 2 + 1][1] - m_safe0);
+          const float p12 = ex2_approx(s[kp * 2 + 1][2] - m_safe1);
+          const float p13 = ex2_approx(s[kp * 2 + 1][3] - m_safe1);
+          psum0 += (p00 + p01) + (p10 + p11);
+          psum1 += (p02 + p03) + (p12 + p13);
+          pa[kp][0] = pack_f32x2_to_bf16x2(p00, p01);
+          pa[kp][1] = pack_f32x2_to_bf16x2(p02, p03);
+          pa[kp][2] = pack_f32x2_to_bf16x2(p10, p11);
+          pa[kp][3] = pack_f32x2_to_bf16x2(p12, p13);
+        }
+        psum0 += __shfl_xor_sync(0xffffffffu, psum0, 1);
+        psum0 += __shfl_xor_sync(0xffffffffu, psum0, 2);
+        psum1 += __shfl_xor_sync(0xffffffffu, psum1, 1);
+        psum1 += __shfl_xor_sync(0xffffffffu, psum1, 2);
+        l_i0 = __fmaf_rn(l_i0, alpha0, psum0);
+        l_i1 = __fmaf_rn(l_i1, alpha1, psum1);
       }
+
+      // For single-buffered Rel (m64, 2 CTAs/SM), prefetch Rel_{n+1} during half==1 P @ V!
+      if constexpr (REL_STAGES == 1) {
+        if (half == 1 && (n + 1 < n_hi)) {
+          __syncthreads();
+          load_swa_rel_stage<THREADS, BLOCK_M>(
+              reinterpret_cast<bf16*>(smem + 32768),
+              Rel, block_m0, head, past, (n + 1) * kBlockN, num_tokens, tid);
+          cp_async_commit();
+        }
+      }
+
+      if (sub_active) {
+        const bool need_rescale = __any_sync(0xffffffffu, (alpha0 != 1.0f) || (alpha1 != 1.0f));
+        if (need_rescale) {
+#pragma unroll
+          for (int di = 0; di < 16; ++di) {
+            acc[di][0] = __fmul_rn(acc[di][0], alpha0);
+            acc[di][1] = __fmul_rn(acc[di][1], alpha0);
+            acc[di][2] = __fmul_rn(acc[di][2], alpha1);
+            acc[di][3] = __fmul_rn(acc[di][3], alpha1);
+          }
+        }
+
+        // 4. P @ V via hardware ldmatrix.m16n16.x2.trans.b8 + 1-instr cvt.rn.bf16x2.e4m3x2
+        const int v_base_row = half * 32 + lane;
+#pragma unroll
+        for (int dp = 0; dp < 8; ++dp) {
+          const int swiz_d = swizzle_fp8_c16(lane, dp);
+          uint32_t vb0, vb1, vb2, vb3;
+          ldmatrix_x2_trans_b8(vb0, vb1, vb2, vb3, &v_swiz[v_base_row * 8 + swiz_d]);
+          mma_m16n8k16_bf16(acc[dp * 2][0], acc[dp * 2][1], acc[dp * 2][2], acc[dp * 2][3],
+                            pa[0][0], pa[0][1], pa[0][2], pa[0][3],
+                            cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(vb0)),
+                            cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(vb0 >> 16)));
+          mma_m16n8k16_bf16(acc[dp * 2 + 1][0], acc[dp * 2 + 1][1], acc[dp * 2 + 1][2], acc[dp * 2 + 1][3],
+                            pa[0][0], pa[0][1], pa[0][2], pa[0][3],
+                            cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(vb1)),
+                            cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(vb1 >> 16)));
+          mma_m16n8k16_bf16(acc[dp * 2][0], acc[dp * 2][1], acc[dp * 2][2], acc[dp * 2][3],
+                            pa[1][0], pa[1][1], pa[1][2], pa[1][3],
+                            cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(vb2)),
+                            cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(vb2 >> 16)));
+          mma_m16n8k16_bf16(acc[dp * 2 + 1][0], acc[dp * 2 + 1][1], acc[dp * 2 + 1][2], acc[dp * 2 + 1][3],
+                            pa[1][0], pa[1][1], pa[1][2], pa[1][3],
+                            cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(vb3)),
+                            cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(vb3 >> 16)));
+        }
+      }
+    }
+
+    if (n + 1 < n_hi) {
+      __syncthreads();
     }
   }
 
@@ -544,7 +634,7 @@ __device__ __forceinline__ void run_swa_prefill_impl(
 
 }  // namespace
 
-// BLOCK_M=128, BLOCK_N=64, 8 warps (256 threads), 48 KB dynamic SMEM.
+// BLOCK_M=128, BLOCK_N=64, 8 warps (256 threads), 69,632 B dynamic SMEM (1 CTA/SM, 2-stage KV+Rel).
 extern "C" __global__ void __launch_bounds__(256, 1) kern_rel_swa_prefill_m128_sm120(
     const bf16* __restrict__ Q,
     const uint8_t* __restrict__ SeqState,
@@ -561,12 +651,12 @@ extern "C" __global__ void __launch_bounds__(256, 1) kern_rel_swa_prefill_m128_s
     int stride_sink,
     float sm_scale,
     float v_scale) {
-  run_swa_prefill_impl<8>(
+  run_swa_prefill_impl<8, 2>(
       Q, SeqState, KCur, VCur, Rel, Gate, Sink, Lines, SeqLens, Out,
       num_tokens, stride_gate, stride_sink, sm_scale, v_scale);
 }
 
-// BLOCK_M=64, BLOCK_N=64, 4 warps (128 threads), 48 KB dynamic SMEM (2 CTAs/SM).
+// BLOCK_M=64, BLOCK_N=64, 4 warps (128 threads), 41,984 B dynamic SMEM (2 CTAs/SM, 2-stage KV + 1-stage Rel).
 extern "C" __global__ void __launch_bounds__(128, 2) kern_rel_swa_prefill_m64_sm120(
     const bf16* __restrict__ Q,
     const uint8_t* __restrict__ SeqState,
@@ -583,32 +673,12 @@ extern "C" __global__ void __launch_bounds__(128, 2) kern_rel_swa_prefill_m64_sm
     int stride_sink,
     float sm_scale,
     float v_scale) {
-  run_swa_prefill_impl<4>(
+  run_swa_prefill_impl<4, 1>(
       Q, SeqState, KCur, VCur, Rel, Gate, Sink, Lines, SeqLens, Out,
       num_tokens, stride_gate, stride_sink, sm_scale, v_scale);
 }
 
 namespace {
-
-__device__ __forceinline__ void ldmatrix_x2_trans_b8(
-    uint32_t& d0, uint32_t& d1, uint32_t& d2, uint32_t& d3, const void* smem_ptr) {
-  uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
-  asm volatile(
-      "ldmatrix.sync.aligned.m16n16.x2.trans.shared.b8 {%0, %1, %2, %3}, [%4];\n"
-      : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3)
-      : "r"(addr));
-}
-
-// Swizzle 16B chunk index (0..7) by row & 7 for bank-conflict-free [64, 128] FP8 smem.
-__device__ __forceinline__ int swizzle_fp8_c16(int row, int c16) {
-  return c16 ^ (row & 7);
-}
-
-// Permute key index within each 16-row V tile so ldmatrix.m16n16.x2.trans.b8 + cvt.rn.bf16x2.e4m3x2
-// directly matches the Q@K^T C-fragment register layout of P with zero warp shuffles.
-__device__ __forceinline__ int permute_v_row_16(int row) {
-  return (row & ~15) | (row & 1) | ((row & 8) >> 2) | ((row & 6) << 1);
-}
 
 // Cooperatively issue 16B cp.async.cg for one paged [64, 128] FP8 K+V page into swizzled SMEM.
 template <int THREADS>

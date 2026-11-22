@@ -28,14 +28,14 @@ cutlass = ["third_party/flashinfer/3rdparty/cutlass/include", "third_party/flash
 
 # M1 CUDA modules
 [kernels."norm_attnres"]
-sha256 = "c27d3f196a6e150cdb66d628c163bd886c46e936a8b43df1d3074bd12d3bc9df"
+sha256 = "823a735e964a901a0635305a28874d8138d242b067320fcd60f67a6b1eb82f8e"
 milestone = "M1"
 source = "source/norm_attnres.cu"
 flags = "plain"
 includes = []
 
 [kernels."loop_controller"]
-sha256 = "5ab92c4c7ea6a234bcf1c922d55f045707cce1438b0e050f1cf688c4d34637e4"
+sha256 = "68d6eb8118367d5901dae2b2c1dee58505419e18feb69c7dc70045574c5f5139"
 milestone = "M1"
 source = "source/loop_controller.cu"
 flags = "strict_fp32"
@@ -50,35 +50,35 @@ includes = []
 
 # M2 CUDA modules
 [kernels."moe_route"]
-sha256 = "41c844cec44bb2e6124c9b7257fd2841ccd442ded3d605cba3817eddecb77b6c"
+sha256 = "809f6627526f42ad2d6e0af7e025afc51f990f9d19977a5c50cfb7bcfe3c4250"
 milestone = "M2"
 source = "source/moe_route.cu"
 flags = "plain"
 includes = []
 
 [kernels."moe_swiglu_quant"]
-sha256 = "b6d05919719ef1412f5996c702b30aae5c1e252a14e66e44f628df3411ea4cc0"
+sha256 = "8b4b6db30c4fb643cb71ba28a9552aa32f7b4348b0b580d7091cde24e6193478"
 milestone = "M2"
 source = "source/moe_swiglu_quant.cu"
 flags = "plain"
 includes = []
 
 [kernels."moe_combine"]
-sha256 = "b987b859b34d90ff91323c7845f4c4041bf052e6afb52d42cee6ee4ec12bef11"
+sha256 = "8ab6339dc2d13f8ff7be05c7572bd4fbd579ace8a769def6bc666b04730c9ee4"
 milestone = "M2"
 source = "source/moe_combine.cu"
 flags = "plain"
 includes = []
 
 [kernels."moe_nvfp4_sm120"]
-sha256 = "1026aea151d9602a1e547f00a4f3b9116f34a74018481054aa287a601bb3cce1"
+sha256 = "d02c6d2d6be5fc9d023313e2b5801896226f7a76b493d63bc3d949ae2b69ad4b"
 milestone = "M2"
 source = "source/moe_nvfp4_sm120.cu"
 flags = "cutlass_sm120"
 includes = ["cutlass"]
 
 [kernels."moe_mxfp8_sm120"]
-sha256 = "7e84b652b74548ae267792daed723c74a47ac71332088b0583cad210d1492dfe"
+sha256 = "73934d845aecac204ff6e6c47b8a8c9cfd3cd849ca36542b0d98a553155749e3"
 milestone = "M2"
 source = "source/moe_mxfp8_sm120.cu"
 flags = "cutlass_sm120"
@@ -100,21 +100,21 @@ flags = "plain"
 includes = []
 
 [kernels."rel_attn_sm120"]
-sha256 = "832a19e4fb74a5359408ec0f22ed657286ab7294c2c1dffb99ebaf0e3bb46724"
+sha256 = "38c8c3fa0bfa864c508107e48740a1d0c7bbf17c4ade55ade9217466d1d72578"
 milestone = "M3"
 source = "source/rel_attn_sm120.cu"
 flags = "plain"
 includes = []
 
 [kernels."rel_verify_sm120"]
-sha256 = "49d884a94869d50278b1af6dd085300fac89be93cac0fb86f396dc5b85a891b5"
+sha256 = "1bc1d9f2eefa90805bcb1b984c4879203a5a71fcc12ae009ec9f1855d49589e8"
 milestone = "M3"
 source = "source/rel_verify_sm120.cu"
 flags = "plain"
 includes = []
 
 [kernels."bf16_gemv_sm120"]
-sha256 = "b37ee3012dfceec58afb3a185b1b24cab9a5ad246a0ad2dcace6882bb60c10c5"
+sha256 = "56b24959179f41ac994e1b5eae750f98a36c1a70cc1551bc84f00367ca895957"
 milestone = "M3"
 source = "source/bf16_gemv_sm120.cu"
 flags = "plain"
@@ -129,21 +129,21 @@ flags = "plain"
 includes = []
 
 [kernels."spec_state_commit"]
-sha256 = "53e2523863b7a40ec9252f2ad2310f61c7ba0031cc9545b491afb7701821d700"
+sha256 = "2a9223053bc2a356a1e4e30b0bb0c6093259423e49c1bbee40fe0d7d4b46243e"
 milestone = "M4"
 source = "source/spec_state_commit.cu"
 flags = "plain"
 includes = []
 
 [kernels."spec_round"]
-sha256 = "d8a0015756329de5a87e578770b49d03acaef61b742a1a780cd8e9f042fc73b1"
+sha256 = "0795ad7c64b98147fc36663267fa1527d3d90ece6fe9a13e2899baa2219aff7f"
 milestone = "M4"
 source = "source/spec_round.cu"
 flags = "plain"
 includes = []
 
 [kernels."spec_markov_rows"]
-sha256 = "728b3763db965eb0c011c9f5a7d360c489fda495e652eb292f52c94f70d1ba5c"
+sha256 = "546a2a414400b4db275a4ad12276948dfd36245b1488a7584418fca562819e04"
 milestone = "M4"
 source = "source/markov_rows.cu"
 flags = "plain"
@@ -157,7 +157,7 @@ flags = "plain"
 includes = []
 
 [kernels."spec_sampling"]
-sha256 = "734186ffc4ec613fb60f5ce35a869c10c087cba9fbb4afc3a29d6bad0c9932f1"
+sha256 = "f239c59142cfb568fe6ee4b789e5f24ab1d9582c1ee714886c2f605081cd3961"
 milestone = "M4"
 source = "source/sampling.cu"
 flags = "plain"

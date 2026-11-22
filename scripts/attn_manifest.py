@@ -1201,7 +1201,7 @@ def register_ops(
                     "entry": "kern_rel_swa_prefill_m64_sm120",
                     "grid": [_ceil_div("tokens", 64), HEADS, 1],
                     "block": [128, 1, 1],
-                    "shared_mem": 49152,
+                    "shared_mem": 41984,
                     "when": {"var": "tokens", "max": 512},
                 },
                 {
@@ -1209,7 +1209,7 @@ def register_ops(
                     "entry": "kern_rel_swa_prefill_m128_sm120",
                     "grid": [_ceil_div("tokens", 128), HEADS, 1],
                     "block": [256, 1, 1],
-                    "shared_mem": 49152,
+                    "shared_mem": 69632,
                     "when": {"var": "tokens", "min": 513},
                 },
             ],
