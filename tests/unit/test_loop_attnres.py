@@ -3,6 +3,7 @@
 import ctypes
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -22,9 +23,10 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 import loop_manifest as lm
 
-KERN_BIN = Path("/workspace/kern/target/release/kern")
-KERN_PY_ROOT = Path("/workspace/kern/crates/kern-py/python")
-KERN_LIB_SO = Path("/workspace/kern/target/release/lib_kern.so")
+_WORKSPACE = ROOT.parent
+KERN_BIN = Path(os.environ.get("KERN_BIN", _WORKSPACE / "kern/target/release/kern"))
+KERN_PY_ROOT = Path(os.environ.get("KERN_PY_ROOT", _WORKSPACE / "kern/crates/kern-py/python"))
+KERN_LIB_SO = Path(os.environ.get("KERN_LIB_SO", _WORKSPACE / "kern/target/release/lib_kern.so"))
 KERNELS_DIR = ROOT / "build" / "sm_120"
 
 

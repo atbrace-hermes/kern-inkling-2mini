@@ -9,6 +9,7 @@ from dataclasses import dataclass
 import hashlib
 import importlib.util
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -38,8 +39,8 @@ DSPARK_SWA_BYTES = 2 * DSPARK_SWA_WINDOW * (DSPARK_KV_HEADS * DSPARK_HEAD_DIM * 
 DSPARK_FRNN_BYTES = DSPARK_HIDDEN * 2
 DSPARK_STATE_BYTES_PER_SEQ = DSPARK_SWA_BYTES + DSPARK_FRNN_BYTES
 
-DEFAULT_FLASHINFER_INCLUDE = Path(
-    "/workspace/kern-qwen38/third_party/flashinfer/include"
+DEFAULT_FLASHINFER_INCLUDE = (
+    Path(__file__).resolve().parents[1] / "third_party" / "flashinfer" / "include"
 )
 
 BLOCK_SAMPLING = 1024
@@ -3166,4 +3167,5 @@ if __name__ == "__main__":
         with tempfile.TemporaryDirectory() as td:
             p = Path(td) / "model.json"
             p.write_text(json.dumps(m, indent=2))
-            subprocess.run(["/workspace/kern/target/release/kern", "verify", str(p)], check=True)
+            kern_bin = os.environ.get("KERN_BIN") or shutil.which("kern") or str(repo_root.parent / "kern" / "target" / "release" / "kern")
+            subprocess.run([kern_bin, "verify", str(p)], check=True)

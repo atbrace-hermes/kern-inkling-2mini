@@ -22,6 +22,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import shutil
 import struct
 import subprocess
 import sys
@@ -42,12 +43,13 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 import moe_manifest as mm
 
-KERN_BIN = Path("/workspace/kern/target/release/kern")
-KERN_PY_ROOT = Path("/workspace/kern/crates/kern-py/python")
-KERN_LIB_SO = Path("/workspace/kern/target/release/lib_kern.so")
+_WORKSPACE = ROOT.parent
+KERN_BIN = Path(os.environ.get("KERN_BIN", _WORKSPACE / "kern/target/release/kern"))
+KERN_PY_ROOT = Path(os.environ.get("KERN_PY_ROOT", _WORKSPACE / "kern/crates/kern-py/python"))
+KERN_LIB_SO = Path(os.environ.get("KERN_LIB_SO", _WORKSPACE / "kern/target/release/lib_kern.so"))
 KERNELS_DIR = ROOT / "build" / "sm_120"
-WEIGHTS_DIR = Path("/workspace/weights/Inkling-2-Mini")
-CUOBJDUMP = Path("/usr/local/cuda-13.5/bin/cuobjdump")
+WEIGHTS_DIR = Path(os.environ.get("KERN_WEIGHTS", _WORKSPACE / "weights/Inkling-2-Mini"))
+CUOBJDUMP = Path(os.environ.get("CUOBJDUMP", shutil.which("cuobjdump") or "/usr/local/cuda/bin/cuobjdump"))
 
 
 def _load_kern():

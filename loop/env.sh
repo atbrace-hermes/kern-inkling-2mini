@@ -9,17 +9,24 @@ if [[ -n "$_COMMON_GIT" ]]; then
 else
   MAIN=$(cd "$_THIS_LOOP/.." && pwd)
 fi
+_WORKSPACE=$(dirname "$MAIN")
 LOOP=$MAIN/loop
 TREE=$(git rev-parse --show-toplevel 2>/dev/null || echo "$MAIN")
 STATE=${KERN_LOOP_STATE:-$MAIN/state}
 GPU=${KERN_LOOP_GPU:-0}
-PY=${PY:-/workspace/kern-qwen38/.venv/bin/python}
-KERN=${KERN:-/workspace/kern/target/release/kern}
+if [[ -z "${PY:-}" ]]; then
+  if [[ -x "$MAIN/.venv/bin/python" ]]; then
+    PY="$MAIN/.venv/bin/python"
+  else
+    PY=$(command -v python3 || echo python3)
+  fi
+fi
+KERN=${KERN:-$(command -v kern || echo "$_WORKSPACE/kern/target/release/kern")}
 NVCC=${NVCC:-$(command -v nvcc || echo /usr/local/cuda/bin/nvcc)}
-WEIGHTS=${KERN_LOOP_WEIGHTS:-/workspace/weights/Inkling-2-Mini}
-SMOKE_REF=${KERN_LOOP_SMOKE_REF:-/workspace/baselines/inkling-2-mini/smoke_reference.parquet}
-STD_REF=${KERN_LOOP_STD_REF:-/workspace/baselines/inkling-2-mini/standard_reference.parquet}
+WEIGHTS=${KERN_LOOP_WEIGHTS:-${KERN_WEIGHTS:-$_WORKSPACE/weights/Inkling-2-Mini}}
+SMOKE_REF=${KERN_LOOP_SMOKE_REF:-$_WORKSPACE/baselines/inkling-2-mini/smoke_reference.parquet}
+STD_REF=${KERN_LOOP_STD_REF:-$_WORKSPACE/baselines/inkling-2-mini/standard_reference.parquet}
 KV_SCALES=${KERN_LOOP_KV_SCALES:-$MAIN/results/kv-scales.json}
-unset _THIS_LOOP _COMMON_GIT
+unset _THIS_LOOP _COMMON_GIT _WORKSPACE
 set +a
 mkdir -p "$STATE"

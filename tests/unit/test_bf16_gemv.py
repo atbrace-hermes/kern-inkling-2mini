@@ -30,8 +30,11 @@ def _load_kern():
     except ImportError:
         pass
 
-    kern_py_dir = Path("/workspace/kern/crates/kern-py/python/kern")
-    lib_kern_so = Path("/workspace/kern/target/release/lib_kern.so")
+    import os
+
+    _ws = ROOT.parent
+    kern_py_dir = Path(os.environ.get("KERN_PY_ROOT", _ws / "kern/crates/kern-py/python")) / "kern"
+    lib_kern_so = Path(os.environ.get("KERN_LIB_SO", _ws / "kern/target/release/lib_kern.so"))
     spec = importlib.util.spec_from_file_location("kern._kern", str(lib_kern_so))
     assert spec is not None and spec.loader is not None
     _kern = importlib.util.module_from_spec(spec)

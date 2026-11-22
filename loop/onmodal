@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# loop/onmodal: fast Modal RTX PRO 6000 Blackwell (SM120) remote GPU runner.
+#
+# Usage:
+#   loop/onmodal unit <worktree_dir> <test_path> [extra unittest args...]
+#   loop/onmodal e2e <bundle_dir>
+#   loop/onmodal check <cand_bundle> [base_bundle] [--capacity N]
+#   loop/onmodal bench <bundle_dir> [workload_toml] [--out <local_json>] [--base <base_bundle>] [--ops]
+#   loop/onmodal exec <local_dir> "<shell_cmd>"
+#   loop/onmodal probe [--cubin <path>]
+#   loop/onmodal populate-weights [--force]
+#   loop/onmodal deploy
+set -euo pipefail
+
+# Bypass local HTTP/HTTPS proxy (Modal client gRPC fails without python-socks).
+export MODAL_DISABLE_API_PROXY=1
+
+_SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+_RUNNER="$_SELF_DIR/modal_runner.py"
+
+# Locate Modal's Python environment (installed via uv tool).
+_MODAL_BIN=$(command -v modal || echo "${HOME}/.local/bin/modal")
+_MODAL_PY=""
+if [[ -x "$_MODAL_BIN" ]]; then
+  _SHEBANG=$(head -n 1 "$_MODAL_BIN" | sed 's/^#!//')
+  if [[ -x "$_SHEBANG" ]]; then
+    _MODAL_PY="$_SHEBANG"
+  fi
+fi
+if [[ -z "$_MODAL_PY" ]]; then
+  _MODAL_PY="${HOME}/.local/share/uv/tools/modal/bin/python"
+fi
+
+if [[ "${1:-}" == "deploy" ]]; then
+  exec "$_MODAL_BIN" deploy "$_RUNNER"
+fi
+
+exec "$_MODAL_PY" "$_RUNNER" "$@"

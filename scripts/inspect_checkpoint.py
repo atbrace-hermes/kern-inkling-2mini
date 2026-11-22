@@ -260,11 +260,13 @@ def inspect(root: Path) -> tuple[dict, list[str]]:
 
 
 def main() -> int:
+    import os
+
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
         "--checkpoint",
         type=Path,
-        default=Path("/workspace/weights/Inkling-2-Mini"),
+        default=Path(os.environ.get("KERN_WEIGHTS", ROOT.parent / "weights" / "Inkling-2-Mini")),
     )
     ap.add_argument("--strict", action="store_true", help="exit 1 if any problems found")
     args = ap.parse_args()

@@ -25,9 +25,10 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import dspark_manifest as dm  # noqa: E402
 
-KERN_BIN = Path("/workspace/kern/target/release/kern")
-KERN_PY_DIR = Path("/workspace/kern/crates/kern-py/python")
-LIB_KERN_SO = Path("/workspace/kern/target/release/lib_kern.so")
+_WORKSPACE = ROOT.parent
+KERN_BIN = Path(os.environ.get("KERN_BIN", _WORKSPACE / "kern/target/release/kern"))
+KERN_PY_DIR = Path(os.environ.get("KERN_PY_ROOT", _WORKSPACE / "kern/crates/kern-py/python"))
+LIB_KERN_SO = Path(os.environ.get("KERN_LIB_SO", _WORKSPACE / "kern/target/release/lib_kern.so"))
 KERNELS_DIR = ROOT / "build/sm_120"
 
 RUN_GPU = os.environ.get("KERN_RUN_GPU") == "1"

@@ -816,7 +816,9 @@ def test_selftest_vocab_bounds_and_near_tie_ulp_helpers() -> None:
 
 def test_selftest_weights_config_validation(tmp_path: Path) -> None:
     # Real checkpoint config validation if weights exist on host
-    real_weights = Path("/workspace/weights/Inkling-2-Mini")
+    import os
+
+    real_weights = Path(os.environ.get("KERN_WEIGHTS", Path(__file__).resolve().parents[3] / "weights" / "Inkling-2-Mini"))
     if real_weights.exists():
         res = validate_weights_configs(real_weights)
         assert res["present"] is True

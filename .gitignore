@@ -10,3 +10,8 @@ state/
 weights/
 results/*.parquet
 results/*.log
+results/*.junit.xml
+results/*.txt
+results/bench-baseline.json
+tests/e2e/results/
+blog/

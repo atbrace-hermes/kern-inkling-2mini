@@ -524,11 +524,13 @@ def calibrate_torch_loop(
 
 
 def main() -> None:
+    import os
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--checkpoint",
         type=Path,
-        default=Path("/workspace/weights/Inkling-2-Mini"),
+        default=Path(os.environ.get("KERN_WEIGHTS", Path(__file__).resolve().parents[2] / "weights" / "Inkling-2-Mini")),
     )
     parser.add_argument("--out", type=Path, default=Path("results/kv-scales.json"))
     parser.add_argument("--report", type=Path, default=None)

@@ -16,13 +16,14 @@ if _REPO_ROOT not in sys.path:
 from tests.e2e.client import KernCLI, KernClient  # noqa: E402
 from tests.e2e.fixtures_data import BaselineArtifacts, discover_baselines  # noqa: E402
 
+_WORKSPACE = Path(_REPO_ROOT).parent
 DEFAULT_BASE_URL = os.environ.get("KERN_E2E_BASE_URL", "http://127.0.0.1:8000")
 DEFAULT_TRACE_URL = os.environ.get("KERN_E2E_TRACE_URL", "")
-DEFAULT_BASELINE_DIR = "/workspace/baselines/inkling-2-mini"
-DEFAULT_MANIFEST = "/workspace/kern-inkling-2mini/out/inkling-2-mini/model.json"
-DEFAULT_KERNELS = "/workspace/kern-inkling-2mini/build/sm_120"
-DEFAULT_WEIGHTS = "/workspace/weights/Inkling-2-Mini"
-DEFAULT_KERN_BIN = "/workspace/kern/target/release/kern"
+DEFAULT_BASELINE_DIR = os.environ.get("KERN_BASELINE_DIR", str(_WORKSPACE / "baselines" / "inkling-2-mini"))
+DEFAULT_MANIFEST = os.environ.get("KERN_MANIFEST", str(Path(_REPO_ROOT) / "out" / "inkling-2-mini" / "model.json"))
+DEFAULT_KERNELS = os.environ.get("KERN_KERNELS", str(Path(_REPO_ROOT) / "build" / "sm_120"))
+DEFAULT_WEIGHTS = os.environ.get("KERN_WEIGHTS", str(_WORKSPACE / "weights" / "Inkling-2-Mini"))
+DEFAULT_KERN_BIN = os.environ.get("KERN_BIN", str(_WORKSPACE / "kern" / "target" / "release" / "kern"))
 
 
 @dataclass(frozen=True)

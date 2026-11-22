@@ -12,6 +12,7 @@ import hashlib
 import importlib.util
 import json
 import math
+import os
 import subprocess
 import sys
 import tempfile
@@ -22,8 +23,9 @@ from unittest import mock
 import torch
 
 ROOT = Path(__file__).resolve().parents[2]
+_WORKSPACE = ROOT.parent
 BUILD_DIR = ROOT / "build/sm_120"
-KERN_BIN = Path("/workspace/kern/target/release/kern")
+KERN_BIN = Path(os.environ.get("KERN_BIN", _WORKSPACE / "kern/target/release/kern"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import attn_manifest as am  # noqa: E402
@@ -41,8 +43,9 @@ def _load_kern():
     except ImportError:
         pass
 
-    kern_py_dir = Path("/workspace/kern/crates/kern-py/python/kern")
-    lib_kern_so = Path("/workspace/kern/target/release/lib_kern.so")
+    kern_py_root = Path(os.environ.get("KERN_PY_ROOT", _WORKSPACE / "kern/crates/kern-py/python"))
+    kern_py_dir = kern_py_root / "kern"
+    lib_kern_so = Path(os.environ.get("KERN_LIB_SO", _WORKSPACE / "kern/target/release/lib_kern.so"))
     if not lib_kern_so.exists():
         raise RuntimeError(f"Missing {lib_kern_so}")
 

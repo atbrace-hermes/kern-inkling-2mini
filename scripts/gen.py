@@ -21,7 +21,7 @@ import dspark_manifest  # noqa: E402
 import loop_manifest  # noqa: E402
 import moe_manifest  # noqa: E402
 
-DEFAULT_CHECKPOINT = Path("/workspace/weights/Inkling-2-Mini")
+DEFAULT_CHECKPOINT = Path(os.environ.get("KERN_WEIGHTS", ROOT.parent / "weights" / "Inkling-2-Mini"))
 DEFAULT_KERNELS = ROOT / "build" / "sm_120"
 DEFAULT_OUT = ROOT / "out" / "inkling-2-mini"
 DEFAULT_KV_SCALES = ROOT / "results" / "kv-scales.json"

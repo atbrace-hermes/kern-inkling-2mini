@@ -2,7 +2,7 @@
 [target]
 architecture = "sm_120a"
 device = "NVIDIA RTX PRO 5000 72GB Blackwell"
-checkpoint = "/workspace/weights/Inkling-2-Mini"
+checkpoint = "thinkingmachines/Inkling-2-Mini"
 model_type = "inkling2_loop"
 
 [weights]
