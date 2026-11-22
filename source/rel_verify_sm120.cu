@@ -3,17 +3,20 @@
 //   1. kern_attn_swa_verify_split: Split-KV sliding-window (W=1024) FP8 E4M3 attention
 //      over states.seq_state ring + KCur/VCur for speculative verify (QLEN=8, H=24, HKV=8, D=128).
 //      - Transposed MMA geometry: K @ Q^T [64x24] and V^T @ P^T [128x24] (100% Tensor Core util)
-//      - Q resident in registers (zero SMEM Q buffer, zero Q LDS in hot loop)
+//      - Hardware ldmatrix.m8n8.x4 (FP8 K) + ldmatrix.m16n16.x2.trans.b8 (permuted-swizzled FP8 V)
+//      - Direct coalesced Q register load (zero SMEM Q buffer, zero prologue sync)
 //      - 3-buffer KV SMEM (k[2]+v[1]) + separate rel & p buffers (~32.7 KB -> 3 CTAs/SM on SM120!)
-//      - Prefetches K_{it+1} + Rel_{it+1} together during V^T @ P^T (eliminates Rel wait & sync)
-//      - Blackwell native 1-instr cvt.rn.bf16x2.e4m3x2 (F2FP.BF16.E4M3)
+//      - Early PDL K0+V0 prefetch from SeqState BEFORE griddepcontrol.wait (overlaps attn_prologue!)
+//      - Blackwell native 1-instr cvt.rn.bf16x2.e4m3x2 (F2FP.BF16.E4M3) + L2::256B prefetch
 //      - Optional dedicated cur-only split (ring_splits < num_splits) to eliminate last-split straggler
-//      - PDL (griddepcontrol) across prologue & combine.
 //   2. kern_attn_full_verify_split: 2-phase (pure-bulk dist>=1024 + causal/Rel tail)
 //      paged FP8 E4M3 full attention for speculative verify (QLEN=8, PAGE=64 == BN=64).
-//      - 3 CTAs/SM (REG:168, STACK:0, SMEM:33280 B), balanced contiguous page splits
-//      - Wave-matched 1-wave split schedule (S=41/20/10/5 <= 328 CTAs <= 330 slots on PRO 5000).
-//   3. kern_attn_verify_combine_s{4,5,8,9,10,16,17,20,32,41}: 1-warp float4 split-KV combine + Gate + Sink.
+//      - 3 CTAs/SM (REG<=168, STACK:0, SMEM:33280 B), hardware ldmatrix K/V + direct-reg Q
+//      - Proportional dynamic split-K across sequences (grid=[total_splits, 8, 1], total_splits=41/40)
+//        eliminating uneven-KV stragglers at seqs=4/8 and filling all 320-328 SM slots at seqs=1..8
+//      - Early PDL K0+V0 prefetch for bulk pages BEFORE griddepcontrol.wait (overlaps attn_prologue!)
+//   3. kern_attn_verify_combine_dyn (4-warp float4 PDL dynamic split-KV combine + Gate + Sink)
+//      and kern_attn_verify_combine_s{4,5,8,9,10,16,17,20,32,41} (1-warp float4 PDL combine).
 
 #include <cuda_bf16.h>
 #include <cstdint>
@@ -34,7 +37,7 @@ constexpr int kQlen = 8;
 constexpr int kM = kQlen * kGroup;  // 24 query rows per (seq, kv_head)
 constexpr int kBN = 64;             // keys per tile
 constexpr int kThreads = 128;       // 4 warps
-constexpr int kPRow = 72;           // 72 bf16 = 144 B = 36 banks (gid*4 + tig -> 0 bank conflicts!)
+constexpr int kPRow = 72;           // 72 bf16 = 144 B = 36 banks (0 bank conflicts)
 
 constexpr int64_t kSeqStateBytes = 90005376LL;
 constexpr int64_t kSwaHeadRingBytes = 131072LL;   // 1024 * 128
@@ -55,7 +58,7 @@ __device__ __forceinline__ uint32_t smem_u32(const void* ptr) {
 
 __device__ __forceinline__ void cp_async_cg_16(void* dst_smem, const void* src_gmem) {
   uint32_t dst = smem_u32(dst_smem);
-  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(dst), "l"(src_gmem) : "memory");
+  asm volatile("cp.async.cg.shared.global.L2::256B [%0], [%1], 16;\n" :: "r"(dst), "l"(src_gmem) : "memory");
 }
 
 __device__ __forceinline__ void cp_async_cg_16_pred(void* dst_smem, const void* src_gmem, int src_size) {
@@ -79,16 +82,33 @@ __device__ __forceinline__ uint32_t cvt_e4m3x2_to_bf16x2(uint16_t x) {
   return res;
 }
 
+__device__ __forceinline__ void ldmatrix_x4(
+    uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3, const void* smem_ptr) {
+  uint32_t addr = smem_u32(smem_ptr);
+  asm volatile(
+      "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+      : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+      : "r"(addr));
+}
+
+__device__ __forceinline__ void ldmatrix_x2_trans_b8(
+    uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3, const void* smem_ptr) {
+  uint32_t addr = smem_u32(smem_ptr);
+  asm volatile(
+      "ldmatrix.sync.aligned.m16n16.x2.trans.shared.b8 {%0, %1, %2, %3}, [%4];\n"
+      : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+      : "r"(addr));
+}
+
 __device__ __forceinline__ void mma_m16n8k16_bf16(
     float (&c)[4],
-    const uint32_t (&a)[4],
-    uint32_t b0,
-    uint32_t b1) {
+    uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+    uint32_t b0, uint32_t b1) {
   asm volatile(
       "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-      "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+      "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
       : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
 __device__ __forceinline__ float ex2_approx(float x) {
@@ -107,18 +127,20 @@ __device__ __forceinline__ float sigmoid_fast(float x) {
   return 1.0f / (1.0f + ex2_approx(-x * kLog2E));
 }
 
-__device__ __forceinline__ int swiz_q_col(int row, int col_bf16) {
-  return col_bf16 ^ ((row & 7) << 3);
+__device__ __forceinline__ int swiz_c16(int row, int c16) {
+  return c16 ^ (row & 7);
 }
 
-// Load 64x128 FP8 ring tile (K or V) from SeqState into dst_smem[64][128] with 16B XOR swizzle.
+// Load 64x128 FP8 ring tile (K or V) from SeqState into dst[512] uint4 with 16B XOR swizzle.
+template <bool PERM_V>
 __device__ __forceinline__ void cp_async_ring_tile(
-    uint8_t (&dst)[kBN][kHeadDim],
+    uint4* __restrict__ dst,
     const uint8_t* __restrict__ ring_base,
     int k0,
     int past,
     int tid,
     bool full_valid) {
+  (void)PERM_V;
   const int c16 = tid & 7;
   const int r0 = tid >> 3;
   const int col_byte = c16 << 4;
@@ -126,23 +148,21 @@ __device__ __forceinline__ void cp_async_ring_tile(
   for (int step = 0; step < 4; ++step) {
     const int r = r0 + step * 16;
     const int k = k0 + r;
-    const int swiz_col = col_byte ^ ((r & 7) << 4);
     const int slot = k & (kRing - 1);
     const uint8_t* src = ring_base + static_cast<int64_t>(slot) * kHeadDim + col_byte;
     if (full_valid) {
-      cp_async_cg_16(&dst[r][swiz_col], src);
+      cp_async_cg_16(&dst[r * 8 + swiz_c16(r, c16)], src);
     } else {
       const int sz = (k >= 0 && k < past) ? 16 : 0;
-      cp_async_cg_16_pred(&dst[r][swiz_col], src, sz);
+      cp_async_cg_16_pred(&dst[r * 8 + swiz_c16(r, c16)], src, sz);
     }
   }
 }
 
-// Load 64x128 FP8 paged KV tile (K or V) from KVState into dst[64][128] with 16B XOR swizzle.
-// One page is 64 contiguous rows of 128B (8 KB) per kv_head!
-template <bool IS_V>
+// Load 64x128 FP8 paged KV tile (K or V) from KVState into dst[512] uint4 with 16B XOR swizzle.
+template <bool IS_V, bool PERM_V>
 __device__ __forceinline__ void cp_async_page_tile(
-    uint8_t (&dst)[kBN][kHeadDim],
+    uint4* __restrict__ dst,
     const uint8_t* __restrict__ KVState,
     int kv_head,
     int page,
@@ -150,6 +170,7 @@ __device__ __forceinline__ void cp_async_page_tile(
     int seqlen_k,
     int tid,
     bool full_valid) {
+  (void)PERM_V;
   const int c16 = tid & 7;
   const int r0 = tid >> 3;
   const int col_byte = c16 << 4;
@@ -163,13 +184,12 @@ __device__ __forceinline__ void cp_async_page_tile(
 #pragma unroll
   for (int step = 0; step < 4; ++step) {
     const int r = r0 + step * 16;
-    const int swiz_col = col_byte ^ ((r & 7) << 4);
     const uint8_t* src = base + static_cast<int64_t>(r) * kHeadDim;
     if (full_valid && page_ok) {
-      cp_async_cg_16(&dst[r][swiz_col], src);
+      cp_async_cg_16(&dst[r * 8 + swiz_c16(r, c16)], src);
     } else {
       const int sz = (page_ok && (k0 + r) < seqlen_k) ? 16 : 0;
-      cp_async_cg_16_pred(&dst[r][swiz_col], src, sz);
+      cp_async_cg_16_pred(&dst[r * 8 + swiz_c16(r, c16)], src, sz);
     }
   }
 }
@@ -207,102 +227,115 @@ __device__ __forceinline__ void cp_async_rel_tile(
   }
 }
 
-// Compute S^T = K[64x128] @ Q^T[128x24] for warp w (keys w*16 .. w*16+15) with Q in registers.
-__device__ __forceinline__ void compute_kq_tile_qreg(
-    float (&s)[3][4],
-    const uint8_t (&smem_k)[kBN][kHeadDim],
-    const uint32_t (&q_b0)[8][3],
-    const uint32_t (&q_b1)[8][3],
-    int w,
+// Load Q[24][128] BF16 directly into registers matching ldmatrix_x4 K layout (d = ds*16 + tig*4..+3).
+__device__ __forceinline__ void load_q_direct_reg(
+    uint32_t (&q_b0)[8][3],
+    uint32_t (&q_b1)[8][3],
+    const bf16* __restrict__ Q,
+    int q_start,
+    int kv_head,
     int gid,
     int tig) {
 #pragma unroll
   for (int mt = 0; mt < 3; ++mt) {
-    s[mt][0] = 0.0f; s[mt][1] = 0.0f; s[mt][2] = 0.0f; s[mt][3] = 0.0f;
-  }
-  const int k_row0 = w * 16 + gid;
-  const int k_row1 = k_row0 + 8;
-  const int sw_k0 = (k_row0 & 7) << 4;
-  const int sw_k1 = (k_row1 & 7) << 4;
-
+    const int m = mt * 8 + gid;
+    const int tok = m / kGroup;
+    const int head = kv_head * kGroup + (m - tok * kGroup);
+    const bf16* q_row = Q + (static_cast<int64_t>(q_start + tok) * kHeads + head) * kHeadDim;
 #pragma unroll
-  for (int ds = 0; ds < 8; ++ds) {
-    const int d_step = ds << 4;
-    const int k_col0 = (d_step ^ sw_k0) + tig * 2;
-    const int k_col1 = (d_step ^ sw_k1) + tig * 2;
-    uint16_t raw0 = *reinterpret_cast<const uint16_t*>(&smem_k[k_row0][k_col0]);
-    uint16_t raw1 = *reinterpret_cast<const uint16_t*>(&smem_k[k_row1][k_col1]);
-    uint16_t raw2 = *reinterpret_cast<const uint16_t*>(&smem_k[k_row0][k_col0 + 8]);
-    uint16_t raw3 = *reinterpret_cast<const uint16_t*>(&smem_k[k_row1][k_col1 + 8]);
-    uint32_t a[4];
-    a[0] = cvt_e4m3x2_to_bf16x2(raw0);
-    a[1] = cvt_e4m3x2_to_bf16x2(raw1);
-    a[2] = cvt_e4m3x2_to_bf16x2(raw2);
-    a[3] = cvt_e4m3x2_to_bf16x2(raw3);
-
-#pragma unroll
-    for (int mt = 0; mt < 3; ++mt) {
-      mma_m16n8k16_bf16(s[mt], a, q_b0[ds][mt], q_b1[ds][mt]);
+    for (int ds = 0; ds < 8; ++ds) {
+      const uint2 qv = *reinterpret_cast<const uint2*>(q_row + ds * 16 + tig * 4);
+      q_b0[ds][mt] = qv.x;
+      q_b1[ds][mt] = qv.y;
     }
   }
 }
 
-// Accumulate O^T += V^T[128xK] @ P^T[Kx24] for warp w (dims w*32 .. w*32+31).
+// Compute S^T = K[64x128] @ Q^T[128x24] for warp w (keys w*16..w*16+15) via 4 hardware ldmatrix_x4!
+__device__ __forceinline__ void compute_kq_tile_ldm(
+    float (&s)[3][4],
+    const uint4* __restrict__ smem_k,
+    const uint32_t (&q_b0)[8][3],
+    const uint32_t (&q_b1)[8][3],
+    int w,
+    int lane) {
+#pragma unroll
+  for (int mt = 0; mt < 3; ++mt) {
+    s[mt][0] = 0.0f; s[mt][1] = 0.0f; s[mt][2] = 0.0f; s[mt][3] = 0.0f;
+  }
+  const int k_ld_row = w * 16 + ((lane >> 4) << 3) + (lane & 7);
+  const int k_ld_c16_off = (lane >> 3) & 1;
+
+#pragma unroll
+  for (int ds2 = 0; ds2 < 4; ++ds2) {
+    uint32_t b0, b1, b2, b3;
+    ldmatrix_x4(b0, b1, b2, b3, &smem_k[k_ld_row * 8 + swiz_c16(k_ld_row, ds2 * 2 + k_ld_c16_off)]);
+    const int ds_lo = ds2 * 2;
+    const int ds_hi = ds_lo + 1;
+    uint32_t a0 = cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(b0));
+    uint32_t a1 = cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(b2));
+    uint32_t a2 = cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(b0 >> 16));
+    uint32_t a3 = cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(b2 >> 16));
+#pragma unroll
+    for (int mt = 0; mt < 3; ++mt) {
+      mma_m16n8k16_bf16(s[mt], a0, a1, a2, a3, q_b0[ds_lo][mt], q_b1[ds_lo][mt]);
+    }
+    uint32_t c0 = cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(b1));
+    uint32_t c1 = cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(b3));
+    uint32_t c2 = cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(b1 >> 16));
+    uint32_t c3 = cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(b3 >> 16));
+#pragma unroll
+    for (int mt = 0; mt < 3; ++mt) {
+      mma_m16n8k16_bf16(s[mt], c0, c1, c2, c3, q_b0[ds_hi][mt], q_b1[ds_hi][mt]);
+    }
+  }
+}
+
+// Accumulate O^T += V^T[128xK] @ P^T[Kx24] for warp w (dims w*32..w*32+31) via hardware ldmatrix_x2_trans_b8!
 template <int K_STEPS>
-__device__ __forceinline__ void compute_vp_tile(
+__device__ __forceinline__ void compute_vp_tile_ldm(
     float (&acc)[2][3][4],
-    const uint8_t (&smem_v)[kBN][kHeadDim],
+    const uint4* __restrict__ smem_v,
     const bf16 (&smem_p)[kM][kPRow],
     int w,
+    int lane,
     int gid,
     int tig) {
+  const int v_dp = w * 2 + (lane >> 4);
+  const int v_r_off = lane & 15;
 #pragma unroll
   for (int ks = 0; ks < K_STEPS; ++ks) {
     const int k_base = ks * 16;
-    const int k0 = k_base + tig * 2;
-    const int k1 = k0 + 1;
-    const int k2 = k0 + 8;
-    const int k3 = k2 + 1;
-    const int sw0 = (k0 & 7) << 4;
-    const int sw1 = (k1 & 7) << 4;
-    const int sw2 = (k2 & 7) << 4;
-    const int sw3 = (k3 & 7) << 4;
+    const int vr = k_base + v_r_off;
+    uint32_t vb0, vb1, vb2, vb3;
+    ldmatrix_x2_trans_b8(vb0, vb1, vb2, vb3, &smem_v[vr * 8 + swiz_c16(vr, v_dp)]);
 
     uint32_t b0[3], b1[3];
 #pragma unroll
     for (int mt = 0; mt < 3; ++mt) {
       const int m = mt * 8 + gid;
-      b0[mt] = *reinterpret_cast<const uint32_t*>(&smem_p[m][k0]);
-      b1[mt] = *reinterpret_cast<const uint32_t*>(&smem_p[m][k2]);
+      // ldmatrix.m16n16.x2.trans.b8 returns contiguous keys {tig*4..tig*4+3} -> single 64-bit load!
+      const uint2 pv = *reinterpret_cast<const uint2*>(&smem_p[m][k_base + tig * 4]);
+      b0[mt] = pv.x;
+      b1[mt] = pv.y;
     }
 
+    uint32_t a0 = cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(vb0));
+    uint32_t a1 = cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(vb1));
+    uint32_t a2 = cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(vb0 >> 16));
+    uint32_t a3 = cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(vb1 >> 16));
 #pragma unroll
-    for (int dt = 0; dt < 2; ++dt) {
-      const int d_base = w * 32 + dt * 16;
-      const int d_off0 = (d_base ^ sw0) + gid;
-      const int d_off1 = (d_base ^ sw1) + gid;
-      const int d_off2 = (d_base ^ sw2) + gid;
-      const int d_off3 = (d_base ^ sw3) + gid;
+    for (int mt = 0; mt < 3; ++mt) {
+      mma_m16n8k16_bf16(acc[0][mt], a0, a1, a2, a3, b0[mt], b1[mt]);
+    }
 
-      uint16_t v_lo0 = static_cast<uint16_t>(smem_v[k0][d_off0])
-                     | (static_cast<uint16_t>(smem_v[k1][d_off1]) << 8);
-      uint16_t v_hi0 = static_cast<uint16_t>(smem_v[k0][d_off0 + 8])
-                     | (static_cast<uint16_t>(smem_v[k1][d_off1 + 8]) << 8);
-      uint16_t v_lo1 = static_cast<uint16_t>(smem_v[k2][d_off2])
-                     | (static_cast<uint16_t>(smem_v[k3][d_off3]) << 8);
-      uint16_t v_hi1 = static_cast<uint16_t>(smem_v[k2][d_off2 + 8])
-                     | (static_cast<uint16_t>(smem_v[k3][d_off3 + 8]) << 8);
-
-      uint32_t a[4];
-      a[0] = cvt_e4m3x2_to_bf16x2(v_lo0);
-      a[1] = cvt_e4m3x2_to_bf16x2(v_hi0);
-      a[2] = cvt_e4m3x2_to_bf16x2(v_lo1);
-      a[3] = cvt_e4m3x2_to_bf16x2(v_hi1);
-
+    uint32_t c0 = cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(vb2));
+    uint32_t c1 = cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(vb3));
+    uint32_t c2 = cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(vb2 >> 16));
+    uint32_t c3 = cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(vb3 >> 16));
 #pragma unroll
-      for (int mt = 0; mt < 3; ++mt) {
-        mma_m16n8k16_bf16(acc[dt][mt], a, b0[mt], b1[mt]);
-      }
+    for (int mt = 0; mt < 3; ++mt) {
+      mma_m16n8k16_bf16(acc[1][mt], c0, c1, c2, c3, b0[mt], b1[mt]);
     }
   }
 }
@@ -321,24 +354,67 @@ __device__ __forceinline__ float col_reduce_sum8(float v) {
   return v;
 }
 
+// Deterministic exact-integer proportional split allocation across seqs (1..8) into SMEM sh_sp[8], sh_np[8].
+// Guarantees: sum(sh_sp) == total_splits (when any seq active), uniform seqs get exact floor/ceil equal splits,
+// skewed seqs get splits strictly proportional to page counts (fixing uneven-KV SOL collapse!).
+__device__ __forceinline__ void compute_dyn_splits_smem(
+    const int32_t* __restrict__ SeqLens,
+    int seqs,
+    int total_splits,
+    int* __restrict__ sh_sp,
+    int* __restrict__ sh_np) {
+  int sum_p = 0;
+  int active = 0;
+  for (int r = 0; r < seqs; ++r) {
+    const int sl = SeqLens[r];
+    const int pages = (sl > 0) ? ((sl + kPage - 1) >> 6) : 0;
+    sh_np[r] = pages;
+    sh_sp[r] = (pages > 0) ? 1 : 0;
+    sum_p += pages;
+    active += (pages > 0) ? 1 : 0;
+  }
+  const int rem_s = total_splits - active;
+  if (rem_s > 0 && sum_p > 0) {
+    int used = 0;
+    for (int r = 0; r < seqs; ++r) {
+      if (sh_np[r] > 0) {
+        const int add = (rem_s * sh_np[r]) / sum_p;
+        sh_sp[r] += add;
+        used += add;
+      }
+    }
+    int left = rem_s - used;
+    while (left > 0) {
+      int best = -1;
+      for (int r = 0; r < seqs; ++r) {
+        if (sh_np[r] <= 0) continue;
+        if (best < 0 ||
+            static_cast<int64_t>(sh_np[r]) * sh_sp[best] > static_cast<int64_t>(sh_np[best]) * sh_sp[r]) {
+          best = r;
+        }
+      }
+      if (best < 0) break;
+      sh_sp[best] += 1;
+      --left;
+    }
+  }
+}
+
 // Total SMEM = 32,256 B (+1 KB runtime = 33,280 B -> 3 CTAs/SM = 99,840 B <= 101,376 B on SM120!)
 struct SwaVerifySmem {
-  alignas(16) uint8_t k[2][kBN][kHeadDim];  // 16,384 B (k[1] stages Q at prologue; k[0..1] stages O at epilogue)
-  alignas(16) uint8_t v[kBN][kHeadDim];     //  8,192 B
+  alignas(16) uint4 k[2][kBN * 8];          // 16,384 B (reused for O epilogue staging)
+  alignas(16) uint4 v[kBN * 8];             //  8,192 B
   alignas(16) bf16 rel[kM][kPRow];          //  3,456 B (separate from p so Rel_{it+1} prefetches with K_{it+1}!)
   alignas(16) bf16 p[kM][kPRow];            //  3,456 B
-  alignas(16) float m[4][kM];               //    384 B (4-warp rowmax scratch — separate from l to avoid WAR race!)
+  alignas(16) float m[4][kM];               //    384 B (4-warp rowmax scratch; also holds dyn split table before loop)
   alignas(16) float l[4][kM];               //    384 B (4-warp rowsum scratch)
 };
 
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// 1. SWA Verify Split-KV Attention Kernel (SM120, 3 CTAs/SM)
+// 1. SWA Verify Split-KV Attention Kernel (SM120, 3 CTAs/SM, PDL + ldmatrix)
 // Grid: [num_splits, 8 (kv_heads), seqs], Block: [128, 1, 1]
-// If ring_splits < num_splits (e.g. ring_splits=8, num_splits=9), split==ring_splits
-// is dedicated exclusively to the 8-key KCur/VCur micro-tile (eliminates straggler!).
-// If ring_splits == num_splits, split==num_splits-1 handles both its ring tiles and cur.
 // ---------------------------------------------------------------------------
 extern "C" __global__ void __launch_bounds__(kThreads, 3) kern_attn_swa_verify_split(
     const bf16* __restrict__ Q,
@@ -417,55 +493,29 @@ extern "C" __global__ void __launch_bounds__(kThreads, 3) kern_attn_swa_verify_s
       + static_cast<int64_t>(kv_head) * kSwaHeadRingBytes;
   const uint8_t* ring_v_base = ring_k_base + kSwaHalfVisitBytes;
 
-  // Prefetch first ring K tile into smem.k[0] BEFORE griddepcontrol.wait (SeqState untouched by prologue!).
+  // Prefetch BOTH first ring K and V tiles into smem BEFORE griddepcontrol.wait (SeqState untouched by prologue!).
   int k0_first = 0;
   bool full_first = false;
   if (tile_count > 0) {
     k0_first = k_min + tile_start * kBN;
     full_first = (k0_first + kBN <= past) && (past + 7 - k0_first < kWindow);
-    cp_async_ring_tile(smem.k[0], ring_k_base, k0_first, past, tid, full_first);
+    cp_async_ring_tile<false>(smem.k[0], ring_k_base, k0_first, past, tid, full_first);
+    cp_async_ring_tile<true>(smem.v, ring_v_base, k0_first, past, tid, full_first);
     cp_async_commit();
   }
 
   // Wait for attn_prologue_swa_verify to finish writing Q, Rel, KCur, VCur.
   asm volatile("griddepcontrol.wait;" ::: "memory");
 
-  // Immediately kick off Rel_0 cp.async (it==0) in parallel with Q load!
+  // Kick off Rel_0 cp.async in parallel with direct Q register load (zero smem_q, zero prologue sync!).
   if (tile_count > 0) {
     cp_async_rel_tile(smem.rel, Rel, q_start, kv_head, past, k0_first, tid, full_first);
     cp_async_commit();
   }
 
-  // Stage Q[24][128] bf16 (6 KB) into smem.k[1] (free until it==1!), then load into registers.
-  bf16 (*smem_q)[kHeadDim] = reinterpret_cast<bf16 (*)[kHeadDim]>(&smem.k[1][0][0]);
-#pragma unroll
-  for (int step = 0; step < 3; ++step) {
-    const int idx = tid + step * kThreads;
-    const int m = idx >> 4;
-    const int c16 = idx & 15;
-    const int tok = m / kGroup;
-    const int head = kv_head * kGroup + (m - tok * kGroup);
-    const int col_bf16 = c16 << 3;
-    const int sw_col = swiz_q_col(m, col_bf16);
-    const bf16* q_src = Q + (static_cast<int64_t>(q_start + tok) * kHeads + head) * kHeadDim + col_bf16;
-    *reinterpret_cast<uint4*>(&smem_q[m][sw_col]) = *reinterpret_cast<const uint4*>(q_src);
-  }
-  __syncthreads();
-
   uint32_t q_b0[8][3];
   uint32_t q_b1[8][3];
-#pragma unroll
-  for (int ds = 0; ds < 8; ++ds) {
-    const int d_step = ds << 4;
-#pragma unroll
-    for (int mt = 0; mt < 3; ++mt) {
-      const int q_m = mt * 8 + gid;
-      const int q_c0 = swiz_q_col(q_m, d_step) + tig * 2;
-      const int q_c1 = swiz_q_col(q_m, d_step + 8) + tig * 2;
-      q_b0[ds][mt] = *reinterpret_cast<const uint32_t*>(&smem_q[q_m][q_c0]);
-      q_b1[ds][mt] = *reinterpret_cast<const uint32_t*>(&smem_q[q_m][q_c1]);
-    }
-  }
+  load_q_direct_reg(q_b0, q_b1, Q, q_start, kv_head, gid, tig);
 
   const float qk_scale = sm_scale * kLog2E;
 
@@ -483,51 +533,43 @@ extern "C" __global__ void __launch_bounds__(kThreads, 3) kern_attn_swa_verify_s
     }
   }
 
-  int owned_tok[3][2];
-#pragma unroll
-  for (int mt = 0; mt < 3; ++mt) {
-    const int m0 = mt * 8 + tig * 2;
-    owned_tok[mt][0] = m0 / kGroup;
-    owned_tok[mt][1] = (m0 + 1) / kGroup;
-  }
+  const int k_local0 = w * 16 + gid;
+  const int k_local1 = k_local0 + 8;
+  const int rev0 = (kBN - 1) - k_local0;
+  const int rev1 = (kBN - 1) - k_local1;
 
-  // ---------------- Main Ring Loop (BN=64, 3-sync overlapped K+Rel / V pipeline) ----------------
+  // ---------------- Main Ring Loop (BN=64, hardware ldmatrix K/V + overlapped K+Rel / V) ----------------
   for (int it = 0; it < tile_count; ++it) {
     const int cur = it & 1;
     const int nxt = cur ^ 1;
     const int k0 = k_min + (tile_start + it) * kBN;
     const bool is_full_interior = (k0 + kBN <= past) && (past + 7 - k0 < kWindow);
 
-    // Issue V_it into smem.v while K_it + Rel_it finish and K_it @ Q^T runs!
-    cp_async_ring_tile(smem.v, ring_v_base, k0, past, tid, is_full_interior);
-    cp_async_commit();
-
-    // Wait for BOTH K_it and Rel_it (V_it stays in flight!).
-    cp_async_wait<1>();
+    if (it == 0) {
+      // K_0 + V_0 (started during prologue!) and Rel_0 are both in flight: wait for all.
+      cp_async_wait<0>();
+    } else {
+      // Issue V_it while K_it + Rel_it finish and K_it @ Q^T runs!
+      cp_async_ring_tile<true>(smem.v, ring_v_base, k0, past, tid, is_full_interior);
+      cp_async_commit();
+      cp_async_wait<1>();
+    }
     __syncthreads();
 
-    // Phase 1: S^T = K_it @ Q^T (64 x 24), Q directly from registers!
     float s[3][4];
-    compute_kq_tile_qreg(s, smem.k[cur], q_b0, q_b1, w, gid, tig);
+    compute_kq_tile_ldm(s, smem.k[cur], q_b0, q_b1, w, lane);
 
-    // Rel_it is ALREADY ready in smem.rel — zero wait, zero sync!
-    const int k_local0 = w * 16 + gid;
-    const int k_local1 = k_local0 + 8;
     const int k_abs0 = k0 + k_local0;
     const int k_abs1 = k0 + k_local1;
-    const int rev0 = (kBN - 1) - k_local0;
-    const int rev1 = (kBN - 1) - k_local1;
 
 #pragma unroll
     for (int mt = 0; mt < 3; ++mt) {
       const int m0 = mt * 8 + tig * 2;
       const int m1 = m0 + 1;
-      const int tok0 = owned_tok[mt][0];
-      const int tok1 = owned_tok[mt][1];
-      const int d_lo0 = (past + tok0) - (k0 + kBN - 1);
-      const int d_lo1 = (past + tok1) - (k0 + kBN - 1);
-      const int sh0 = d_lo0 & 7;
-      const int sh1 = d_lo1 & 7;
+      const int tok0 = m0 / kGroup;
+      const int tok1 = m1 / kGroup;
+      const int sh0 = ((past + tok0) - (k0 + kBN - 1)) & 7;
+      const int sh1 = ((past + tok1) - (k0 + kBN - 1)) & 7;
 
       if (is_full_interior) {
         const float r00 = __bfloat162float(smem.rel[m0][rev0 + sh0]);
@@ -562,8 +604,6 @@ extern "C" __global__ void __launch_bounds__(kThreads, 3) kern_attn_swa_verify_s
     }
     __syncthreads();
 
-    // Cross-warp rowmax (from smem.m), compute P -> smem.p, warp rowsum -> smem.l (disjoint from smem.m!).
-    // Note: smem.rel reads are ALL complete after the __syncthreads() above!
     float alpha[3][2];
 #pragma unroll
     for (int mt = 0; mt < 3; ++mt) {
@@ -598,20 +638,18 @@ extern "C" __global__ void __launch_bounds__(kThreads, 3) kern_attn_swa_verify_s
       }
     }
 
-    // Issue BOTH K_{it+1} and Rel_{it+1} in ONE cp.async group while V_it finishes and V_it^T @ P_it^T runs!
     if (it + 1 < tile_count) {
       const int k0_nxt = k_min + (tile_start + it + 1) * kBN;
       const bool full_nxt = (k0_nxt + kBN <= past) && (past + 7 - k0_nxt < kWindow);
-      cp_async_ring_tile(smem.k[nxt], ring_k_base, k0_nxt, past, tid, full_nxt);
+      cp_async_ring_tile<false>(smem.k[nxt], ring_k_base, k0_nxt, past, tid, full_nxt);
       cp_async_rel_tile(smem.rel, Rel, q_start, kv_head, past, k0_nxt, tid, full_nxt);
       cp_async_commit();
-      cp_async_wait<1>();
-    } else {
+      if (it > 0) cp_async_wait<1>();
+    } else if (it > 0) {
       cp_async_wait<0>();
     }
     __syncthreads();
 
-    // Update l_i and rescale acc by alpha.
 #pragma unroll
     for (int mt = 0; mt < 3; ++mt) {
       const int m0 = mt * 8 + tig * 2;
@@ -629,30 +667,28 @@ extern "C" __global__ void __launch_bounds__(kThreads, 3) kern_attn_swa_verify_s
       }
     }
 
-    // Phase 2: O^T += V_it^T @ P_it^T (128 x 24).
-    compute_vp_tile<4>(acc, smem.v, smem.p, w, gid, tig);
+    compute_vp_tile_ldm<4>(acc, smem.v, smem.p, w, lane, gid, tig);
 
-    // Ensure all warps finish reading smem.v before next iter overwrites it with V_{it+1}.
     if (it + 1 < tile_count || do_cur) {
       __syncthreads();
     }
   }
 
-  // ---------------- 8-key Cur Micro-Tile ----------------
+  // ---------------- 8-key Cur Micro-Tile (ldmatrix K/V!) ----------------
   if (do_cur) {
     const int r = tid >> 3;          // 0..15
     const int c16 = tid & 7;         // 0..7
     const int col_byte = c16 << 4;
-    const int sw_col = col_byte ^ ((r & 7) << 4);
+    const int sw = swiz_c16(r, c16);
     if (r < kQlen) {
       const int k_real = past + r;
       const bool valid_k = (k_real >= 0 && k_real < seqlen_k);
       const int64_t cur_off = (static_cast<int64_t>(q_start + r) * kKvHeads + kv_head) * kHeadDim + col_byte;
-      cp_async_cg_16_pred(&smem.k[0][r][sw_col], KCur + cur_off, valid_k ? 16 : 0);
-      cp_async_cg_16_pred(&smem.v[r][sw_col], VCur + cur_off, valid_k ? 16 : 0);
+      cp_async_cg_16_pred(&smem.k[0][r * 8 + sw], KCur + cur_off, valid_k ? 16 : 0);
+      cp_async_cg_16_pred(&smem.v[r * 8 + sw], VCur + cur_off, valid_k ? 16 : 0);
     } else {
-      *reinterpret_cast<uint4*>(&smem.k[0][r][sw_col]) = make_uint4(0u, 0u, 0u, 0u);
-      *reinterpret_cast<uint4*>(&smem.v[r][sw_col]) = make_uint4(0u, 0u, 0u, 0u);
+      smem.k[0][r * 8 + sw] = make_uint4(0u, 0u, 0u, 0u);
+      smem.v[r * 8 + sw] = make_uint4(0u, 0u, 0u, 0u);
     }
     if (tid < kM) {
       const int tok = tid / kGroup;
@@ -667,7 +703,7 @@ extern "C" __global__ void __launch_bounds__(kThreads, 3) kern_attn_swa_verify_s
 
     if (w == 0) {
       float s[3][4];
-      compute_kq_tile_qreg(s, smem.k[0], q_b0, q_b1, 0, gid, tig);
+      compute_kq_tile_ldm(s, smem.k[0], q_b0, q_b1, 0, lane);
 
       const int k_real = past + gid;
       const bool k_ok = (k_real >= 0 && k_real < seqlen_k);
@@ -675,8 +711,8 @@ extern "C" __global__ void __launch_bounds__(kThreads, 3) kern_attn_swa_verify_s
       for (int mt = 0; mt < 3; ++mt) {
         const int m0 = mt * 8 + tig * 2;
         const int m1 = m0 + 1;
-        const int d0 = owned_tok[mt][0] - gid;
-        const int d1 = owned_tok[mt][1] - gid;
+        const int d0 = (m0 / kGroup) - gid;
+        const int d1 = (m1 / kGroup) - gid;
         const bool v0 = k_ok && (d0 >= 0);
         const bool v1 = k_ok && (d1 >= 0);
         const float r0 = v0 ? __bfloat162float(smem.rel[m0][d0]) : 0.0f;
@@ -736,15 +772,13 @@ extern "C" __global__ void __launch_bounds__(kThreads, 3) kern_attn_swa_verify_s
         acc[dt][mt][3] *= a1;
       }
     }
-    compute_vp_tile<1>(acc, smem.v, smem.p, w, gid, tig);
+    compute_vp_tile_ldm<1>(acc, smem.v, smem.p, w, lane, gid, tig);
   }
 
-  // Launch dependent combine kernel (preloads Gate/Sink and waits at gdc_wait).
   asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 
-  // Stage normalized O into smem.k (16 KB -> float[24][128] = 12 KB) for coalesced float4 stores.
   __syncthreads();
-  float (*smem_o)[kHeadDim] = reinterpret_cast<float (*)[kHeadDim]>(&smem.k[0][0][0]);
+  float (*smem_o)[kHeadDim] = reinterpret_cast<float (*)[kHeadDim]>(&smem.k[0][0]);
 
 #pragma unroll
   for (int mt = 0; mt < 3; ++mt) {
@@ -762,8 +796,8 @@ extern "C" __global__ void __launch_bounds__(kThreads, 3) kern_attn_swa_verify_s
       smem_o[m1][d1] = acc[dt][mt][3] * inv1;
     }
     if (w == 0 && gid == 0) {
-      const int tok0 = owned_tok[mt][0];
-      const int tok1 = owned_tok[mt][1];
+      const int tok0 = m0 / kGroup;
+      const int tok1 = m1 / kGroup;
       const int h0 = kv_head * kGroup + (m0 - tok0 * kGroup);
       const int h1 = kv_head * kGroup + (m1 - tok1 * kGroup);
       const float lse0 = (l_i[mt][0] == 0.0f) ? kNegInf : (m_i[mt][0] + lg2_approx(l_i[mt][0]));
@@ -788,12 +822,10 @@ extern "C" __global__ void __launch_bounds__(kThreads, 3) kern_attn_swa_verify_s
 }
 
 // ---------------------------------------------------------------------------
-// 2. Full Attention Verify Split-KV Kernel (SM120, 3 CTAs/SM, 2-Phase Bulk+Tail)
-// Grid: [num_splits, 8 (kv_heads), seqs], Block: [128, 1, 1]
-// Splits all ceil(seqlen_k / 64) pages contiguously across num_splits.
-// Pages < n_bulk_pages (= max(0, past - 1023) / 64) run the ultra-tight ZERO-Rel,
-// ZERO-mask, pure-HBM-streaming bulk loop (~98-99% of pages at long context!).
-// Pages >= n_bulk_pages run the causal + Rel-bias tail loop seamlessly in the same CTA.
+// 2. Full Attention Verify Dynamic Split-KV Kernel (SM120, 3 CTAs/SM, PDL + ldmatrix)
+// Grid: [total_splits, 8 (kv_heads), 1], Block: [128, 1, 1]
+// Proportionally allocates total_splits (41 for seqs==1, 40 for seqs>=2) across
+// active sequences in proportion to page count (eliminating uneven-KV stragglers!).
 // ---------------------------------------------------------------------------
 extern "C" __global__ void __launch_bounds__(kThreads, 3) kern_attn_full_verify_split(
     const bf16* __restrict__ Q,
@@ -807,23 +839,58 @@ extern "C" __global__ void __launch_bounds__(kThreads, 3) kern_attn_full_verify_
     int table_width,
     float sm_scale,
     float v_scale,
-    int num_splits) {
-  const int split = blockIdx.x;
+    int total_splits) {
+  const int gsplit = blockIdx.x;
   const int kv_head = blockIdx.y;
-  const int req = blockIdx.z;
   const int tid = threadIdx.x;
   const int w = tid >> 5;
   const int lane = tid & 31;
   const int gid = lane >> 2;
   const int tig = lane & 3;
 
+  __shared__ SwaVerifySmem smem;
+
+  const int seqs = num_tokens >> 3;
+  int req = 0;
+  int split = gsplit;
+  int num_splits = total_splits;
+  int n_pages = 0;
+
+  if (seqs <= 1) {
+    const int sl = SeqLens[0];
+    n_pages = (sl > 0) ? ((sl + kPage - 1) >> 6) : 0;
+  } else {
+    int* sh_sp = reinterpret_cast<int*>(&smem.m[0][0]);
+    int* sh_np = reinterpret_cast<int*>(&smem.m[0][8]);
+    if (tid == 0) {
+      compute_dyn_splits_smem(SeqLens, seqs, total_splits, sh_sp, sh_np);
+    }
+    __syncthreads();
+    int rem = gsplit;
+    req = -1;
+    for (int r = 0; r < seqs; ++r) {
+      const int sp_r = sh_sp[r];
+      if (rem < sp_r) {
+        req = r;
+        split = rem;
+        num_splits = sp_r;
+        n_pages = sh_np[r];
+        break;
+      }
+      rem -= sp_r;
+    }
+    if (req < 0) {
+      asm volatile("griddepcontrol.wait;" ::: "memory");
+      asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+      return;
+    }
+  }
+
   const int q_start = req * kQlen;
   const int seqlen_k = SeqLens[req];
-  const int n_pages = (seqlen_k > 0) ? ((seqlen_k + kPage - 1) >> 6) : 0;
 
-  // Balanced contiguous partition of pages across num_splits.
-  const int base_pages = n_pages / num_splits;
-  const int rem_pages = n_pages % num_splits;
+  const int base_pages = (num_splits > 0) ? (n_pages / num_splits) : 0;
+  const int rem_pages = (num_splits > 0) ? (n_pages % num_splits) : 0;
   const int page_start = split * base_pages + (split < rem_pages ? split : rem_pages);
   const int page_count = base_pages + (split < rem_pages ? 1 : 0);
   const int page_end = page_start + page_count;
@@ -841,8 +908,6 @@ extern "C" __global__ void __launch_bounds__(kThreads, 3) kern_attn_full_verify_
   }
 
   const int past = seqlen_k - kQlen;
-  // Bulk pages: for page p < n_bulk_pages, max key k = (p+1)*64 - 1 <= past - 1024,
-  // so dist >= 1024 == E for all 8 query rows (zero Rel bias, zero causal mask, all 64 keys < seqlen_k!).
   const int n_bulk_pages = (past >= kRelExtent - 1) ? ((past - (kRelExtent - 1)) >> 6) : 0;
   const int bulk_end = (page_end < n_bulk_pages) ? page_end : n_bulk_pages;
   const int bulk_count = (bulk_end > page_start) ? (bulk_end - page_start) : 0;
@@ -850,53 +915,28 @@ extern "C" __global__ void __launch_bounds__(kThreads, 3) kern_attn_full_verify_
   const int tail_count = (page_end > tail_start) ? (page_end - tail_start) : 0;
 
   const int32_t* bt = BlockTable + static_cast<int64_t>(req) * table_width;
+  int cur_page = bt[page_start];
 
-  __shared__ SwaVerifySmem smem;
+  // For bulk splits (page_start < n_bulk_pages, strictly >= 16 pages older than newest page written by prologue!),
+  // prefetch BOTH K_0 and V_0 BEFORE griddepcontrol.wait to overlap DRAM latency with attn_prologue_full_verify!
+  if (bulk_count > 0) {
+    cp_async_page_tile<false, false>(smem.k[0], KVState, kv_head, cur_page, page_start << 6, seqlen_k, tid, true);
+    cp_async_page_tile<true, true>(smem.v, KVState, kv_head, cur_page, page_start << 6, seqlen_k, tid, true);
+    cp_async_commit();
+  }
 
   // Wait for attn_prologue_full_verify to finish writing Q, Rel, and newest KV page.
   asm volatile("griddepcontrol.wait;" ::: "memory");
 
-  // Prefetch first page's K (bulk if bulk_count > 0, else first tail page) in parallel with Q load!
-  int cur_page = bt[page_start];
-  if (bulk_count > 0) {
-    cp_async_page_tile<false>(smem.k[0], KVState, kv_head, cur_page, page_start << 6, seqlen_k, tid, true);
-    cp_async_commit();
-  } else {
-    cp_async_page_tile<false>(smem.k[0], KVState, kv_head, cur_page, tail_start << 6, seqlen_k, tid, false);
+  if (bulk_count == 0) {
+    cp_async_page_tile<false, false>(smem.k[0], KVState, kv_head, cur_page, tail_start << 6, seqlen_k, tid, false);
     cp_async_rel_tile(smem.rel, Rel, q_start, kv_head, past, tail_start << 6, tid, false);
     cp_async_commit();
   }
 
-  // Stage Q[24][128] bf16 (6 KB) into smem.k[1] (free until it==1!), then load into registers.
-  bf16 (*smem_q)[kHeadDim] = reinterpret_cast<bf16 (*)[kHeadDim]>(&smem.k[1][0][0]);
-#pragma unroll
-  for (int step = 0; step < 3; ++step) {
-    const int idx = tid + step * kThreads;
-    const int m = idx >> 4;
-    const int c16 = idx & 15;
-    const int tok = m / kGroup;
-    const int head = kv_head * kGroup + (m - tok * kGroup);
-    const int col_bf16 = c16 << 3;
-    const int sw_col = swiz_q_col(m, col_bf16);
-    const bf16* q_src = Q + (static_cast<int64_t>(q_start + tok) * kHeads + head) * kHeadDim + col_bf16;
-    *reinterpret_cast<uint4*>(&smem_q[m][sw_col]) = *reinterpret_cast<const uint4*>(q_src);
-  }
-  __syncthreads();
-
   uint32_t q_b0[8][3];
   uint32_t q_b1[8][3];
-#pragma unroll
-  for (int ds = 0; ds < 8; ++ds) {
-    const int d_step = ds << 4;
-#pragma unroll
-    for (int mt = 0; mt < 3; ++mt) {
-      const int q_m = mt * 8 + gid;
-      const int q_c0 = swiz_q_col(q_m, d_step) + tig * 2;
-      const int q_c1 = swiz_q_col(q_m, d_step + 8) + tig * 2;
-      q_b0[ds][mt] = *reinterpret_cast<const uint32_t*>(&smem_q[q_m][q_c0]);
-      q_b1[ds][mt] = *reinterpret_cast<const uint32_t*>(&smem_q[q_m][q_c1]);
-    }
-  }
+  load_q_direct_reg(q_b0, q_b1, Q, q_start, kv_head, gid, tig);
 
   const float qk_scale = sm_scale * kLog2E;
 
@@ -914,14 +954,6 @@ extern "C" __global__ void __launch_bounds__(kThreads, 3) kern_attn_full_verify_
     }
   }
 
-  int owned_tok[3][2];
-#pragma unroll
-  for (int mt = 0; mt < 3; ++mt) {
-    const int m0 = mt * 8 + tig * 2;
-    owned_tok[mt][0] = m0 / kGroup;
-    owned_tok[mt][1] = (m0 + 1) / kGroup;
-  }
-
   const int k_local0 = w * 16 + gid;
   const int k_local1 = k_local0 + 8;
 
@@ -932,19 +964,19 @@ extern "C" __global__ void __launch_bounds__(kThreads, 3) kern_attn_full_verify_
     const int p_idx = page_start + it;
     const int page = cur_page;
 
-    // Issue V_it cp.async while K_it finishes and K_it @ Q^T executes.
-    cp_async_page_tile<true>(smem.v, KVState, kv_head, page, p_idx << 6, seqlen_k, tid, true);
-    cp_async_commit();
-
-    // Wait for K_it (V_it stays in flight!).
-    cp_async_wait<1>();
+    if (it == 0) {
+      // K_0 + V_0 were prefetched together before griddepcontrol.wait!
+      cp_async_wait<0>();
+    } else {
+      cp_async_page_tile<true, true>(smem.v, KVState, kv_head, page, p_idx << 6, seqlen_k, tid, true);
+      cp_async_commit();
+      cp_async_wait<1>();
+    }
     __syncthreads();
 
-    // Phase 1: S^T = K_it @ Q^T (64 x 24), Q directly from registers.
     float s[3][4];
-    compute_kq_tile_qreg(s, smem.k[cur], q_b0, q_b1, w, gid, tig);
+    compute_kq_tile_ldm(s, smem.k[cur], q_b0, q_b1, w, lane);
 
-    // Pure bulk rowmax: ZERO Rel loads, ZERO causal/window checks (only page >= 0 guard)!
     const bool page_ok = (page >= 0);
 #pragma unroll
     for (int mt = 0; mt < 3; ++mt) {
@@ -993,24 +1025,22 @@ extern "C" __global__ void __launch_bounds__(kThreads, 3) kern_attn_full_verify_
       }
     }
 
-    // Prefetch next page's K (bulk or first tail page!) while V_it finishes and V_it^T @ P_it^T runs!
     if (it + 1 < bulk_count) {
       cur_page = bt[p_idx + 1];
-      cp_async_page_tile<false>(smem.k[nxt], KVState, kv_head, cur_page, (p_idx + 1) << 6, seqlen_k, tid, true);
+      cp_async_page_tile<false, false>(smem.k[nxt], KVState, kv_head, cur_page, (p_idx + 1) << 6, seqlen_k, tid, true);
       cp_async_commit();
-      cp_async_wait<1>();
+      if (it > 0) cp_async_wait<1>();
     } else if (tail_count > 0) {
       cur_page = bt[tail_start];
-      cp_async_page_tile<false>(smem.k[0], KVState, kv_head, cur_page, tail_start << 6, seqlen_k, tid, false);
+      cp_async_page_tile<false, false>(smem.k[0], KVState, kv_head, cur_page, tail_start << 6, seqlen_k, tid, false);
       cp_async_rel_tile(smem.rel, Rel, q_start, kv_head, past, tail_start << 6, tid, false);
       cp_async_commit();
-      cp_async_wait<1>();
-    } else {
+      if (it > 0) cp_async_wait<1>();
+    } else if (it > 0) {
       cp_async_wait<0>();
     }
     __syncthreads();
 
-    // Update l_i and rescale acc by alpha.
 #pragma unroll
     for (int mt = 0; mt < 3; ++mt) {
       const int m0 = mt * 8 + tig * 2;
@@ -1028,8 +1058,7 @@ extern "C" __global__ void __launch_bounds__(kThreads, 3) kern_attn_full_verify_
       }
     }
 
-    // Phase 2: O^T += V_it^T @ P_it^T (128 x 24).
-    compute_vp_tile<4>(acc, smem.v, smem.p, w, gid, tig);
+    compute_vp_tile_ldm<4>(acc, smem.v, smem.p, w, lane, gid, tig);
 
     if (it + 1 < bulk_count || tail_count > 0) {
       __syncthreads();
@@ -1046,16 +1075,13 @@ extern "C" __global__ void __launch_bounds__(kThreads, 3) kern_attn_full_verify_
     const int k0 = p_idx << 6;
     const int page = cur_page;
 
-    // Issue V_it cp.async while K_it + Rel_it finish and K_it @ Q^T runs!
-    cp_async_page_tile<true>(smem.v, KVState, kv_head, page, k0, seqlen_k, tid, false);
+    cp_async_page_tile<true, true>(smem.v, KVState, kv_head, page, k0, seqlen_k, tid, false);
     cp_async_commit();
-
-    // Wait for BOTH K_it and Rel_it (V_it stays in flight!).
     cp_async_wait<1>();
     __syncthreads();
 
     float s[3][4];
-    compute_kq_tile_qreg(s, smem.k[cur], q_b0, q_b1, w, gid, tig);
+    compute_kq_tile_ldm(s, smem.k[cur], q_b0, q_b1, w, lane);
 
     const bool page_ok = (page >= 0);
     const int k_abs0 = k0 + k_local0;
@@ -1067,12 +1093,10 @@ extern "C" __global__ void __launch_bounds__(kThreads, 3) kern_attn_full_verify_
     for (int mt = 0; mt < 3; ++mt) {
       const int m0 = mt * 8 + tig * 2;
       const int m1 = m0 + 1;
-      const int tok0 = owned_tok[mt][0];
-      const int tok1 = owned_tok[mt][1];
-      const int d_lo0 = (past + tok0) - (k0 + kBN - 1);
-      const int d_lo1 = (past + tok1) - (k0 + kBN - 1);
-      const int sh0 = d_lo0 & 7;
-      const int sh1 = d_lo1 & 7;
+      const int tok0 = m0 / kGroup;
+      const int tok1 = m1 / kGroup;
+      const int sh0 = ((past + tok0) - (k0 + kBN - 1)) & 7;
+      const int sh1 = ((past + tok1) - (k0 + kBN - 1)) & 7;
 
       const int dist00 = (past + tok0) - k_abs0;
       const int dist01 = (past + tok1) - k_abs0;
@@ -1083,8 +1107,6 @@ extern "C" __global__ void __launch_bounds__(kThreads, 3) kern_attn_full_verify_
       const bool v10 = kv_ok1 && (dist10 >= 0);
       const bool v11 = kv_ok1 && (dist11 >= 0);
 
-      // Note: smem.rel was zero-filled by cp_async_rel_tile for any aligned chunk >= 1024 or < 0,
-      // so for all dist >= 0, smem.rel[m][rev + sh] is exact Rel[dist] when dist < 1024 and 0.0f when dist >= 1024!
       s[mt][0] = v00 ? __fmaf_rn(s[mt][0], qk_scale, __bfloat162float(smem.rel[m0][rev0 + sh0]) * kLog2E) : kNegInf;
       s[mt][1] = v01 ? __fmaf_rn(s[mt][1], qk_scale, __bfloat162float(smem.rel[m1][rev0 + sh1]) * kLog2E) : kNegInf;
       s[mt][2] = v10 ? __fmaf_rn(s[mt][2], qk_scale, __bfloat162float(smem.rel[m0][rev1 + sh0]) * kLog2E) : kNegInf;
@@ -1135,7 +1157,7 @@ extern "C" __global__ void __launch_bounds__(kThreads, 3) kern_attn_full_verify_
 
     if (it + 1 < tail_count) {
       cur_page = bt[p_idx + 1];
-      cp_async_page_tile<false>(smem.k[nxt], KVState, kv_head, cur_page, (p_idx + 1) << 6, seqlen_k, tid, false);
+      cp_async_page_tile<false, false>(smem.k[nxt], KVState, kv_head, cur_page, (p_idx + 1) << 6, seqlen_k, tid, false);
       cp_async_rel_tile(smem.rel, Rel, q_start, kv_head, past, (p_idx + 1) << 6, tid, false);
       cp_async_commit();
       cp_async_wait<1>();
@@ -1161,18 +1183,17 @@ extern "C" __global__ void __launch_bounds__(kThreads, 3) kern_attn_full_verify_
       }
     }
 
-    compute_vp_tile<4>(acc, smem.v, smem.p, w, gid, tig);
+    compute_vp_tile_ldm<4>(acc, smem.v, smem.p, w, lane, gid, tig);
 
     if (it + 1 < tail_count) {
       __syncthreads();
     }
   }
 
-  // Launch dependent combine kernel (preloads Gate/Sink and waits at gdc_wait).
   asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 
   __syncthreads();
-  float (*smem_o)[kHeadDim] = reinterpret_cast<float (*)[kHeadDim]>(&smem.k[0][0][0]);
+  float (*smem_o)[kHeadDim] = reinterpret_cast<float (*)[kHeadDim]>(&smem.k[0][0]);
 
 #pragma unroll
   for (int mt = 0; mt < 3; ++mt) {
@@ -1190,8 +1211,8 @@ extern "C" __global__ void __launch_bounds__(kThreads, 3) kern_attn_full_verify_
       smem_o[m1][d1] = acc[dt][mt][3] * inv1;
     }
     if (w == 0 && gid == 0) {
-      const int tok0 = owned_tok[mt][0];
-      const int tok1 = owned_tok[mt][1];
+      const int tok0 = m0 / kGroup;
+      const int tok1 = m1 / kGroup;
       const int h0 = kv_head * kGroup + (m0 - tok0 * kGroup);
       const int h1 = kv_head * kGroup + (m1 - tok1 * kGroup);
       const float lse0 = (l_i[mt][0] == 0.0f) ? kNegInf : (m_i[mt][0] + lg2_approx(l_i[mt][0]));
@@ -1216,7 +1237,174 @@ extern "C" __global__ void __launch_bounds__(kThreads, 3) kern_attn_full_verify_
 }
 
 // ---------------------------------------------------------------------------
-// 3. Fast 1-Warp Float4 Split-KV Combine + Gate + Sink Epilogue (SM120)
+// 3. Fast 1-Warp 4-Way Pipelined Float4 Dynamic Split-KV Combine + Gate + Sink (SM120)
+// Grid: [num_tokens, 24 (heads), 1], Block: [32, 1, 1]
+// Issues up to 4 float4 OPart loads concurrently (4x MLP) while accumulating in
+// exact serial split order (100% bit-identical to static combine!).
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ void accum_active_splits_4x(
+    float& o0, float& o1, float& o2, float& o3,
+    uint32_t active_mask,
+    float w_norm_lane,
+    int s_base,
+    const float* __restrict__ OPart,
+    int64_t split_stride,
+    int64_t base_row_head,
+    int d4) {
+  while (active_mask != 0u) {
+    const int b0 = __ffs(active_mask) - 1;
+    active_mask &= (active_mask - 1u);
+    const float w0 = __shfl_sync(0xffffffffu, w_norm_lane, b0);
+    const float4 v0 = *reinterpret_cast<const float4*>(
+        OPart + (static_cast<int64_t>(s_base + b0) * split_stride + base_row_head) * kHeadDim + d4);
+    if (active_mask != 0u) {
+      const int b1 = __ffs(active_mask) - 1;
+      active_mask &= (active_mask - 1u);
+      const float w1 = __shfl_sync(0xffffffffu, w_norm_lane, b1);
+      const float4 v1 = *reinterpret_cast<const float4*>(
+          OPart + (static_cast<int64_t>(s_base + b1) * split_stride + base_row_head) * kHeadDim + d4);
+      if (active_mask != 0u) {
+        const int b2 = __ffs(active_mask) - 1;
+        active_mask &= (active_mask - 1u);
+        const float w2 = __shfl_sync(0xffffffffu, w_norm_lane, b2);
+        const float4 v2 = *reinterpret_cast<const float4*>(
+            OPart + (static_cast<int64_t>(s_base + b2) * split_stride + base_row_head) * kHeadDim + d4);
+        if (active_mask != 0u) {
+          const int b3 = __ffs(active_mask) - 1;
+          active_mask &= (active_mask - 1u);
+          const float w3 = __shfl_sync(0xffffffffu, w_norm_lane, b3);
+          const float4 v3 = *reinterpret_cast<const float4*>(
+              OPart + (static_cast<int64_t>(s_base + b3) * split_stride + base_row_head) * kHeadDim + d4);
+          o0 = __fmaf_rn(w0, v0.x, o0); o1 = __fmaf_rn(w0, v0.y, o1); o2 = __fmaf_rn(w0, v0.z, o2); o3 = __fmaf_rn(w0, v0.w, o3);
+          o0 = __fmaf_rn(w1, v1.x, o0); o1 = __fmaf_rn(w1, v1.y, o1); o2 = __fmaf_rn(w1, v1.z, o2); o3 = __fmaf_rn(w1, v1.w, o3);
+          o0 = __fmaf_rn(w2, v2.x, o0); o1 = __fmaf_rn(w2, v2.y, o1); o2 = __fmaf_rn(w2, v2.z, o2); o3 = __fmaf_rn(w2, v2.w, o3);
+          o0 = __fmaf_rn(w3, v3.x, o0); o1 = __fmaf_rn(w3, v3.y, o1); o2 = __fmaf_rn(w3, v3.z, o2); o3 = __fmaf_rn(w3, v3.w, o3);
+          continue;
+        }
+        o0 = __fmaf_rn(w0, v0.x, o0); o1 = __fmaf_rn(w0, v0.y, o1); o2 = __fmaf_rn(w0, v0.z, o2); o3 = __fmaf_rn(w0, v0.w, o3);
+        o0 = __fmaf_rn(w1, v1.x, o0); o1 = __fmaf_rn(w1, v1.y, o1); o2 = __fmaf_rn(w1, v1.z, o2); o3 = __fmaf_rn(w1, v1.w, o3);
+        o0 = __fmaf_rn(w2, v2.x, o0); o1 = __fmaf_rn(w2, v2.y, o1); o2 = __fmaf_rn(w2, v2.z, o2); o3 = __fmaf_rn(w2, v2.w, o3);
+        continue;
+      }
+      o0 = __fmaf_rn(w0, v0.x, o0); o1 = __fmaf_rn(w0, v0.y, o1); o2 = __fmaf_rn(w0, v0.z, o2); o3 = __fmaf_rn(w0, v0.w, o3);
+      o0 = __fmaf_rn(w1, v1.x, o0); o1 = __fmaf_rn(w1, v1.y, o1); o2 = __fmaf_rn(w1, v1.z, o2); o3 = __fmaf_rn(w1, v1.w, o3);
+      continue;
+    }
+    o0 = __fmaf_rn(w0, v0.x, o0); o1 = __fmaf_rn(w0, v0.y, o1); o2 = __fmaf_rn(w0, v0.z, o2); o3 = __fmaf_rn(w0, v0.w, o3);
+  }
+}
+
+extern "C" __global__ void __launch_bounds__(32) kern_attn_verify_combine_dyn(
+    const float* __restrict__ OPart,
+    const float* __restrict__ LsePart,
+    const bf16* __restrict__ Gate,
+    const bf16* __restrict__ Sink,
+    const int32_t* __restrict__ SeqLens,
+    bf16* __restrict__ Y,
+    int num_tokens,
+    int stride_gate,
+    int stride_sink,
+    int total_splits) {
+  const int64_t row = blockIdx.x;
+  const int head = blockIdx.y;
+  const int lane = threadIdx.x;
+  const int d4 = lane << 2;
+
+  __shared__ int sh_sp[8];
+  __shared__ int sh_np[8];
+
+  const int seqs = num_tokens >> 3;
+  const int req = static_cast<int>(row >> 3);
+  int ns = total_splits;
+  if (seqs <= 1) {
+    ns = (SeqLens[0] > 0) ? total_splits : 0;
+  } else {
+    if (lane == 0) {
+      compute_dyn_splits_smem(SeqLens, seqs, total_splits, sh_sp, sh_np);
+    }
+    __syncwarp();
+    ns = sh_sp[req];
+  }
+
+  // Preload Gate and Sink BEFORE griddepcontrol.wait!
+  const uint2 gate_raw = *reinterpret_cast<const uint2*>(
+      Gate + row * stride_gate + head * kHeadDim + d4);
+  const bf16* g_bf = reinterpret_cast<const bf16*>(&gate_raw);
+  const float g0 = __bfloat162float(g_bf[0]);
+  const float g1 = __bfloat162float(g_bf[1]);
+  const float g2 = __bfloat162float(g_bf[2]);
+  const float g3 = __bfloat162float(g_bf[3]);
+  const float sink_val = __bfloat162float(Sink[row * stride_sink + head]);
+
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+
+  bf16* dst = Y + row * (kHeads * kHeadDim) + head * kHeadDim + d4;
+  if (ns <= 0) {
+    *reinterpret_cast<uint2*>(dst) = make_uint2(0u, 0u);
+    return;
+  }
+
+  const int64_t base_row_head = row * kHeads + head;
+  const int64_t split_stride = static_cast<int64_t>(num_tokens) * kHeads;
+
+  const float lse_s = (lane < ns)
+      ? LsePart[static_cast<int64_t>(lane) * split_stride + base_row_head]
+      : kNegInf;
+  const float lse_s1 = ((lane + 32) < ns)
+      ? LsePart[static_cast<int64_t>(lane + 32) * split_stride + base_row_head]
+      : kNegInf;
+  float lse_max = fmaxf(lse_s, lse_s1);
+#pragma unroll
+  for (int off = 16; off >= 1; off >>= 1) {
+    lse_max = fmaxf(lse_max, __shfl_xor_sync(0xffffffffu, lse_max, off));
+  }
+
+  if (lse_max == kNegInf) {
+    *reinterpret_cast<uint2*>(dst) = make_uint2(0u, 0u);
+    return;
+  }
+
+  const float w_lane = (lane < ns) ? ex2_approx(lse_s - lse_max) : 0.0f;
+  const float w_lane1 = ((lane + 32) < ns) ? ex2_approx(lse_s1 - lse_max) : 0.0f;
+  float w_sum = w_lane + w_lane1;
+#pragma unroll
+  for (int off = 16; off >= 1; off >>= 1) {
+    w_sum += __shfl_xor_sync(0xffffffffu, w_sum, off);
+  }
+
+  if (w_sum == 0.0f) {
+    *reinterpret_cast<uint2*>(dst) = make_uint2(0u, 0u);
+    return;
+  }
+
+  const float inv_w_sum = 1.0f / w_sum;
+  const float wn0 = w_lane * inv_w_sum;
+  const float wn1 = w_lane1 * inv_w_sum;
+
+  float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
+  accum_active_splits_4x(
+      o0, o1, o2, o3, __ballot_sync(0xffffffffu, w_lane > 0.0f),
+      wn0, 0, OPart, split_stride, base_row_head, d4);
+  if (ns > 32) {
+    accum_active_splits_4x(
+        o0, o1, o2, o3, __ballot_sync(0xffffffffu, w_lane1 > 0.0f),
+        wn1, 32, OPart, split_stride, base_row_head, d4);
+  }
+
+  const float lse_nat = (lg2_approx(w_sum) + lse_max) * kLn2;
+  const float sink_scale = sigmoid_fast(lse_nat - sink_val);
+
+  uint2 out_raw;
+  bf16* out_bf = reinterpret_cast<bf16*>(&out_raw);
+  out_bf[0] = __float2bfloat16_rn(o0 * sigmoid_fast(g0) * sink_scale);
+  out_bf[1] = __float2bfloat16_rn(o1 * sigmoid_fast(g1) * sink_scale);
+  out_bf[2] = __float2bfloat16_rn(o2 * sigmoid_fast(g2) * sink_scale);
+  out_bf[3] = __float2bfloat16_rn(o3 * sigmoid_fast(g3) * sink_scale);
+  *reinterpret_cast<uint2*>(dst) = out_raw;
+}
+
+// ---------------------------------------------------------------------------
+// 4. Fast 1-Warp Float4 Static Split-KV Combine + Gate + Sink Epilogue (SM120)
 // Grid: [num_tokens, 24 (heads), 1], Block: [32, 1, 1]
 // ---------------------------------------------------------------------------
 template <int NUM_SPLITS>
@@ -1288,34 +1476,15 @@ __device__ __forceinline__ void attn_verify_combine_impl(
   const float inv_w_sum = 1.0f / w_sum;
   const float w_norm_lane = w_lane * inv_w_sum;
 
-  uint32_t active_mask = __ballot_sync(0xffffffffu, w_lane > 0.0f);
-
   float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
-  while (active_mask != 0u) {
-    const int s = __ffs(active_mask) - 1;
-    active_mask &= (active_mask - 1u);
-    const float ws = __shfl_sync(0xffffffffu, w_norm_lane, s);
-    const int64_t part = static_cast<int64_t>(s) * split_stride + base_row_head;
-    const float4 v = *reinterpret_cast<const float4*>(OPart + part * kHeadDim + d4);
-    o0 = __fmaf_rn(ws, v.x, o0);
-    o1 = __fmaf_rn(ws, v.y, o1);
-    o2 = __fmaf_rn(ws, v.z, o2);
-    o3 = __fmaf_rn(ws, v.w, o3);
-  }
+  accum_active_splits_4x(
+      o0, o1, o2, o3, __ballot_sync(0xffffffffu, w_lane > 0.0f),
+      w_norm_lane, 0, OPart, split_stride, base_row_head, d4);
   if constexpr (NUM_SPLITS > 32) {
     const float w_norm_lane1 = w_lane1 * inv_w_sum;
-    uint32_t active_mask1 = __ballot_sync(0xffffffffu, w_lane1 > 0.0f);
-    while (active_mask1 != 0u) {
-      const int b = __ffs(active_mask1) - 1;
-      active_mask1 &= (active_mask1 - 1u);
-      const float ws = __shfl_sync(0xffffffffu, w_norm_lane1, b);
-      const int64_t part = static_cast<int64_t>(b + 32) * split_stride + base_row_head;
-      const float4 v = *reinterpret_cast<const float4*>(OPart + part * kHeadDim + d4);
-      o0 = __fmaf_rn(ws, v.x, o0);
-      o1 = __fmaf_rn(ws, v.y, o1);
-      o2 = __fmaf_rn(ws, v.z, o2);
-      o3 = __fmaf_rn(ws, v.w, o3);
-    }
+    accum_active_splits_4x(
+        o0, o1, o2, o3, __ballot_sync(0xffffffffu, w_lane1 > 0.0f),
+        w_norm_lane1, 32, OPart, split_stride, base_row_head, d4);
   }
 
   const float lse_nat = (lg2_approx(w_sum) + lse_max) * kLn2;

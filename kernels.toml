@@ -107,7 +107,7 @@ flags = "plain"
 includes = []
 
 [kernels."rel_verify_sm120"]
-sha256 = "1bc1d9f2eefa90805bcb1b984c4879203a5a71fcc12ae009ec9f1855d49589e8"
+sha256 = "940308c8948ae4754bb6cb74f8467a69791f6ffee677fa2d3a5f9f54992f6b50"
 milestone = "M3"
 source = "source/rel_verify_sm120.cu"
 flags = "plain"
@@ -136,7 +136,7 @@ flags = "plain"
 includes = []
 
 [kernels."spec_round"]
-sha256 = "0795ad7c64b98147fc36663267fa1527d3d90ece6fe9a13e2899baa2219aff7f"
+sha256 = "94b5a1e774453ede5042eea08621b8d8fa38038373ac8b25d3db40d6da320f84"
 milestone = "M4"
 source = "source/spec_round.cu"
 flags = "plain"

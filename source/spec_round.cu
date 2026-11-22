@@ -84,7 +84,7 @@ __device__ __forceinline__ uint32_t ds_smem_u32(const void* ptr) {
 
 __device__ __forceinline__ void ds_cp_async_cg_16(void* dst_smem, const void* src_gmem) {
   uint32_t dst = ds_smem_u32(dst_smem);
-  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(dst), "l"(src_gmem) : "memory");
+  asm volatile("cp.async.cg.shared.global.L2::256B [%0], [%1], 16;\n" :: "r"(dst), "l"(src_gmem) : "memory");
 }
 
 __device__ __forceinline__ void ds_cp_async_cg_16_pred(void* dst_smem, const void* src_gmem, int src_size) {
@@ -108,16 +108,33 @@ __device__ __forceinline__ uint32_t ds_cvt_e4m3x2_to_bf16x2(uint16_t x) {
   return res;
 }
 
+__device__ __forceinline__ void ds_ldmatrix_x4(
+    uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3, const void* smem_ptr) {
+  uint32_t addr = ds_smem_u32(smem_ptr);
+  asm volatile(
+      "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+      : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+      : "r"(addr));
+}
+
+__device__ __forceinline__ void ds_ldmatrix_x2_trans_b8(
+    uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3, const void* smem_ptr) {
+  uint32_t addr = ds_smem_u32(smem_ptr);
+  asm volatile(
+      "ldmatrix.sync.aligned.m16n16.x2.trans.shared.b8 {%0, %1, %2, %3}, [%4];\n"
+      : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+      : "r"(addr));
+}
+
 __device__ __forceinline__ void ds_mma_m16n8k16_bf16(
     float (&c)[4],
-    const uint32_t (&a)[4],
-    uint32_t b0,
-    uint32_t b1) {
+    uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+    uint32_t b0, uint32_t b1) {
   asm volatile(
       "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
       "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
       : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
 __device__ __forceinline__ float ds_ex2_approx(float x) {
@@ -136,6 +153,10 @@ __device__ __forceinline__ int ds_swiz_q_col(int row, int col_bf16) {
   return col_bf16 ^ ((row & 7) << 3);
 }
 
+__device__ __forceinline__ int ds_swiz_c16(int row, int c16) {
+  return c16 ^ (row & 7);
+}
+
 __device__ __forceinline__ float ds_col_reduce_max8(float v) {
   v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, 4));
   v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, 8));
@@ -150,9 +171,10 @@ __device__ __forceinline__ float ds_col_reduce_sum8(float v) {
   return v;
 }
 
-// Load 64x128 FP8 page/ring tile into dst[64][128] with 16B XOR swizzle.
+// Load 64x128 FP8 page/ring tile (K or V) into dst[512] uint4 with 16B XOR swizzle.
+template <bool PERM_V>
 __device__ __forceinline__ void ds_cp_async_paged_tile(
-    uint8_t (&dst)[kDsBN][kDsHeadDim],
+    uint4* __restrict__ dst,
     const uint8_t* __restrict__ page_base,
     int64_t kv_slot_stride,
     int k0,
@@ -160,125 +182,115 @@ __device__ __forceinline__ void ds_cp_async_paged_tile(
     int prefix,
     int tid,
     bool full_valid) {
+  (void)PERM_V;
   const int c16 = tid & 7;
   const int r0 = tid >> 3;
   const int col_byte = c16 << 4;
 #pragma unroll
   for (int step = 0; step < 4; ++step) {
     const int r = r0 + step * 16;
-    const int swiz_col = col_byte ^ ((r & 7) << 4);
     const uint8_t* src = page_base + static_cast<int64_t>(r) * kv_slot_stride + col_byte;
     if (full_valid) {
-      ds_cp_async_cg_16(&dst[r][swiz_col], src);
+      ds_cp_async_cg_16(&dst[r * 8 + ds_swiz_c16(r, c16)], src);
     } else {
       const int key = k0 + r;
       const int sz = (key >= first_key && key < prefix) ? 16 : 0;
-      ds_cp_async_cg_16_pred(&dst[r][swiz_col], src, sz);
+      ds_cp_async_cg_16_pred(&dst[r * 8 + ds_swiz_c16(r, c16)], src, sz);
     }
   }
 }
 
-// S^T = K_fp8[64x128] @ Q^T[128x24] for warp w (keys w*16..w*16+15).
-__device__ __forceinline__ void ds_compute_kq_fp8_qreg(
+// S^T = K_fp8[64x128] @ Q^T[128x24] for warp w (keys w*16..w*16+15) via 4 hardware ldmatrix_x4!
+__device__ __forceinline__ void ds_compute_kq_fp8_ldm(
     float (&s)[3][4],
-    const uint8_t (&smem_k)[kDsBN][kDsHeadDim],
+    const uint4* __restrict__ smem_k,
     const uint32_t (&q_b0)[8][3],
     const uint32_t (&q_b1)[8][3],
     int w,
-    int gid,
-    int tig) {
+    int lane) {
 #pragma unroll
   for (int mt = 0; mt < 3; ++mt) {
     s[mt][0] = 0.0f; s[mt][1] = 0.0f; s[mt][2] = 0.0f; s[mt][3] = 0.0f;
   }
-  const int k_row0 = w * 16 + gid;
-  const int k_row1 = k_row0 + 8;
-  const int sw_k0 = (k_row0 & 7) << 4;
-  const int sw_k1 = (k_row1 & 7) << 4;
+  const int k_ld_row = w * 16 + ((lane >> 4) << 3) + (lane & 7);
+  const int k_ld_c16_off = (lane >> 3) & 1;
 
 #pragma unroll
-  for (int ds = 0; ds < 8; ++ds) {
-    const int d_step = ds << 4;
-    const int k_col0 = (d_step ^ sw_k0) + tig * 2;
-    const int k_col1 = (d_step ^ sw_k1) + tig * 2;
-    uint16_t raw0 = *reinterpret_cast<const uint16_t*>(&smem_k[k_row0][k_col0]);
-    uint16_t raw1 = *reinterpret_cast<const uint16_t*>(&smem_k[k_row1][k_col1]);
-    uint16_t raw2 = *reinterpret_cast<const uint16_t*>(&smem_k[k_row0][k_col0 + 8]);
-    uint16_t raw3 = *reinterpret_cast<const uint16_t*>(&smem_k[k_row1][k_col1 + 8]);
-    uint32_t a[4];
-    a[0] = ds_cvt_e4m3x2_to_bf16x2(raw0);
-    a[1] = ds_cvt_e4m3x2_to_bf16x2(raw1);
-    a[2] = ds_cvt_e4m3x2_to_bf16x2(raw2);
-    a[3] = ds_cvt_e4m3x2_to_bf16x2(raw3);
+  for (int ds2 = 0; ds2 < 4; ++ds2) {
+    uint32_t b0, b1, b2, b3;
+    ds_ldmatrix_x4(b0, b1, b2, b3, &smem_k[k_ld_row * 8 + ds_swiz_c16(k_ld_row, ds2 * 2 + k_ld_c16_off)]);
+    const int ds_lo = ds2 * 2;
+    const int ds_hi = ds_lo + 1;
+    uint32_t a0 = ds_cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(b0));
+    uint32_t a1 = ds_cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(b2));
+    uint32_t a2 = ds_cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(b0 >> 16));
+    uint32_t a3 = ds_cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(b2 >> 16));
 #pragma unroll
     for (int mt = 0; mt < 3; ++mt) {
-      ds_mma_m16n8k16_bf16(s[mt], a, q_b0[ds][mt], q_b1[ds][mt]);
+      ds_mma_m16n8k16_bf16(s[mt], a0, a1, a2, a3, q_b0[ds_lo][mt], q_b1[ds_lo][mt]);
+    }
+    uint32_t c0 = ds_cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(b1));
+    uint32_t c1 = ds_cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(b3));
+    uint32_t c2 = ds_cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(b1 >> 16));
+    uint32_t c3 = ds_cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(b3 >> 16));
+#pragma unroll
+    for (int mt = 0; mt < 3; ++mt) {
+      ds_mma_m16n8k16_bf16(s[mt], c0, c1, c2, c3, q_b0[ds_hi][mt], q_b1[ds_hi][mt]);
     }
   }
 }
 
-// O^T += V_fp8^T[128x64] @ P^T[64x24] for warp w (dims w*32..w*32+31).
-__device__ __forceinline__ void ds_compute_vp_fp8_tile(
+// O^T += V_fp8^T[128x64] @ P^T[64x24] for warp w (dims w*32..w*32+31) via 4 hardware ldmatrix_x2_trans_b8!
+__device__ __forceinline__ void ds_compute_vp_fp8_ldm(
     float (&acc)[2][3][4],
-    const uint8_t (&smem_v)[kDsBN][kDsHeadDim],
+    const uint4* __restrict__ smem_v,
     const bf16 (&smem_p)[kDsM][kDsPRow],
     int w,
+    int lane,
     int gid,
     int tig) {
+  const int v_dp = w * 2 + (lane >> 4);
+  const int v_r_off = lane & 15;
 #pragma unroll
   for (int ks = 0; ks < 4; ++ks) {
     const int k_base = ks * 16;
-    const int k0 = k_base + tig * 2;
-    const int k1 = k0 + 1;
-    const int k2 = k0 + 8;
-    const int k3 = k2 + 1;
-    const int sw0 = (k0 & 7) << 4;
-    const int sw1 = (k1 & 7) << 4;
-    const int sw2 = (k2 & 7) << 4;
-    const int sw3 = (k3 & 7) << 4;
+    const int vr = k_base + v_r_off;
+    uint32_t vb0, vb1, vb2, vb3;
+    ds_ldmatrix_x2_trans_b8(vb0, vb1, vb2, vb3, &smem_v[vr * 8 + ds_swiz_c16(vr, v_dp)]);
 
     uint32_t b0[3], b1[3];
 #pragma unroll
     for (int mt = 0; mt < 3; ++mt) {
       const int m = mt * 8 + gid;
-      b0[mt] = *reinterpret_cast<const uint32_t*>(&smem_p[m][k0]);
-      b1[mt] = *reinterpret_cast<const uint32_t*>(&smem_p[m][k2]);
+      const uint2 pv = *reinterpret_cast<const uint2*>(&smem_p[m][k_base + tig * 4]);
+      b0[mt] = pv.x;
+      b1[mt] = pv.y;
     }
 
+    uint32_t a0 = ds_cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(vb0));
+    uint32_t a1 = ds_cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(vb1));
+    uint32_t a2 = ds_cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(vb0 >> 16));
+    uint32_t a3 = ds_cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(vb1 >> 16));
 #pragma unroll
-    for (int dt = 0; dt < 2; ++dt) {
-      const int d_base = w * 32 + dt * 16;
-      const int d_off0 = (d_base ^ sw0) + gid;
-      const int d_off1 = (d_base ^ sw1) + gid;
-      const int d_off2 = (d_base ^ sw2) + gid;
-      const int d_off3 = (d_base ^ sw3) + gid;
+    for (int mt = 0; mt < 3; ++mt) {
+      ds_mma_m16n8k16_bf16(acc[0][mt], a0, a1, a2, a3, b0[mt], b1[mt]);
+    }
 
-      uint16_t v_lo0 = static_cast<uint16_t>(smem_v[k0][d_off0])
-                     | (static_cast<uint16_t>(smem_v[k1][d_off1]) << 8);
-      uint16_t v_hi0 = static_cast<uint16_t>(smem_v[k0][d_off0 + 8])
-                     | (static_cast<uint16_t>(smem_v[k1][d_off1 + 8]) << 8);
-      uint16_t v_lo1 = static_cast<uint16_t>(smem_v[k2][d_off2])
-                     | (static_cast<uint16_t>(smem_v[k3][d_off3]) << 8);
-      uint16_t v_hi1 = static_cast<uint16_t>(smem_v[k2][d_off2 + 8])
-                     | (static_cast<uint16_t>(smem_v[k3][d_off3 + 8]) << 8);
-
-      uint32_t a[4];
-      a[0] = ds_cvt_e4m3x2_to_bf16x2(v_lo0);
-      a[1] = ds_cvt_e4m3x2_to_bf16x2(v_hi0);
-      a[2] = ds_cvt_e4m3x2_to_bf16x2(v_lo1);
-      a[3] = ds_cvt_e4m3x2_to_bf16x2(v_hi1);
+    uint32_t c0 = ds_cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(vb2));
+    uint32_t c1 = ds_cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(vb3));
+    uint32_t c2 = ds_cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(vb2 >> 16));
+    uint32_t c3 = ds_cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(vb3 >> 16));
 #pragma unroll
-      for (int mt = 0; mt < 3; ++mt) {
-        ds_mma_m16n8k16_bf16(acc[dt][mt], a, b0[mt], b1[mt]);
-      }
+    for (int mt = 0; mt < 3; ++mt) {
+      ds_mma_m16n8k16_bf16(acc[1][mt], c0, c1, c2, c3, b0[mt], b1[mt]);
     }
   }
 }
 
 // Total static SMEM = 28,800 B -> 3 CTAs/SM = 89.5 KB <= 101,376 B on SM120!
 struct DsparkPagedSmem {
-  alignas(16) uint8_t k[2][kDsBN][kDsHeadDim];  // 16,384 B (k[1] stages Q; k[0..1] stages O at epilogue)
-  alignas(16) uint8_t v[kDsBN][kDsHeadDim];     //  8,192 B (also holds live BF16 V)
+  alignas(16) uint4 k[2][kDsBN * 8];            // 16,384 B (reused for live K and O epilogue staging)
+  alignas(16) uint4 v[kDsBN * 8];               //  8,192 B (also holds live BF16 V)
   alignas(16) bf16 p[kDsM][kDsPRow];            //  3,456 B
   alignas(16) float m[4][kDsM];                 //    384 B
   alignas(16) float l[4][kDsM];                 //    384 B
@@ -397,52 +409,40 @@ __device__ __forceinline__ void dspark_attn_split_sm120_impl(
     }
   };
 
-  // Prefetch first K tile into smem.k[0] while staging Q into smem.k[1].
+  // Prefetch BOTH first K and V tiles into smem.k[0] + smem.v in parallel with direct Q load!
   if (tile_count > 0) {
     const int k0_first = tile_start * kDsBN;
     const uint8_t* p0_base = tile_k_ptr(tile_start);
     const bool full0 = (k0_first >= first_key) && (k0_first + kDsBN <= prefix);
-    ds_cp_async_paged_tile(smem.k[0], p0_base, slot_stride, k0_first, first_key, prefix, tid, full0);
+    ds_cp_async_paged_tile<false>(smem.k[0], p0_base, slot_stride, k0_first, first_key, prefix, tid, full0);
+    ds_cp_async_paged_tile<true>(smem.v, p0_base + v_offset, slot_stride, k0_first, first_key, prefix, tid, full0);
     ds_cp_async_commit();
   }
 
-  // Stage Q[24][128] bf16 into smem.k[1] (6 KB <= 8 KB), then load into registers.
-  bf16 (*smem_q)[kDsHeadDim] = reinterpret_cast<bf16 (*)[kDsHeadDim]>(&smem.k[1][0][0]);
-#pragma unroll
-  for (int step = 0; step < 3; ++step) {
-    const int idx = tid + step * kDsThreads;
-    const int m = idx >> 4;
-    const int c16 = idx & 15;
-    const int tok = m / kDsGroup;
-    const int head = kv_head * kDsGroup + (m - tok * kDsGroup);
-    const int col_bf16 = c16 << 3;
-    const int sw_col = ds_swiz_q_col(m, col_bf16);
-    const int token = q_start + tok;
-    if (token < num_tokens) {
-      const bf16* q_src = Q + static_cast<int64_t>(token) * stride_q_t + head * kDsHeadDim + col_bf16;
-      *reinterpret_cast<uint4*>(&smem_q[m][sw_col]) = *reinterpret_cast<const uint4*>(q_src);
-    } else {
-      *reinterpret_cast<uint4*>(&smem_q[m][sw_col]) = make_uint4(0u, 0u, 0u, 0u);
-    }
-  }
-  __syncthreads();
-
+  // Load Q[24][128] BF16 directly into registers matching ldmatrix_x4 K layout (d = ds*16 + tig*4..+3).
   uint32_t q_b0[8][3];
   uint32_t q_b1[8][3];
 #pragma unroll
-  for (int ds = 0; ds < 8; ++ds) {
-    const int d_step = ds << 4;
+  for (int mt = 0; mt < 3; ++mt) {
+    const int m = mt * 8 + gid;
+    const int tok = m / kDsGroup;
+    const int head = kv_head * kDsGroup + (m - tok * kDsGroup);
+    const int token = q_start + tok;
+    const bf16* q_row = (token < num_tokens)
+        ? (Q + static_cast<int64_t>(token) * stride_q_t + head * kDsHeadDim)
+        : nullptr;
 #pragma unroll
-    for (int mt = 0; mt < 3; ++mt) {
-      const int q_m = mt * 8 + gid;
-      const int q_c0 = ds_swiz_q_col(q_m, d_step) + tig * 2;
-      const int q_c1 = ds_swiz_q_col(q_m, d_step + 8) + tig * 2;
-      q_b0[ds][mt] = *reinterpret_cast<const uint32_t*>(&smem_q[q_m][q_c0]);
-      q_b1[ds][mt] = *reinterpret_cast<const uint32_t*>(&smem_q[q_m][q_c1]);
+    for (int ds = 0; ds < 8; ++ds) {
+      if (token < num_tokens) {
+        const uint2 qv = *reinterpret_cast<const uint2*>(q_row + ds * 16 + tig * 4);
+        q_b0[ds][mt] = qv.x;
+        q_b1[ds][mt] = qv.y;
+      } else {
+        q_b0[ds][mt] = 0u;
+        q_b1[ds][mt] = 0u;
+      }
     }
   }
-  // Ensure all threads finish reading smem.k[1] (Q) before iter 0 prefetches K_1 into smem.k[1].
-  __syncthreads();
 
   const float qk_scale_old = softmax_scale * k_scale * kDsLog2E;
 
@@ -468,19 +468,19 @@ __device__ __forceinline__ void dspark_attn_split_sm120_impl(
     const int k0 = page_idx * kDsBN;
     const bool is_full = (k0 >= first_key) && (k0 + kDsBN <= prefix);
 
-    const uint8_t* v_base = tile_k_ptr(page_idx) + v_offset;
-
-    // Issue V_it into smem.v while K_it finishes and K_it @ Q^T runs.
-    ds_cp_async_paged_tile(smem.v, v_base, slot_stride, k0, first_key, prefix, tid, is_full);
-    ds_cp_async_commit();
-
-    // Wait for K_it (V_it stays in flight!).
-    ds_cp_async_wait<1>();
+    if (it == 0) {
+      ds_cp_async_wait<0>();
+    } else {
+      const uint8_t* v_base = tile_k_ptr(page_idx) + v_offset;
+      ds_cp_async_paged_tile<true>(smem.v, v_base, slot_stride, k0, first_key, prefix, tid, is_full);
+      ds_cp_async_commit();
+      ds_cp_async_wait<1>();
+    }
     __syncthreads();
 
-    // Phase 1: S^T = K_it @ Q^T (64 x 24).
+    // Phase 1: S^T = K_it @ Q^T (64 x 24) via 4 hardware ldmatrix_x4!
     float s[3][4];
-    ds_compute_kq_fp8_qreg(s, smem.k[cur], q_b0, q_b1, w, gid, tig);
+    ds_compute_kq_fp8_ldm(s, smem.k[cur], q_b0, q_b1, w, lane);
 
     const int k_local0 = w * 16 + gid;
     const int k_local1 = k_local0 + 8;
@@ -545,16 +545,16 @@ __device__ __forceinline__ void dspark_attn_split_sm120_impl(
       }
     }
 
-    // Prefetch K_{it+1} into smem.k[nxt] while waiting for V_it.
+    // Prefetch K_{it+1} into smem.k[nxt] while waiting for V_it (V_0 already ready on it==0!).
     if (it + 1 < tile_count) {
       const int next_pidx = page_idx + 1;
       const int k0_nxt = next_pidx * kDsBN;
       const uint8_t* kn_base = tile_k_ptr(next_pidx);
       const bool full_nxt = (k0_nxt >= first_key) && (k0_nxt + kDsBN <= prefix);
-      ds_cp_async_paged_tile(smem.k[nxt], kn_base, slot_stride, k0_nxt, first_key, prefix, tid, full_nxt);
+      ds_cp_async_paged_tile<false>(smem.k[nxt], kn_base, slot_stride, k0_nxt, first_key, prefix, tid, full_nxt);
       ds_cp_async_commit();
-      ds_cp_async_wait<1>();
-    } else {
+      if (it > 0) ds_cp_async_wait<1>();
+    } else if (it > 0) {
       ds_cp_async_wait<0>();
     }
     __syncthreads();
@@ -576,8 +576,8 @@ __device__ __forceinline__ void dspark_attn_split_sm120_impl(
       }
     }
 
-    // Phase 2: O^T += V_it^T @ P_it^T (128 x 24).
-    ds_compute_vp_fp8_tile(acc, smem.v, smem.p, w, gid, tig);
+    // Phase 2: O^T += V_it^T @ P_it^T (128 x 24) via 4 hardware ldmatrix_x2_trans_b8!
+    ds_compute_vp_fp8_ldm(acc, smem.v, smem.p, w, lane, gid, tig);
 
     if (it + 1 < tile_count || do_live) {
       __syncthreads();
@@ -600,8 +600,8 @@ __device__ __forceinline__ void dspark_attn_split_sm120_impl(
 
   // ---------------- Live BF16 Draft Block (1..8 tokens, bidirectional) ----------------
   if (do_live) {
-    bf16 (*smem_kl)[kDsHeadDim] = reinterpret_cast<bf16 (*)[kDsHeadDim]>(&smem.k[0][0][0]);
-    bf16 (*smem_vl)[kDsHeadDim] = reinterpret_cast<bf16 (*)[kDsHeadDim]>(&smem.v[0][0]);
+    bf16 (*smem_kl)[kDsHeadDim] = reinterpret_cast<bf16 (*)[kDsHeadDim]>(&smem.k[0][0]);
+    bf16 (*smem_vl)[kDsHeadDim] = reinterpret_cast<bf16 (*)[kDsHeadDim]>(&smem.v[0]);
 #pragma unroll
     for (int step = 0; step < 2; ++step) {
       const int idx = tid + step * kDsThreads;
@@ -630,17 +630,16 @@ __device__ __forceinline__ void dspark_attn_split_sm120_impl(
       }
 #pragma unroll
       for (int ds = 0; ds < 8; ++ds) {
-        const int d_step = ds << 4;
+        // Match direct-register Q layout (d = ds*16 + tig*4 .. +3) via swizzled 8B chunks!
+        const int d_chunk8 = ds * 16 + ((tig >= 2) ? 8 : 0);
+        const int d_in8 = (tig & 1) * 4;
         const int k_row0 = gid;
         const int k_row1 = gid + 8;
-        uint32_t a[4];
-        a[0] = *reinterpret_cast<const uint32_t*>(&smem_kl[k_row0][ds_swiz_q_col(k_row0, d_step) + tig * 2]);
-        a[1] = *reinterpret_cast<const uint32_t*>(&smem_kl[k_row1][ds_swiz_q_col(k_row1, d_step) + tig * 2]);
-        a[2] = *reinterpret_cast<const uint32_t*>(&smem_kl[k_row0][ds_swiz_q_col(k_row0, d_step + 8) + tig * 2]);
-        a[3] = *reinterpret_cast<const uint32_t*>(&smem_kl[k_row1][ds_swiz_q_col(k_row1, d_step + 8) + tig * 2]);
+        const uint2 kv0 = *reinterpret_cast<const uint2*>(&smem_kl[k_row0][ds_swiz_q_col(k_row0, d_chunk8) + d_in8]);
+        const uint2 kv1 = *reinterpret_cast<const uint2*>(&smem_kl[k_row1][ds_swiz_q_col(k_row1, d_chunk8) + d_in8]);
 #pragma unroll
         for (int mt = 0; mt < 3; ++mt) {
-          ds_mma_m16n8k16_bf16(s[mt], a, q_b0[ds][mt], q_b1[ds][mt]);
+          ds_mma_m16n8k16_bf16(s[mt], kv0.x, kv1.x, kv0.y, kv1.y, q_b0[ds][mt], q_b1[ds][mt]);
         }
       }
 
@@ -725,14 +724,13 @@ __device__ __forceinline__ void dspark_attn_split_sm120_impl(
       const uint16_t lo_k3 = *reinterpret_cast<const uint16_t*>(&smem_vl[k3][ds_swiz_q_col(k3, d_base) + gid]);
       const uint16_t hi_k2 = *reinterpret_cast<const uint16_t*>(&smem_vl[k2][ds_swiz_q_col(k2, d_base + 8) + gid]);
       const uint16_t hi_k3 = *reinterpret_cast<const uint16_t*>(&smem_vl[k3][ds_swiz_q_col(k3, d_base + 8) + gid]);
-      uint32_t a[4];
-      a[0] = static_cast<uint32_t>(lo_k0) | (static_cast<uint32_t>(lo_k1) << 16);
-      a[1] = static_cast<uint32_t>(hi_k0) | (static_cast<uint32_t>(hi_k1) << 16);
-      a[2] = static_cast<uint32_t>(lo_k2) | (static_cast<uint32_t>(lo_k3) << 16);
-      a[3] = static_cast<uint32_t>(hi_k2) | (static_cast<uint32_t>(hi_k3) << 16);
+      uint32_t a0 = static_cast<uint32_t>(lo_k0) | (static_cast<uint32_t>(lo_k1) << 16);
+      uint32_t a1 = static_cast<uint32_t>(hi_k0) | (static_cast<uint32_t>(hi_k1) << 16);
+      uint32_t a2 = static_cast<uint32_t>(lo_k2) | (static_cast<uint32_t>(lo_k3) << 16);
+      uint32_t a3 = static_cast<uint32_t>(hi_k2) | (static_cast<uint32_t>(hi_k3) << 16);
 #pragma unroll
       for (int mt = 0; mt < 3; ++mt) {
-        ds_mma_m16n8k16_bf16(acc[dt][mt], a, b0[mt], b1[mt]);
+        ds_mma_m16n8k16_bf16(acc[dt][mt], a0, a1, a2, a3, b0[mt], b1[mt]);
       }
     }
   }
@@ -741,7 +739,7 @@ __device__ __forceinline__ void dspark_attn_split_sm120_impl(
   asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 
   __syncthreads();
-  float (*smem_o)[kDsHeadDim] = reinterpret_cast<float (*)[kDsHeadDim]>(&smem.k[0][0][0]);
+  float (*smem_o)[kDsHeadDim] = reinterpret_cast<float (*)[kDsHeadDim]>(&smem.k[0][0]);
 
 #pragma unroll
   for (int mt = 0; mt < 3; ++mt) {

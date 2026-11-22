@@ -783,6 +783,7 @@ def register_ops(
                     "entry": "kern_attn_prologue_full_prefill",
                     "grid": ["tokens", 6, 1],
                     "block": [256, 1, 1],
+                    "pdl": True,
                 }
             ]
         },
@@ -813,6 +814,7 @@ def register_ops(
                         ],
                         "grid": [grid_x, 6, 1],
                         "block": [256, 1, 1],
+                        "pdl": True,
                         "args": [
                             *[{"param": j} for j in range(21)],
                             _i32(page_columns),
@@ -836,6 +838,7 @@ def register_ops(
                     "entry": "kern_attn_prologue_swa_prefill",
                     "grid": ["tokens", 6, 1],
                     "block": [256, 1, 1],
+                    "pdl": True,
                 }
             ]
         },
@@ -856,6 +859,7 @@ def register_ops(
                     "entry": "kern_attn_prologue_swa_decode",
                     "grid": ["seqs", 6, 1],
                     "block": [256, 1, 1],
+                    "pdl": True,
                 }
             ]
         },
@@ -876,6 +880,7 @@ def register_ops(
                     "entry": "kern_attn_prologue_swa_verify",
                     "grid": ["tokens", 6, 1],
                     "block": [256, 1, 1],
+                    "pdl": True,
                 }
             ]
         },
@@ -892,6 +897,7 @@ def register_ops(
                     "entry": "kern_swa_ring_commit_prefill",
                     "grid": ["tokens", 8, 1],
                     "block": [32, 1, 1],
+                    "pdl": True,
                 }
             ]
         },
@@ -1098,37 +1104,39 @@ def register_ops(
         },
     }
 
-    # Full Verify: SM120 CUDA 2-phase bulk+tail split-KV + 1-warp float4 PDL combine
-    # Wave-matched 1-wave split counts for 110-SM PRO 5000 (3 CTAs/SM = 330 slots, 0 wave tail)
-    # and 188-SM PRO 6000 (564 slots):
-    #   seqs<=1: S=41 (328 CTAs), seqs==2: S=20 (320 CTAs),
-    #   seqs in 3..4: S=10 (240/320 CTAs), seqs>=5: S=5 (200..320 CTAs).
+    # Full Verify: SM120 CUDA 2-phase bulk+tail proportional dynamic split-KV + 4-warp float4 PDL combine.
+    # Total splits = 41 (seqs<=1 -> 328 CTAs) or 40 (seqs>=2 -> 320 CTAs): exact 1-wave fill on 110-SM PRO 5000
+    # (3 CTAs/SM = 330 slots), dynamically balanced across sequences to eliminate uneven-KV stragglers!
     full_verify_split_params = [
         "in buffer<bf16>", "in state", "in buffer<bf16>",
         "in buffer<i32>", "in buffer<i32>",
         "out buffer<f32>", "out buffer<f32>",
         "i32", "i32", "f32", "f32", "i32",
     ]
+    full_verify_comb_dyn_params = [
+        "in buffer<f32>", "in buffer<f32>", "in buffer<bf16>", "in buffer<bf16>",
+        "in buffer<i32>", "out buffer<bf16>",
+        "i32", "i32", "i32", "i32",
+    ]
     full_verify_launches: list[dict[str, Any]] = []
-    for num_splits, when_cond in (
+    for total_splits, when_cond in (
         (41, {"var": "seqs", "max": 1}),
-        (20, {"var": "seqs", "min": 2, "max": 2}),
-        (10, {"var": "seqs", "min": 3, "max": 4}),
-        (5, {"var": "seqs", "min": 5}),
+        (40, {"var": "seqs", "min": 2}),
     ):
         full_verify_launches.append(
             {
                 "module": "rel_verify_sm120",
                 "entry": "kern_attn_full_verify_split",
                 "params": full_verify_split_params,
-                "grid": [num_splits, 8, "seqs"],
+                "grid": [total_splits, 8, 1],
                 "block": [128, 1, 1],
+                "pdl": True,
                 "args": [
                     {"param": 0}, {"param": 1}, {"param": 2},
                     {"param": 5}, {"param": 6},
                     {"scratch": "o_part"}, {"scratch": "lse_part"},
                     {"param": 8}, _i32(page_columns), {"param": 11}, {"param": 12},
-                    _i32(num_splits),
+                    _i32(total_splits),
                 ],
                 "when": when_cond,
             }
@@ -1136,14 +1144,14 @@ def register_ops(
         full_verify_launches.append(
             {
                 "module": "rel_verify_sm120",
-                "entry": f"kern_attn_verify_combine_s{num_splits}",
-                "params": combine_params,
+                "entry": "kern_attn_verify_combine_dyn",
+                "params": full_verify_comb_dyn_params,
                 "grid": ["tokens", HEADS, 1],
                 "block": [32, 1, 1],
                 "args": [
                     {"scratch": "o_part"}, {"scratch": "lse_part"},
-                    {"param": 3}, {"param": 4}, {"param": 7},
-                    {"param": 8}, {"param": 9}, {"param": 10},
+                    {"param": 3}, {"param": 4}, {"param": 6}, {"param": 7},
+                    {"param": 8}, {"param": 9}, {"param": 10}, _i32(total_splits),
                 ],
                 "pdl": True,
                 "when": when_cond,
@@ -1235,6 +1243,7 @@ def register_ops(
                 "params": swa_verify_split_params,
                 "grid": [num_splits, 8, "seqs"],
                 "block": [128, 1, 1],
+                "pdl": True,
                 "args": [
                     {"param": 0}, {"param": 1}, {"param": 2}, {"param": 3},
                     {"param": 4}, {"param": 7}, {"param": 8},
