@@ -474,6 +474,137 @@ def register_ops(
             },
         }
 
+    # Bit-identical 3-stream batched loop controller for round/decode (T <= 64):
+    # merges 3x s1 + 3x s4 launches for ctrl.{attn,k,v} into 1x s1 + 1x s4 (tripling SM occupancy
+    # and sharing in_f32 RMSNorm on SWA layers) while keeping cuBLASLt/cuBLAS s2/s3 identical.
+    if not include_sample_copy:
+        for op3_name, s1_grid_y in (("loop_controller_3x_swa", 4), ("loop_controller_3x_full", 6)):
+            if op3_name not in ops:
+                ctrl3_params = [
+                    "in buffer<f32>",    # 0: in_f32 (mix_qkv)
+                    "in buffer<f32>",    # 1: msg_f32 (msg_buf)
+                    "in buffer<bf16>",   # 2: w_down_0 (attn)
+                    "in buffer<bf16>",   # 3: w_fg_0
+                    "in buffer<bf16>",   # 4: w_down_1 (k)
+                    "in buffer<bf16>",   # 5: w_fg_1
+                    "in buffer<bf16>",   # 6: w_down_2 (v)
+                    "in buffer<bf16>",   # 7: w_fg_2
+                    "in buffer<bf16>",   # 8: norm_w (attn_norm or qkv_input_norm)
+                    "out buffer<bf16>",  # 9: out_bf16 (x_qkv)
+                    "i64",               # 10: in_stride (0 for SWA, max_tokens*H for Full)
+                    "i64",               # 11: msg_stride (max_tokens*H)
+                    "i64",               # 12: out_stride (max_tokens*H)
+                    "i64",               # 13: norm_stride (0 for SWA, H for Full)
+                    "i32",               # 14: T
+                    "f32",               # 15: eps
+                ]
+                p3 = lambda idx: {"param": idx}
+                scr3 = lambda name: {"scratch": name}
+                ops[op3_name] = {
+                    "params": ctrl3_params,
+                    "impl": {
+                        "scratch": {
+                            "cat0": {"dtype": "bf16", "shape": ["tokens", 2 * H]},
+                            "cat1": {"dtype": "bf16", "shape": ["tokens", 2 * H]},
+                            "cat2": {"dtype": "bf16", "shape": ["tokens", 2 * H]},
+                            "h0": {"dtype": "bf16", "shape": ["tokens", RANK]},
+                            "h1": {"dtype": "bf16", "shape": ["tokens", RANK]},
+                            "h2": {"dtype": "bf16", "shape": ["tokens", RANK]},
+                            "fg0": {"dtype": "f32", "shape": ["tokens", 2 * H]},
+                            "fg1": {"dtype": "f32", "shape": ["tokens", 2 * H]},
+                            "fg2": {"dtype": "f32", "shape": ["tokens", 2 * H]},
+                        },
+                        "launches": [
+                            {
+                                "module": "loop_controller",
+                                "entry": "kern_ctrl_rms_concat_3x_f32_bf16",
+                                "params": [
+                                    "in buffer<f32>",
+                                    "in buffer<f32>",
+                                    "out buffer<bf16>",
+                                    "out buffer<bf16>",
+                                    "out buffer<bf16>",
+                                    "i64",
+                                    "i64",
+                                    "i32",
+                                    "f32",
+                                ],
+                                "grid": ["tokens", s1_grid_y, 1],
+                                "block": [256, 1, 1],
+                                "pdl": True,
+                                "args": [p3(0), p3(1), scr3("cat0"), scr3("cat1"), scr3("cat2"), p3(10), p3(11), p3(14), p3(15)],
+                            },
+                            {
+                                "entry": "extern:cublaslt_bf16_tn",
+                                "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32", "i32"],
+                                "args": [scr3("cat0"), p3(2), scr3("h0"), p3(14), i32(RANK), i32(2 * H)],
+                            },
+                            {
+                                "entry": "extern:cublaslt_bf16_tn",
+                                "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32", "i32"],
+                                "args": [scr3("cat1"), p3(4), scr3("h1"), p3(14), i32(RANK), i32(2 * H)],
+                            },
+                            {
+                                "entry": "extern:cublaslt_bf16_tn",
+                                "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32", "i32"],
+                                "args": [scr3("cat2"), p3(6), scr3("h2"), p3(14), i32(RANK), i32(2 * H)],
+                            },
+                            {
+                                "entry": "extern:cublas_bf16_tn_f32",
+                                "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<f32>", "i32", "i32", "i32"],
+                                "args": [scr3("h0"), p3(3), scr3("fg0"), p3(14), i32(2 * H), i32(RANK)],
+                            },
+                            {
+                                "entry": "extern:cublas_bf16_tn_f32",
+                                "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<f32>", "i32", "i32", "i32"],
+                                "args": [scr3("h1"), p3(5), scr3("fg1"), p3(14), i32(2 * H), i32(RANK)],
+                            },
+                            {
+                                "entry": "extern:cublas_bf16_tn_f32",
+                                "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<f32>", "i32", "i32", "i32"],
+                                "args": [scr3("h2"), p3(7), scr3("fg2"), p3(14), i32(2 * H), i32(RANK)],
+                            },
+                            {
+                                "module": "loop_controller",
+                                "entry": "kern_ctrl_merge_rmsnorm_3x_f32_bf16",
+                                "params": [
+                                    "in buffer<f32>",
+                                    "in buffer<f32>",
+                                    "in buffer<f32>",
+                                    "in buffer<f32>",
+                                    "in buffer<f32>",
+                                    "in buffer<bf16>",
+                                    "out buffer<bf16>",
+                                    "i64",
+                                    "i64",
+                                    "i64",
+                                    "i64",
+                                    "i32",
+                                    "f32",
+                                ],
+                                "grid": ["tokens", 3, 1],
+                                "block": [256, 1, 1],
+                                "pdl": True,
+                                "args": [
+                                    p3(0),
+                                    p3(1),
+                                    scr3("fg0"),
+                                    scr3("fg1"),
+                                    scr3("fg2"),
+                                    p3(8),
+                                    p3(9),
+                                    p3(10),
+                                    p3(11),
+                                    p3(12),
+                                    p3(13),
+                                    p3(14),
+                                    p3(15),
+                                ],
+                            },
+                        ],
+                    },
+                }
+
     # Unembed + softcap + vocab mask + FP32 argmax
     single_op(
         "last_row_bf16",
@@ -739,31 +870,61 @@ def emit_layer_calls(
                 ],
             }
         )
-        stream_norms = (
-            ("q_input_norm", "k_input_norm", "v_input_norm")
-            if is_full
-            else ("attn_norm", "attn_norm", "attn_norm")
-        )
-        for s_idx, (sname, nw_name) in enumerate(zip(("attn", "k", "v"), stream_norms)):
-            mix_off = (s_idx * max_tokens * H * 4) if is_full else 0
-            msg_off = s_idx * max_tokens * H * 4
-            out_off = s_idx * max_tokens * H * 2
+        if mode in ("round", "decode"):
+            op3 = "loop_controller_3x_full" if is_full else "loop_controller_3x_swa"
+            nw_buf = b(f"w.l{phys_idx}.qkv_input_norm") if is_full else b(f"w.l{phys_idx}.attn_norm")
+            in_stride = (max_tokens * H) if is_full else 0
+            norm_stride = H if is_full else 0
             pre_attn.append(
                 {
-                    "label": f"v{visit_idx}.l{phys_idx}.ctrl.{sname}",
-                    "op": "loop_controller",
+                    "label": f"v{visit_idx}.l{phys_idx}.ctrl.qkv",
+                    "op": op3,
                     "args": [
-                        b("mix_qkv", mix_off),
-                        b("msg_buf", msg_off),
-                        b(f"w.l{phys_idx}.ctrl.{sname}.down"),
-                        b(f"w.l{phys_idx}.ctrl.{sname}.fg"),
-                        b(f"w.l{phys_idx}.{nw_name}"),
-                        b("x_qkv", out_off),
+                        b("mix_qkv"),
+                        b("msg_buf"),
+                        b(f"w.l{phys_idx}.ctrl.attn.down"),
+                        b(f"w.l{phys_idx}.ctrl.attn.fg"),
+                        b(f"w.l{phys_idx}.ctrl.k.down"),
+                        b(f"w.l{phys_idx}.ctrl.k.fg"),
+                        b(f"w.l{phys_idx}.ctrl.v.down"),
+                        b(f"w.l{phys_idx}.ctrl.v.fg"),
+                        nw_buf,
+                        b("x_qkv"),
+                        i64(in_stride),
+                        i64(max_tokens * H),
+                        i64(max_tokens * H),
+                        i64(norm_stride),
                         T_var,
                         f32(EPS),
                     ],
                 }
             )
+        else:
+            stream_norms = (
+                ("q_input_norm", "k_input_norm", "v_input_norm")
+                if is_full
+                else ("attn_norm", "attn_norm", "attn_norm")
+            )
+            for s_idx, (sname, nw_name) in enumerate(zip(("attn", "k", "v"), stream_norms)):
+                mix_off = (s_idx * max_tokens * H * 4) if is_full else 0
+                msg_off = s_idx * max_tokens * H * 4
+                out_off = s_idx * max_tokens * H * 2
+                pre_attn.append(
+                    {
+                        "label": f"v{visit_idx}.l{phys_idx}.ctrl.{sname}",
+                        "op": "loop_controller",
+                        "args": [
+                            b("mix_qkv", mix_off),
+                            b("msg_buf", msg_off),
+                            b(f"w.l{phys_idx}.ctrl.{sname}.down"),
+                            b(f"w.l{phys_idx}.ctrl.{sname}.fg"),
+                            b(f"w.l{phys_idx}.{nw_name}"),
+                            b("x_qkv", out_off),
+                            T_var,
+                            f32(EPS),
+                        ],
+                    }
+                )
 
     # Pre-MLP input preparation
     if first:

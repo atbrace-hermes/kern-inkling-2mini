@@ -76,6 +76,7 @@ extern "C" __global__ __launch_bounds__(256, 4) void kern_ctrl_rms_concat_2strea
   __syncthreads();
 
   const float rstd = s_rstd;
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
   __nv_bfloat16* dst = cat_bf16 + static_cast<long long>(t) * (2 * kD) + stream * kD;
 #pragma unroll
   for (int i = 0; i < 9; ++i) {
@@ -138,6 +139,7 @@ extern "C" __global__ __launch_bounds__(256, 4) void kern_ctrl_rms_concat_f32_bf
       }
     }
     __syncthreads();
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     const float rstd_in = s_red8[0][0];
     const float rstd_msg = s_red8[0][1];
 #pragma unroll
@@ -272,5 +274,169 @@ extern "C" __global__ __launch_bounds__(256, 4) void kern_ctrl_merge_rmsnorm_f32
     float merged = __fadd_rn(__fmul_rn(__fsub_rn(1.0f, wf), in_row[d]), __fmul_rn(wg, msg_row[d]));
     float w = __bfloat162float(norm_w[d]);
     out_row[d] = __float2bfloat16_rn(__fmul_rn(__fmul_rn(merged, rstd), w));
+  }
+}
+
+
+// ---------------------------------------------------------------------------
+// Bit-identical 3-stream batched s1 (RMSNorm + concat) for round/decode (T <= 64).
+// - SWA shared mode (in_stride == 0): grid [T, 4, 1], block [256, 1, 1]
+//   y=0 normalizes shared in_f32 ONCE and broadcasts to cat0/cat1/cat2 [0..D);
+//   y=1..3 normalize msg0/msg1/msg2 -> cat0/cat1/cat2 [D..2D).
+// - Full mode (in_stride > 0): grid [T, 6, 1], block [256, 1, 1]
+//   y=2*s normalizes in_s -> cat_s [0..D); y=2*s+1 normalizes msg_s -> cat_s [D..2D).
+// ---------------------------------------------------------------------------
+extern "C" __global__ __launch_bounds__(256, 4) void kern_ctrl_rms_concat_3x_f32_bf16(
+    const float* __restrict__ in_f32,
+    const float* __restrict__ msg_f32,
+    __nv_bfloat16* __restrict__ cat0,
+    __nv_bfloat16* __restrict__ cat1,
+    __nv_bfloat16* __restrict__ cat2,
+    long long in_stride,
+    long long msg_stride,
+    int T,
+    float eps) {
+  const int t = blockIdx.x;
+  const int y = blockIdx.y;
+  if (t >= T) return;
+
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+
+  const bool shared_in = (in_stride == 0);
+  const float* src;
+  if (shared_in) {
+    src = (y == 0) ? (in_f32 + static_cast<long long>(t) * kD)
+                   : (msg_f32 + static_cast<long long>(y - 1) * msg_stride + static_cast<long long>(t) * kD);
+  } else {
+    const int s = y >> 1;
+    const int is_msg = y & 1;
+    src = is_msg ? (msg_f32 + static_cast<long long>(s) * msg_stride + static_cast<long long>(t) * kD)
+                 : (in_f32 + static_cast<long long>(s) * in_stride + static_cast<long long>(t) * kD);
+  }
+
+  float x[9];
+  float sq = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 9; ++i) {
+    float v = src[tid + i * 256];
+    x[i] = v;
+    sq = __fadd_rn(sq, __fmul_rn(v, v));
+  }
+  sq = warp_reduce_sum(sq);
+
+  __shared__ float s_red[8];
+  __shared__ float s_rstd;
+  if (lane == 0) s_red[warp] = sq;
+  __syncthreads();
+
+  if (warp == 0) {
+    float v = warp_reduce_sum((lane < 8) ? s_red[lane] : 0.0f);
+    if (lane == 0) {
+      s_rstd = rsqrt_approx_f32(__fadd_rn(__fmul_rn(v, 1.0f / static_cast<float>(kD)), eps));
+    }
+  }
+  __syncthreads();
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+
+  const float rstd = s_rstd;
+  const long long row_off = static_cast<long long>(t) * (2 * kD);
+  if (shared_in && y == 0) {
+    __nv_bfloat16* d0 = cat0 + row_off;
+    __nv_bfloat16* d1 = cat1 + row_off;
+    __nv_bfloat16* d2 = cat2 + row_off;
+#pragma unroll
+    for (int i = 0; i < 9; ++i) {
+      int d = tid + i * 256;
+      __nv_bfloat16 outv = __float2bfloat16_rn(__fmul_rn(x[i], rstd));
+      d0[d] = outv;
+      d1[d] = outv;
+      d2[d] = outv;
+    }
+  } else {
+    int s;
+    int col_off;
+    if (shared_in) {
+      s = y - 1;
+      col_off = kD;
+    } else {
+      s = y >> 1;
+      col_off = (y & 1) ? kD : 0;
+    }
+    __nv_bfloat16* dst = ((s == 0) ? cat0 : ((s == 1) ? cat1 : cat2)) + row_off + col_off;
+#pragma unroll
+    for (int i = 0; i < 9; ++i) {
+      dst[tid + i * 256] = __float2bfloat16_rn(__fmul_rn(x[i], rstd));
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Bit-identical 3-stream batched s4 (strict no-FMA FP32 merge + RMSNorm -> BF16)
+// for round/decode (T <= 64). Triples SM occupancy vs single-stream s4.
+// Grid: [T, 3, 1], Block: [256, 1, 1], pdl: True
+// ---------------------------------------------------------------------------
+extern "C" __global__ __launch_bounds__(256, 4) void kern_ctrl_merge_rmsnorm_3x_f32_bf16(
+    const float* __restrict__ in_f32,
+    const float* __restrict__ msg_f32,
+    const float* __restrict__ fg0,
+    const float* __restrict__ fg1,
+    const float* __restrict__ fg2,
+    const __nv_bfloat16* __restrict__ norm_w,
+    __nv_bfloat16* __restrict__ out_bf16,
+    long long in_stride,
+    long long msg_stride,
+    long long out_stride,
+    long long norm_stride,
+    int T,
+    float eps) {
+  const int t = blockIdx.x;
+  const int s = blockIdx.y;
+  if (t >= T) return;
+
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+
+  const float* in_row = in_f32 + static_cast<long long>(s) * in_stride + static_cast<long long>(t) * kD;
+  const float* msg_row = msg_f32 + static_cast<long long>(s) * msg_stride + static_cast<long long>(t) * kD;
+  const float* fg_row = ((s == 0) ? fg0 : ((s == 1) ? fg1 : fg2)) + static_cast<long long>(t) * (2 * kD);
+  const __nv_bfloat16* nw = norm_w + static_cast<long long>(s) * norm_stride;
+  __nv_bfloat16* out_row = out_bf16 + static_cast<long long>(s) * out_stride + static_cast<long long>(t) * kD;
+
+  float merged[9];
+  float sq = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 9; ++i) {
+    int d = tid + i * 256;
+    float wf = tanhf(__ldcs(&fg_row[d]));
+    float wg = tanhf(__ldcs(&fg_row[kD + d]));
+    float m = __fadd_rn(__fmul_rn(__fsub_rn(1.0f, wf), in_row[d]), __fmul_rn(wg, msg_row[d]));
+    merged[i] = m;
+    sq = __fadd_rn(sq, __fmul_rn(m, m));
+  }
+  __shared__ float s_red8[8];
+  sq = warp_reduce_sum(sq);
+  if (lane == 0) s_red8[warp] = sq;
+  __syncthreads();
+  if (warp == 0) {
+    float v = warp_reduce_sum((lane < 8) ? s_red8[lane] : 0.0f);
+    if (lane == 0) {
+      s_red8[0] = rsqrt_approx_f32(__fadd_rn(__fmul_rn(v, 1.0f / static_cast<float>(kD)), eps));
+    }
+  }
+  __syncthreads();
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+  const float rstd = s_red8[0];
+#pragma unroll
+  for (int i = 0; i < 9; ++i) {
+    int d = tid + i * 256;
+    float w = __bfloat162float(__ldg(&nw[d]));
+    out_row[d] = __float2bfloat16_rn(__fmul_rn(__fmul_rn(merged[i], rstd), w));
   }
 }

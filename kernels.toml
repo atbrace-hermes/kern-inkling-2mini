@@ -35,7 +35,7 @@ flags = "plain"
 includes = []
 
 [kernels."loop_controller"]
-sha256 = "68d6eb8118367d5901dae2b2c1dee58505419e18feb69c7dc70045574c5f5139"
+sha256 = "9a954b02217cb19f46c8510b59af348ba438a0dedc39fe92a0f38ac3e76c3a76"
 milestone = "M1"
 source = "source/loop_controller.cu"
 flags = "strict_fp32"
