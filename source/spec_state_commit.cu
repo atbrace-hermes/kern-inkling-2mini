@@ -891,7 +891,719 @@ __device__ __forceinline__ void run_v8_gate_up_silu_pdl(
   }
 }
 
+// ---------------------------------------------------------------------------
+// SM120 W8A16 FP8 (E4M3 per-row) -> BF16 direct-register MMA kernel with PDL
+// for DSpark `markov.base_logits` (M = 7*seqs, N = 201024, K = 2304).
+// Loads 16 FP8 weights via 128-bit ld.global.nc.L1::no_allocate.L2::256B.v4.u32,
+// converts to 16 BF16 in registers via 8x 1-cycle `cvt.rn.bf16x2.e4m3x2`, and
+// applies per-row FP32 scale at epilogue.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ uint4 ld_w_fp8_v4(const void* ptr) {
+  uint4 r;
+  asm volatile(
+      "ld.global.nc.L1::no_allocate.L2::256B.v4.u32 {%0, %1, %2, %3}, [%4];"
+      : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w)
+      : "l"(ptr));
+  return r;
+}
+
+__device__ __forceinline__ uint32_t cvt_e4m3x2_to_bf16x2(uint16_t raw) {
+  uint32_t res;
+  asm("cvt.rn.bf16x2.e4m3x2 %0, %1;" : "=r"(res) : "h"(raw));
+  return res;
+}
+
+__device__ __forceinline__ u32x8 unpack_fp8_v4_to_bf16_v8(const uint4& w) {
+  u32x8 out;
+  out.v[0] = cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(w.x & 0xFFFFu));
+  out.v[1] = cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(w.x >> 16));
+  out.v[2] = cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(w.y & 0xFFFFu));
+  out.v[3] = cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(w.y >> 16));
+  out.v[4] = cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(w.z & 0xFFFFu));
+  out.v[5] = cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(w.z >> 16));
+  out.v[6] = cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(w.w & 0xFFFFu));
+  out.v[7] = cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(w.w >> 16));
+  return out;
+}
+
+__device__ __forceinline__ bool is_fp8_v4_aligned(const B* A, const uint8_t* W, int K) {
+  return ((K & 63) == 0)
+      && ((reinterpret_cast<uintptr_t>(A) & 31u) == 0u)
+      && ((reinterpret_cast<uintptr_t>(W) & 15u) == 0u);
+}
+
+__device__ __noinline__ void fallback_gemm_w8a16_fp8(
+    const B* __restrict__ A,
+    const uint8_t* __restrict__ W,
+    const float* __restrict__ S,
+    B* __restrict__ C,
+    int M, int N, int K) {
+  pdl_wait();
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const int stride = gridDim.x * blockDim.x;
+  for (int n = tid; n < N; n += stride) {
+    const uint8_t* w_row = W + static_cast<int64_t>(n) * K;
+    const float s = S[n];
+    for (int m = 0; m < M; ++m) {
+      const B* a_row = A + static_cast<int64_t>(m) * K;
+      float acc = 0.0f;
+      for (int k = 0; k < K; ++k) {
+        uint32_t pair = cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(w_row[k]));
+        float wf = __bfloat162float(*reinterpret_cast<const B*>(&pair));
+        acc = fmaf(__bfloat162float(a_row[k]), wf, acc);
+      }
+      C[static_cast<int64_t>(m) * N + n] = __float2bfloat16_rn(acc * s);
+    }
+  }
+  pdl_launch_dependents();
+}
+
+template <int M_TILES, bool M_LE_8, int N_TILES, bool PREFETCH = true>
+__device__ __forceinline__ void run_w8a16_fp8_mma_pdl(
+    const B* __restrict__ A,
+    const uint8_t* __restrict__ W,
+    const float* __restrict__ S,
+    B* __restrict__ C,
+    int M, int N, int K) {
+  constexpr int M_CAP = M_LE_8 ? 8 : (M_TILES * 16);
+  if (M <= 0 || N <= 0 || K <= 0) {
+    pdl_wait();
+    pdl_launch_dependents();
+    return;
+  }
+  if (!is_fp8_v4_aligned(A, W, K)) {
+    fallback_gemm_w8a16_fp8(A, W, S, C, M, N, K);
+    return;
+  }
+
+  constexpr int WARPS_K = 8;
+  constexpr int K_STEP = 64 * WARPS_K;  // 512 elements/iter
+  constexpr int BN = 8 * N_TILES;
+  const int num_tiles = (N + BN - 1) / BN;
+  if (blockIdx.x >= num_tiles) {
+    pdl_wait();
+    pdl_launch_dependents();
+    return;
+  }
+
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const int g = lane >> 2;  // 0..7
+  const int t = lane & 3;   // 0..3
+
+  // Shared reduction buffer holds one N-tile at a time (<= 14 KiB even at M_TILES=4).
+  __shared__ float4 s_red[WARPS_K - 1][M_TILES][32];
+  const int k0 = warp * 64;
+  const bool c_align4 = ((N & 1) == 0) && ((reinterpret_cast<uintptr_t>(C) & 3u) == 0u);
+  bool did_wait = false;
+
+  for (int m_base = 0; m_base < M; m_base += M_CAP) {
+    const int m_rem = M - m_base;
+    const B* a_base = A + static_cast<int64_t>(m_base) * K + t * 16;
+
+    for (int tile = blockIdx.x; tile < num_tiles; tile += gridDim.x) {
+      const int n_base = tile * BN;
+      const uint8_t* w_base[N_TILES];
+      bool w_ok[N_TILES];
+      uint4 w_cur[N_TILES];
+#pragma unroll
+      for (int nt = 0; nt < N_TILES; ++nt) {
+        const int n_row = n_base + nt * 8 + g;
+        w_ok[nt] = (n_row < N);
+        w_base[nt] = W + static_cast<int64_t>(n_row) * K + t * 16;
+        w_cur[nt] = (w_ok[nt] && k0 < K) ? ld_w_fp8_v4(w_base[nt] + k0) : make_uint4(0u, 0u, 0u, 0u);
+      }
+      if (!did_wait) {
+        pdl_wait();
+        did_wait = true;
+      }
+
+      float acc[M_TILES][N_TILES][4];
+#pragma unroll
+      for (int mt = 0; mt < M_TILES; ++mt) {
+#pragma unroll
+        for (int nt = 0; nt < N_TILES; ++nt) {
+          acc[mt][nt][0] = 0.0f;
+          acc[mt][nt][1] = 0.0f;
+          acc[mt][nt][2] = 0.0f;
+          acc[mt][nt][3] = 0.0f;
+        }
+      }
+
+      for (int k = k0; k < K; k += K_STEP) {
+        uint4 w_nxt[N_TILES];
+        if constexpr (PREFETCH) {
+          const int k_next = k + K_STEP;
+#pragma unroll
+          for (int nt = 0; nt < N_TILES; ++nt) {
+            w_nxt[nt] = (w_ok[nt] && k_next < K) ? ld_w_fp8_v4(w_base[nt] + k_next) : make_uint4(0u, 0u, 0u, 0u);
+          }
+        } else if (k > k0) {
+#pragma unroll
+          for (int nt = 0; nt < N_TILES; ++nt) {
+            w_cur[nt] = w_ok[nt] ? ld_w_fp8_v4(w_base[nt] + k) : make_uint4(0u, 0u, 0u, 0u);
+          }
+        }
+
+        if constexpr (N_TILES == 1) {
+          const u32x8 w_bf16 = unpack_fp8_v4_to_bf16_v8(w_cur[0]);
+#pragma unroll
+          for (int mt = 0; mt < M_TILES; ++mt) {
+            const int m0 = mt * 16 + g;
+            u32x8 x0 = (m0 < m_rem) ? ld_x_v8(a_base + static_cast<int64_t>(m0) * K + k) : u32x8{};
+            u32x8 x1 = {};
+            if constexpr (!M_LE_8) {
+              const int m1 = m0 + 8;
+              if (m1 < m_rem) x1 = ld_x_v8(a_base + static_cast<int64_t>(m1) * K + k);
+            }
+            mma_v8_step(acc[mt][0], x0, x1, w_bf16);
+          }
+        } else {
+          // Reuse loaded A (x0, x1) across all N_TILES -> cuts A L2 bandwidth by N_TILES!
+#pragma unroll
+          for (int mt = 0; mt < M_TILES; ++mt) {
+            const int m0 = mt * 16 + g;
+            u32x8 x0 = (m0 < m_rem) ? ld_x_v8(a_base + static_cast<int64_t>(m0) * K + k) : u32x8{};
+            u32x8 x1 = {};
+            if constexpr (!M_LE_8) {
+              const int m1 = m0 + 8;
+              if (m1 < m_rem) x1 = ld_x_v8(a_base + static_cast<int64_t>(m1) * K + k);
+            }
+#pragma unroll
+            for (int nt = 0; nt < N_TILES; ++nt) {
+              const u32x8 w_bf16 = unpack_fp8_v4_to_bf16_v8(w_cur[nt]);
+              mma_v8_step(acc[mt][nt], x0, x1, w_bf16);
+            }
+          }
+        }
+        if constexpr (PREFETCH) {
+#pragma unroll
+          for (int nt = 0; nt < N_TILES; ++nt) {
+            w_cur[nt] = w_nxt[nt];
+          }
+        }
+      }
+
+      const bool is_last = (m_base + M_CAP >= M) && (tile + gridDim.x >= num_tiles);
+
+#pragma unroll
+      for (int nt = 0; nt < N_TILES; ++nt) {
+        if (warp > 0) {
+#pragma unroll
+          for (int mt = 0; mt < M_TILES; ++mt) {
+            s_red[warp - 1][mt][lane] =
+                make_float4(acc[mt][nt][0], acc[mt][nt][1], acc[mt][nt][2], acc[mt][nt][3]);
+          }
+        }
+        __syncthreads();
+
+        if (nt == N_TILES - 1 && is_last) {
+          pdl_launch_dependents();
+        }
+
+        if (warp == 0) {
+          const int col0 = n_base + nt * 8 + 2 * t;
+          const int col1 = col0 + 1;
+          const bool c0_ok = (col0 < N);
+          const bool c1_ok = (col1 < N);
+          if (c0_ok) {
+            const float s0 = S[col0];
+            const float s1 = c1_ok ? S[col1] : 0.0f;
+#pragma unroll
+            for (int mt = 0; mt < M_TILES; ++mt) {
+#pragma unroll
+              for (int w = 0; w < WARPS_K - 1; ++w) {
+                const float4 v = s_red[w][mt][lane];
+                acc[mt][nt][0] += v.x;
+                acc[mt][nt][1] += v.y;
+                acc[mt][nt][2] += v.z;
+                acc[mt][nt][3] += v.w;
+              }
+              const int m0 = mt * 16 + g;
+              if (m0 < m_rem) {
+                const float v0 = acc[mt][nt][0] * s0;
+                const float v1 = acc[mt][nt][1] * s1;
+                B* dst = C + static_cast<int64_t>(m_base + m0) * N + col0;
+                if (c1_ok && c_align4) {
+                  *reinterpret_cast<__nv_bfloat162*>(dst) = __floats2bfloat162_rn(v0, v1);
+                } else {
+                  dst[0] = __float2bfloat16_rn(v0);
+                  if (c1_ok) dst[1] = __float2bfloat16_rn(v1);
+                }
+              }
+              if constexpr (!M_LE_8) {
+                const int m1 = m0 + 8;
+                if (m1 < m_rem) {
+                  const float v2 = acc[mt][nt][2] * s0;
+                  const float v3 = acc[mt][nt][3] * s1;
+                  B* dst = C + static_cast<int64_t>(m_base + m1) * N + col0;
+                  if (c1_ok && c_align4) {
+                    *reinterpret_cast<__nv_bfloat162*>(dst) = __floats2bfloat162_rn(v2, v3);
+                  } else {
+                    dst[0] = __float2bfloat16_rn(v2);
+                    if (c1_ok) dst[1] = __float2bfloat16_rn(v3);
+                  }
+                }
+              }
+            }
+          }
+        }
+        if (nt + 1 < N_TILES || !is_last) {
+          __syncthreads();
+        }
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Fused W8A16 FP8 GateUp + SiLU*Mul with PDL for DSpark 3-layer MLP.
+// W = [W_gate (N_half, K); W_up (N_half, K)] in FP8 E4M3, S = [2 * N_half] FP32.
+// Uses two-phase shared reduction (<= 14 KiB SMEM even at M_TILES=4) so W is
+// read strictly ONCE for M <= 64.
+// ---------------------------------------------------------------------------
+__device__ __noinline__ void fallback_gate_up_silu_fp8(
+    const B* __restrict__ A,
+    const uint8_t* __restrict__ W,
+    const float* __restrict__ S,
+    B* __restrict__ Y,
+    int M, int N_half, int K) {
+  pdl_wait();
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const int stride = gridDim.x * blockDim.x;
+  for (int n = tid; n < N_half; n += stride) {
+    const uint8_t* wg = W + static_cast<int64_t>(n) * K;
+    const uint8_t* wu = W + static_cast<int64_t>(N_half + n) * K;
+    const float sg = S[n];
+    const float su = S[N_half + n];
+    for (int m = 0; m < M; ++m) {
+      const B* a_row = A + static_cast<int64_t>(m) * K;
+      float ag = 0.0f, au = 0.0f;
+      for (int k = 0; k < K; ++k) {
+        const float xf = __bfloat162float(a_row[k]);
+        uint32_t pg = cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(wg[k]));
+        uint32_t pu = cvt_e4m3x2_to_bf16x2(static_cast<uint16_t>(wu[k]));
+        ag = fmaf(xf, __bfloat162float(*reinterpret_cast<const B*>(&pg)), ag);
+        au = fmaf(xf, __bfloat162float(*reinterpret_cast<const B*>(&pu)), au);
+      }
+      Y[static_cast<int64_t>(m) * N_half + n] = silu_mul_bf16_exact(ag * sg, au * su);
+    }
+  }
+  pdl_launch_dependents();
+}
+
+template <int M_TILES, bool M_LE_8, bool PREFETCH = false>
+__device__ __forceinline__ void run_w8a16_fp8_gate_up_silu_pdl(
+    const B* __restrict__ A,
+    const uint8_t* __restrict__ W,
+    const float* __restrict__ S,
+    B* __restrict__ Y,
+    int M, int N_half, int K) {
+  constexpr int M_CAP = M_LE_8 ? 8 : (M_TILES * 16);
+  if (M <= 0 || N_half <= 0 || K <= 0) {
+    pdl_wait();
+    pdl_launch_dependents();
+    return;
+  }
+  if (!is_fp8_v4_aligned(A, W, K)) {
+    fallback_gate_up_silu_fp8(A, W, S, Y, M, N_half, K);
+    return;
+  }
+
+  constexpr int WARPS_K = 8;
+  constexpr int K_STEP = 64 * WARPS_K;  // 512 elements/iter
+  constexpr int BN = 8;
+  const int num_tiles = (N_half + BN - 1) / BN;
+  if (blockIdx.x >= num_tiles) {
+    pdl_wait();
+    pdl_launch_dependents();
+    return;
+  }
+
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const int g = lane >> 2;
+  const int t = lane & 3;
+
+  __shared__ float4 s_red[WARPS_K - 1][M_TILES][32];
+  const int k0 = warp * 64;
+  const bool y_align4 = ((N_half & 1) == 0) && ((reinterpret_cast<uintptr_t>(Y) & 3u) == 0u);
+  bool did_wait = false;
+
+  for (int m_base = 0; m_base < M; m_base += M_CAP) {
+    const int m_rem = M - m_base;
+    const B* a_base = A + static_cast<int64_t>(m_base) * K + t * 16;
+
+    for (int tile = blockIdx.x; tile < num_tiles; tile += gridDim.x) {
+      const int n_base = tile * BN;
+      const int n_row = n_base + g;
+      const bool w_ok = (n_row < N_half);
+      const uint8_t* wg_base = W + static_cast<int64_t>(n_row) * K + t * 16;
+      const uint8_t* wu_base = W + static_cast<int64_t>(N_half + n_row) * K + t * 16;
+
+      uint4 wg_cur = (w_ok && k0 < K) ? ld_w_fp8_v4(wg_base + k0) : make_uint4(0u, 0u, 0u, 0u);
+      uint4 wu_cur = (w_ok && k0 < K) ? ld_w_fp8_v4(wu_base + k0) : make_uint4(0u, 0u, 0u, 0u);
+      if (!did_wait) {
+        pdl_wait();
+        did_wait = true;
+      }
+
+      float acc_g[M_TILES][4];
+      float acc_u[M_TILES][4];
+#pragma unroll
+      for (int mt = 0; mt < M_TILES; ++mt) {
+        acc_g[mt][0] = 0.0f; acc_g[mt][1] = 0.0f; acc_g[mt][2] = 0.0f; acc_g[mt][3] = 0.0f;
+        acc_u[mt][0] = 0.0f; acc_u[mt][1] = 0.0f; acc_u[mt][2] = 0.0f; acc_u[mt][3] = 0.0f;
+      }
+
+      for (int k = k0; k < K; k += K_STEP) {
+        uint4 wg_nxt = make_uint4(0u, 0u, 0u, 0u);
+        uint4 wu_nxt = make_uint4(0u, 0u, 0u, 0u);
+        if constexpr (PREFETCH) {
+          const int k_next = k + K_STEP;
+          if (w_ok && k_next < K) {
+            wg_nxt = ld_w_fp8_v4(wg_base + k_next);
+            wu_nxt = ld_w_fp8_v4(wu_base + k_next);
+          }
+        } else if (k > k0) {
+          wg_cur = w_ok ? ld_w_fp8_v4(wg_base + k) : make_uint4(0u, 0u, 0u, 0u);
+          wu_cur = w_ok ? ld_w_fp8_v4(wu_base + k) : make_uint4(0u, 0u, 0u, 0u);
+        }
+
+        const u32x8 wg_bf16 = unpack_fp8_v4_to_bf16_v8(wg_cur);
+        const u32x8 wu_bf16 = unpack_fp8_v4_to_bf16_v8(wu_cur);
+
+#pragma unroll
+        for (int mt = 0; mt < M_TILES; ++mt) {
+          const int m0 = mt * 16 + g;
+          u32x8 x0 = (m0 < m_rem) ? ld_x_v8(a_base + static_cast<int64_t>(m0) * K + k) : u32x8{};
+          u32x8 x1 = {};
+          if constexpr (!M_LE_8) {
+            const int m1 = m0 + 8;
+            if (m1 < m_rem) x1 = ld_x_v8(a_base + static_cast<int64_t>(m1) * K + k);
+          }
+          mma_v8_step(acc_g[mt], x0, x1, wg_bf16);
+          mma_v8_step(acc_u[mt], x0, x1, wu_bf16);
+        }
+
+        if constexpr (PREFETCH) {
+          wg_cur = wg_nxt;
+          wu_cur = wu_nxt;
+        }
+      }
+
+      // Phase 1: reduce gate
+      if (warp > 0) {
+#pragma unroll
+        for (int mt = 0; mt < M_TILES; ++mt) {
+          s_red[warp - 1][mt][lane] = make_float4(acc_g[mt][0], acc_g[mt][1], acc_g[mt][2], acc_g[mt][3]);
+        }
+      }
+      __syncthreads();
+      if (warp == 0) {
+#pragma unroll
+        for (int mt = 0; mt < M_TILES; ++mt) {
+#pragma unroll
+          for (int w = 0; w < WARPS_K - 1; ++w) {
+            const float4 vg = s_red[w][mt][lane];
+            acc_g[mt][0] += vg.x; acc_g[mt][1] += vg.y; acc_g[mt][2] += vg.z; acc_g[mt][3] += vg.w;
+          }
+        }
+      }
+      __syncthreads();
+
+      // Phase 2: reduce up
+      if (warp > 0) {
+#pragma unroll
+        for (int mt = 0; mt < M_TILES; ++mt) {
+          s_red[warp - 1][mt][lane] = make_float4(acc_u[mt][0], acc_u[mt][1], acc_u[mt][2], acc_u[mt][3]);
+        }
+      }
+      __syncthreads();
+
+      const bool is_last = (m_base + M_CAP >= M) && (tile + gridDim.x >= num_tiles);
+      if (is_last) {
+        pdl_launch_dependents();
+      }
+
+      if (warp == 0) {
+        const int col0 = n_base + 2 * t;
+        const int col1 = col0 + 1;
+        const bool c0_ok = (col0 < N_half);
+        const bool c1_ok = (col1 < N_half);
+        if (c0_ok) {
+          const float sg0 = S[col0];
+          const float su0 = S[N_half + col0];
+          const float sg1 = c1_ok ? S[col1] : 0.0f;
+          const float su1 = c1_ok ? S[N_half + col1] : 0.0f;
+#pragma unroll
+          for (int mt = 0; mt < M_TILES; ++mt) {
+#pragma unroll
+            for (int w = 0; w < WARPS_K - 1; ++w) {
+              const float4 vu = s_red[w][mt][lane];
+              acc_u[mt][0] += vu.x; acc_u[mt][1] += vu.y; acc_u[mt][2] += vu.z; acc_u[mt][3] += vu.w;
+            }
+            const int m0 = mt * 16 + g;
+            if (m0 < m_rem) {
+              const B y0 = silu_mul_bf16_exact(acc_g[mt][0] * sg0, acc_u[mt][0] * su0);
+              B* dst = Y + static_cast<int64_t>(m_base + m0) * N_half + col0;
+              if (c1_ok) {
+                const B y1 = silu_mul_bf16_exact(acc_g[mt][1] * sg1, acc_u[mt][1] * su1);
+                if (y_align4) {
+                  *reinterpret_cast<__nv_bfloat162*>(dst) = __halves2bfloat162(y0, y1);
+                } else {
+                  dst[0] = y0; dst[1] = y1;
+                }
+              } else {
+                dst[0] = y0;
+              }
+            }
+            if constexpr (!M_LE_8) {
+              const int m1 = m0 + 8;
+              if (m1 < m_rem) {
+                const B y2 = silu_mul_bf16_exact(acc_g[mt][2] * sg0, acc_u[mt][2] * su0);
+                B* dst = Y + static_cast<int64_t>(m_base + m1) * N_half + col0;
+                if (c1_ok) {
+                  const B y3 = silu_mul_bf16_exact(acc_g[mt][3] * sg1, acc_u[mt][3] * su1);
+                  if (y_align4) {
+                    *reinterpret_cast<__nv_bfloat162*>(dst) = __halves2bfloat162(y2, y3);
+                  } else {
+                    dst[0] = y2; dst[1] = y3;
+                  }
+                } else {
+                  dst[0] = y2;
+                }
+              }
+            }
+          }
+        }
+      }
+      if (!is_last) {
+        __syncthreads();
+      }
+    }
+  }
+}
+
+// 2-warp-group M<=64 W8A16 FP8 MMA: warps 0..3 own m=[0..31], warps 4..7 own m=[32..63],
+// each warp-group splits K across 4 warps (K_STEP=256 -> exact 9 iters for K=2304),
+// sharing W tiles in L1/L2 (single GDDR7 read of W!) with REG<=112, STACK:0, 2 CTAs/SM.
+template <int N_TILES>
+__device__ __forceinline__ void run_w8a16_fp8_mma_m64_2wg_pdl(
+    const B* __restrict__ A,
+    const uint8_t* __restrict__ W,
+    const float* __restrict__ S,
+    B* __restrict__ C,
+    int M, int N, int K) {
+  constexpr int M_CAP = 64;
+  constexpr int M_TILES_WG = 2;  // 32 rows per warp-group
+  if (M <= 0 || N <= 0 || K <= 0) {
+    pdl_wait();
+    pdl_launch_dependents();
+    return;
+  }
+  if (!is_fp8_v4_aligned(A, W, K)) {
+    fallback_gemm_w8a16_fp8(A, W, S, C, M, N, K);
+    return;
+  }
+
+  constexpr int WARPS_K = 4;
+  constexpr int K_STEP = 64 * WARPS_K;  // 256 elements/iter (2304 = 9 * 256 exact!)
+  constexpr int BN = 8 * N_TILES;
+  const int num_tiles = (N + BN - 1) / BN;
+  if (blockIdx.x >= num_tiles) {
+    pdl_wait();
+    pdl_launch_dependents();
+    return;
+  }
+
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;       // 0..7
+  const int wg = warp >> 2;        // 0 or 1
+  const int kw = warp & 3;         // 0..3
+  const int lane = tid & 31;
+  const int g = lane >> 2;         // 0..7
+  const int t = lane & 3;          // 0..3
+
+  __shared__ float4 s_red[2][WARPS_K - 1][M_TILES_WG][32];  // 6 KiB
+  const int k0 = kw * 64;
+  const bool c_align4 = ((N & 1) == 0) && ((reinterpret_cast<uintptr_t>(C) & 3u) == 0u);
+  bool did_wait = false;
+
+  for (int m_base = 0; m_base < M; m_base += M_CAP) {
+    const int wg_m_base = m_base + wg * 32;
+    const int m_rem = M - wg_m_base;
+    const B* a_base = A + static_cast<int64_t>(wg_m_base) * K + t * 16;
+
+    for (int tile = blockIdx.x; tile < num_tiles; tile += gridDim.x) {
+      const int n_base = tile * BN;
+      const uint8_t* w_base[N_TILES];
+      bool w_ok[N_TILES];
+      uint4 w_cur[N_TILES];
+#pragma unroll
+      for (int nt = 0; nt < N_TILES; ++nt) {
+        const int n_row = n_base + nt * 8 + g;
+        w_ok[nt] = (n_row < N);
+        w_base[nt] = W + static_cast<int64_t>(n_row) * K + t * 16;
+        w_cur[nt] = (w_ok[nt] && k0 < K) ? ld_w_fp8_v4(w_base[nt] + k0) : make_uint4(0u, 0u, 0u, 0u);
+      }
+      if (!did_wait) {
+        pdl_wait();
+        did_wait = true;
+      }
+
+      float acc[M_TILES_WG][N_TILES][4];
+#pragma unroll
+      for (int mt = 0; mt < M_TILES_WG; ++mt) {
+#pragma unroll
+        for (int nt = 0; nt < N_TILES; ++nt) {
+          acc[mt][nt][0] = 0.0f; acc[mt][nt][1] = 0.0f;
+          acc[mt][nt][2] = 0.0f; acc[mt][nt][3] = 0.0f;
+        }
+      }
+
+      if (m_rem > 0) {
+        for (int k = k0; k < K; k += K_STEP) {
+          const int k_next = k + K_STEP;
+          uint4 w_nxt[N_TILES];
+#pragma unroll
+          for (int nt = 0; nt < N_TILES; ++nt) {
+            w_nxt[nt] = (w_ok[nt] && k_next < K) ? ld_w_fp8_v4(w_base[nt] + k_next) : make_uint4(0u, 0u, 0u, 0u);
+          }
+
+#pragma unroll
+          for (int mt = 0; mt < M_TILES_WG; ++mt) {
+            const int m0 = mt * 16 + g;
+            const int m1 = m0 + 8;
+            u32x8 x0 = (m0 < m_rem) ? ld_x_v8(a_base + static_cast<int64_t>(m0) * K + k) : u32x8{};
+            u32x8 x1 = (m1 < m_rem) ? ld_x_v8(a_base + static_cast<int64_t>(m1) * K + k) : u32x8{};
+#pragma unroll
+            for (int nt = 0; nt < N_TILES; ++nt) {
+              mma_v8_step(acc[mt][nt], x0, x1, unpack_fp8_v4_to_bf16_v8(w_cur[nt]));
+            }
+          }
+#pragma unroll
+          for (int nt = 0; nt < N_TILES; ++nt) {
+            w_cur[nt] = w_nxt[nt];
+          }
+        }
+      }
+
+      const bool is_last = (m_base + M_CAP >= M) && (tile + gridDim.x >= num_tiles);
+
+#pragma unroll
+      for (int nt = 0; nt < N_TILES; ++nt) {
+        if (kw > 0) {
+#pragma unroll
+          for (int mt = 0; mt < M_TILES_WG; ++mt) {
+            s_red[wg][kw - 1][mt][lane] =
+                make_float4(acc[mt][nt][0], acc[mt][nt][1], acc[mt][nt][2], acc[mt][nt][3]);
+          }
+        }
+        __syncthreads();
+
+        if (nt == N_TILES - 1 && is_last) {
+          pdl_launch_dependents();
+        }
+
+        if (kw == 0 && m_rem > 0) {
+          const int col0 = n_base + nt * 8 + 2 * t;
+          const int col1 = col0 + 1;
+          const bool c0_ok = (col0 < N);
+          const bool c1_ok = (col1 < N);
+          if (c0_ok) {
+            const float s0 = S[col0];
+            const float s1 = c1_ok ? S[col1] : 0.0f;
+#pragma unroll
+            for (int mt = 0; mt < M_TILES_WG; ++mt) {
+#pragma unroll
+              for (int w = 0; w < WARPS_K - 1; ++w) {
+                const float4 v = s_red[wg][w][mt][lane];
+                acc[mt][nt][0] += v.x; acc[mt][nt][1] += v.y;
+                acc[mt][nt][2] += v.z; acc[mt][nt][3] += v.w;
+              }
+              const int m0 = mt * 16 + g;
+              if (m0 < m_rem) {
+                const float v0 = acc[mt][nt][0] * s0;
+                const float v1 = acc[mt][nt][1] * s1;
+                B* dst = C + static_cast<int64_t>(wg_m_base + m0) * N + col0;
+                if (c1_ok && c_align4) {
+                  *reinterpret_cast<__nv_bfloat162*>(dst) = __floats2bfloat162_rn(v0, v1);
+                } else {
+                  dst[0] = __float2bfloat16_rn(v0);
+                  if (c1_ok) dst[1] = __float2bfloat16_rn(v1);
+                }
+              }
+              const int m1 = m0 + 8;
+              if (m1 < m_rem) {
+                const float v2 = acc[mt][nt][2] * s0;
+                const float v3 = acc[mt][nt][3] * s1;
+                B* dst = C + static_cast<int64_t>(wg_m_base + m1) * N + col0;
+                if (c1_ok && c_align4) {
+                  *reinterpret_cast<__nv_bfloat162*>(dst) = __floats2bfloat162_rn(v2, v3);
+                } else {
+                  dst[0] = __float2bfloat16_rn(v2);
+                  if (c1_ok) dst[1] = __float2bfloat16_rn(v3);
+                }
+              }
+            }
+          }
+        }
+        if (nt + 1 < N_TILES || !is_last) {
+          __syncthreads();
+        }
+      }
+    }
+  }
+}
+
 }  // namespace ds_gemm
+
+// W8A16 FP8 DSpark lm_head & linear projection entry points (N_TILES=2 for M>16)
+extern "C" __global__ __launch_bounds__(256, 4) void kern_dspark_lm_head_fp8_m8_sm120(
+    const B* __restrict__ A, const uint8_t* __restrict__ W, const float* __restrict__ S,
+    B* __restrict__ C, int M, int N, int K) {
+  ds_gemm::run_w8a16_fp8_mma_pdl<1, true, 1, true>(A, W, S, C, M, N, K);
+}
+extern "C" __global__ __launch_bounds__(256, 4) void kern_dspark_lm_head_fp8_m16_sm120(
+    const B* __restrict__ A, const uint8_t* __restrict__ W, const float* __restrict__ S,
+    B* __restrict__ C, int M, int N, int K) {
+  ds_gemm::run_w8a16_fp8_mma_pdl<1, false, 1, true>(A, W, S, C, M, N, K);
+}
+extern "C" __global__ __launch_bounds__(256, 2) void kern_dspark_lm_head_fp8_m32_sm120(
+    const B* __restrict__ A, const uint8_t* __restrict__ W, const float* __restrict__ S,
+    B* __restrict__ C, int M, int N, int K) {
+  ds_gemm::run_w8a16_fp8_mma_pdl<2, false, 2, true>(A, W, S, C, M, N, K);
+}
+extern "C" __global__ __launch_bounds__(256, 2) void kern_dspark_lm_head_fp8_m64_sm120(
+    const B* __restrict__ A, const uint8_t* __restrict__ W, const float* __restrict__ S,
+    B* __restrict__ C, int M, int N, int K) {
+  ds_gemm::run_w8a16_fp8_mma_m64_2wg_pdl<2>(A, W, S, C, M, N, K);
+}
+
+// W8A16 FP8 Fused GateUp + SiLU*Mul entry points (M <= 64, single W pass)
+extern "C" __global__ __launch_bounds__(256, 3) void kern_dspark_gate_up_silu_fp8_m8_sm120(
+    const B* __restrict__ A, const uint8_t* __restrict__ W, const float* __restrict__ S,
+    B* __restrict__ Y, int M, int N_half, int K) {
+  ds_gemm::run_w8a16_fp8_gate_up_silu_pdl<1, true, true>(A, W, S, Y, M, N_half, K);
+}
+extern "C" __global__ __launch_bounds__(256, 3) void kern_dspark_gate_up_silu_fp8_m16_sm120(
+    const B* __restrict__ A, const uint8_t* __restrict__ W, const float* __restrict__ S,
+    B* __restrict__ Y, int M, int N_half, int K) {
+  ds_gemm::run_w8a16_fp8_gate_up_silu_pdl<1, false, true>(A, W, S, Y, M, N_half, K);
+}
+extern "C" __global__ __launch_bounds__(256, 2) void kern_dspark_gate_up_silu_fp8_m32_sm120(
+    const B* __restrict__ A, const uint8_t* __restrict__ W, const float* __restrict__ S,
+    B* __restrict__ Y, int M, int N_half, int K) {
+  ds_gemm::run_w8a16_fp8_gate_up_silu_pdl<2, false, false>(A, W, S, Y, M, N_half, K);
+}
+extern "C" __global__ __launch_bounds__(256, 1) void kern_dspark_gate_up_silu_fp8_m64_sm120(
+    const B* __restrict__ A, const uint8_t* __restrict__ W, const float* __restrict__ S,
+    B* __restrict__ Y, int M, int N_half, int K) {
+  ds_gemm::run_w8a16_fp8_gate_up_silu_pdl<4, false, false>(A, W, S, Y, M, N_half, K);
+}
 
 // BF16-output DSpark GEMV/GEMM entry points (M <= 32, STACK:0)
 extern "C" __global__ __launch_bounds__(256, 4) void kern_dspark_gemv_m1_bf16_sm120(

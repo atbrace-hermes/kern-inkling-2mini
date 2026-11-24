@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SM120 derive kernels for DSpark MTP & Inkling2MarkovHead.
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <math.h>
 #include <stdint.h>
 
@@ -160,5 +161,56 @@ extern "C" __global__ void dspark_prep_weights(
   const int half_d = head_dim >> 1;
   if (idx < half_d) {
     inv_freq[idx] = 1.0f / powf(rope_theta, (float)(2 * idx) / (float)head_dim);
+  }
+}
+
+// Per-row FP8 E4M3 quantization of [V, H] BF16 -> out_fp8 [V, H] FP8 + out_scale [V] FP32.
+// Padded rows >= V_unpadded are zeroed with scale 0.0f. Persistent across rows.
+// Grid: [min(ceil_div(V, 8), 1024), 1, 1], Block: [256, 1, 1] (1 warp per row).
+extern "C" __global__ void dspark_quant_lm_head_fp8(
+    const __nv_bfloat16* __restrict__ lm_head,
+    uint8_t* __restrict__ out_fp8,
+    float* __restrict__ out_scale,
+    int V,
+    int V_unpadded,
+    int H) {
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int stride = gridDim.x * 8;
+
+  for (int row = blockIdx.x * 8 + warp; row < V; row += stride) {
+    uint8_t* dst = out_fp8 + static_cast<long long>(row) * H;
+    if (row >= V_unpadded) {
+      for (int k = lane; k < H; k += 32) {
+        dst[k] = 0u;
+      }
+      if (lane == 0) {
+        out_scale[row] = 0.0f;
+      }
+      continue;
+    }
+
+    const __nv_bfloat16* src = lm_head + static_cast<long long>(row) * H;
+    float amax = 0.0f;
+    for (int k = lane; k < H; k += 32) {
+      float v = fabsf(__bfloat162float(src[k]));
+      if (v > amax) amax = v;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+      float other = __shfl_xor_sync(0xFFFFFFFFu, amax, off);
+      if (other > amax) amax = other;
+    }
+
+    const float scale = (amax > 0.0f) ? (amax / 448.0f) : 1.0f;
+    const float inv_scale = (amax > 0.0f) ? (448.0f / amax) : 0.0f;
+    if (lane == 0) {
+      out_scale[row] = scale;
+    }
+
+    for (int k = lane; k < H; k += 32) {
+      float q = __bfloat162float(src[k]) * inv_scale;
+      dst[k] = __nv_fp8_e4m3(q).__x;
+    }
   }
 }

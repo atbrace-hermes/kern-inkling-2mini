@@ -122,14 +122,14 @@ includes = []
 
 # M4 CUDA modules
 [kernels."dspark_derive"]
-sha256 = "460b0bbb02847d49cc3a07cf0ebd9c4e25488348979bd31f570491a0c64c2743"
+sha256 = "12c66f059fa4d0bdd4bd26d0a9eb213fb2bdfdb94efc35c318e9146d5d30261f"
 milestone = "M4"
 source = "source/dspark_derive.cu"
 flags = "plain"
 includes = []
 
 [kernels."spec_state_commit"]
-sha256 = "2a9223053bc2a356a1e4e30b0bb0c6093259423e49c1bbee40fe0d7d4b46243e"
+sha256 = "72f2d1cad76486542f31b2ac359a618be201a094c9547e904afd91cc59c42636"
 milestone = "M4"
 source = "source/spec_state_commit.cu"
 flags = "plain"
@@ -143,7 +143,7 @@ flags = "plain"
 includes = []
 
 [kernels."spec_markov_rows"]
-sha256 = "546a2a414400b4db275a4ad12276948dfd36245b1488a7584418fca562819e04"
+sha256 = "70e19f9202eab810da84b90f9d74c13a62051d5622fd2c123950292d2d4805c8"
 milestone = "M4"
 source = "source/markov_rows.cu"
 flags = "plain"

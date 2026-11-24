@@ -12,7 +12,7 @@ attn_res_and_router_bias = "fp32"
 moe_layers_0_19 = "nvfp4_e2m1"          # uint8 packed + fp8e4m3 block16 scale + fp32 amax/outer_scale
 moe_layers_0_19_scale_rule = "fouroversix_mae"
 moe_layers_20_23 = "mxfp8_e4m3"         # fp8e4m3 + ue8m0 block32 scale
-mtp = "bf16"
+mtp = "fp8_e4m3_w8a16"                  # derived per-row fp8e4m3 (3-layer drafter + markov fold_weight + draft lm_head); norms/kv_ctx/rnn_proj bf16
 exclude_prefixes = ["model.visual."]
 
 [kv_cache]

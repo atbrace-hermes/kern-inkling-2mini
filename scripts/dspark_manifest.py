@@ -1161,13 +1161,15 @@ def register_ops(
             f"d.{p}qkv.weight",
             "bf16",
             [5120, DSPARK_HIDDEN],
-            "weight",
+            "source",
             bind=[
                 {"tensor": f"{p}self_attn.q_proj.weight"},
                 {"tensor": f"{p}self_attn.k_proj.weight"},
                 {"tensor": f"{p}self_attn.v_proj.weight"},
             ],
         )
+        buf(f"d.{p}qkv.fp8", "fp8e4m3", [5120, DSPARK_HIDDEN], "carry")
+        buf(f"d.{p}qkv.scale", "f32", [5120], "carry")
         buf(
             f"d.{p}kv_ctx.weight",
             "bf16",
@@ -1178,22 +1180,32 @@ def register_ops(
                 {"tensor": f"{p}self_attn.v_proj_ctx.weight"},
             ],
         )
-        dweight(p + "self_attn.o_proj.weight", [DSPARK_HIDDEN, 3072])
+        dsource(p + "self_attn.o_proj.weight", [DSPARK_HIDDEN, 3072])
+        buf(f"d.{p}o_proj.fp8", "fp8e4m3", [DSPARK_HIDDEN, 3072], "carry")
+        buf(f"d.{p}o_proj.scale", "f32", [DSPARK_HIDDEN], "carry")
         buf(
             f"d.{p}gate_up.weight",
             "bf16",
             [2 * DSPARK_INTER, DSPARK_HIDDEN],
-            "weight",
+            "source",
             bind=[
                 {"tensor": f"{p}mlp.gate_proj.weight"},
                 {"tensor": f"{p}mlp.up_proj.weight"},
             ],
         )
-        dweight(p + "mlp.down_proj.weight", [DSPARK_HIDDEN, DSPARK_INTER])
+        buf(f"d.{p}gate_up.fp8", "fp8e4m3", [2 * DSPARK_INTER, DSPARK_HIDDEN], "carry")
+        buf(f"d.{p}gate_up.scale", "f32", [2 * DSPARK_INTER], "carry")
+        dsource(p + "mlp.down_proj.weight", [DSPARK_HIDDEN, DSPARK_INTER])
+        buf(f"d.{p}down_proj.fp8", "fp8e4m3", [DSPARK_HIDDEN, DSPARK_INTER], "carry")
+        buf(f"d.{p}down_proj.scale", "f32", [DSPARK_HIDDEN], "carry")
 
     # Derived carry buffers
     buf("d.fold_weight", "bf16", [VOCAB_PADDED, DSPARK_MARKOV_RANK], "carry")
+    buf("d.fold_weight_fp8", "fp8e4m3", [VOCAB_PADDED, DSPARK_MARKOV_RANK], "carry")
+    buf("d.fold_weight_fp8_scale", "f32", [VOCAB_PADDED], "carry")
     buf("d.fold_bias", "bf16", [VOCAB_PADDED], "carry")
+    buf("d.lm_head_fp8", "fp8e4m3", [VOCAB_PADDED, DSPARK_HIDDEN], "carry")
+    buf("d.lm_head_fp8_scale", "f32", [VOCAB_PADDED], "carry")
     buf("d.fuse_alpha", "bf16", [4, 4], "carry")
     buf("d.w_state", "bf16", [3 * DSPARK_MARKOV_RANK, 2 * DSPARK_MARKOV_RANK], "carry")
     buf("d.w_ctx", "bf16", [3 * DSPARK_MARKOV_RANK, 2 * DSPARK_HIDDEN], "carry")
@@ -1245,9 +1257,164 @@ def register_ops(
     ):
         buf(f"d.sample.{n}", dt, ["tokens"])
 
-    # Builtin GEMM ops (kept for huge-N markov.base_logits & standalone tests)
+    # Builtin GEMM ops (kept for standalone tests)
     _gemm_op(ops, "dspark_gemm_bf16", "extern:cublaslt_bf16_tn", "bf16")
     _gemm_op(ops, "dspark_gemm_bf16_f32", "extern:cublas_bf16_tn_f32", "f32")
+
+    # SM120 W8A16 FP8 draft lm_head GEMM (M = 7*seqs, N = 201024, K = 2304)
+    _p7 = [{"param": j} for j in range(7)]
+    _fp8_lm_head_params = [
+        "in buffer<bf16>",
+        "in buffer<fp8e4m3>",
+        "in buffer<f32>",
+        "out buffer<bf16>",
+        "i32",
+        "i32",
+        "i32",
+    ]
+    ops["dspark_lm_head_fp8"] = {
+        "params": _fp8_lm_head_params,
+        "impl": {
+            "launches": [
+                {
+                    "module": "spec_state_commit",
+                    "entry": "kern_dspark_lm_head_fp8_m8_sm120",
+                    "params": _fp8_lm_head_params,
+                    "grid": [880, 1, 1],
+                    "block": [256, 1, 1],
+                    "pdl": True,
+                    "args": _p7,
+                    "when": {"var": "seqs", "max": 1},
+                },
+                {
+                    "module": "spec_state_commit",
+                    "entry": "kern_dspark_lm_head_fp8_m16_sm120",
+                    "params": _fp8_lm_head_params,
+                    "grid": [880, 1, 1],
+                    "block": [256, 1, 1],
+                    "pdl": True,
+                    "args": _p7,
+                    "when": {"var": "seqs", "min": 2, "max": 2},
+                },
+                {
+                    "module": "spec_state_commit",
+                    "entry": "kern_dspark_lm_head_fp8_m32_sm120",
+                    "params": _fp8_lm_head_params,
+                    "grid": [660, 1, 1],
+                    "block": [256, 1, 1],
+                    "pdl": True,
+                    "args": _p7,
+                    "when": {"var": "seqs", "min": 3, "max": 4},
+                },
+                {
+                    "module": "spec_state_commit",
+                    "entry": "kern_dspark_lm_head_fp8_m64_sm120",
+                    "params": _fp8_lm_head_params,
+                    "grid": [660, 1, 1],
+                    "block": [256, 1, 1],
+                    "pdl": True,
+                    "args": _p7,
+                    "when": {"var": "seqs", "min": 5},
+                },
+            ]
+        },
+    }
+    # SM120 W8A16 FP8 3-layer DSpark linear projections (tokens = 8*seqs <= 64)
+    ops["dspark_proj_fp8"] = {
+        "params": _fp8_lm_head_params,
+        "impl": {
+            "launches": [
+                {
+                    "module": "spec_state_commit",
+                    "entry": "kern_dspark_lm_head_fp8_m8_sm120",
+                    "params": _fp8_lm_head_params,
+                    "grid": [660, 1, 1],
+                    "block": [256, 1, 1],
+                    "pdl": True,
+                    "args": _p7,
+                    "when": {"var": "tokens", "max": 8},
+                },
+                {
+                    "module": "spec_state_commit",
+                    "entry": "kern_dspark_lm_head_fp8_m16_sm120",
+                    "params": _fp8_lm_head_params,
+                    "grid": [660, 1, 1],
+                    "block": [256, 1, 1],
+                    "pdl": True,
+                    "args": _p7,
+                    "when": {"var": "tokens", "min": 9, "max": 16},
+                },
+                {
+                    "module": "spec_state_commit",
+                    "entry": "kern_dspark_lm_head_fp8_m32_sm120",
+                    "params": _fp8_lm_head_params,
+                    "grid": [660, 1, 1],
+                    "block": [256, 1, 1],
+                    "pdl": True,
+                    "args": _p7,
+                    "when": {"var": "tokens", "min": 17, "max": 32},
+                },
+                {
+                    "module": "spec_state_commit",
+                    "entry": "kern_dspark_lm_head_fp8_m64_sm120",
+                    "params": _fp8_lm_head_params,
+                    "grid": [660, 1, 1],
+                    "block": [256, 1, 1],
+                    "pdl": True,
+                    "args": _p7,
+                    "when": {"var": "tokens", "min": 33},
+                },
+            ]
+        },
+    }
+    # SM120 W8A16 FP8 fused GateUp + SiLU*Mul (tokens = 8*seqs <= 64)
+    ops["dspark_gate_up_silu_fp8"] = {
+        "params": _fp8_lm_head_params,
+        "impl": {
+            "launches": [
+                {
+                    "module": "spec_state_commit",
+                    "entry": "kern_dspark_gate_up_silu_fp8_m8_sm120",
+                    "params": _fp8_lm_head_params,
+                    "grid": [ceil_div(DSPARK_INTER, 8), 1, 1],
+                    "block": [256, 1, 1],
+                    "pdl": True,
+                    "args": _p7,
+                    "when": {"var": "tokens", "max": 8},
+                },
+                {
+                    "module": "spec_state_commit",
+                    "entry": "kern_dspark_gate_up_silu_fp8_m16_sm120",
+                    "params": _fp8_lm_head_params,
+                    "grid": [ceil_div(DSPARK_INTER, 8), 1, 1],
+                    "block": [256, 1, 1],
+                    "pdl": True,
+                    "args": _p7,
+                    "when": {"var": "tokens", "min": 9, "max": 16},
+                },
+                {
+                    "module": "spec_state_commit",
+                    "entry": "kern_dspark_gate_up_silu_fp8_m32_sm120",
+                    "params": _fp8_lm_head_params,
+                    "grid": [ceil_div(DSPARK_INTER, 8), 1, 1],
+                    "block": [256, 1, 1],
+                    "pdl": True,
+                    "args": _p7,
+                    "when": {"var": "tokens", "min": 17, "max": 32},
+                },
+                {
+                    "module": "spec_state_commit",
+                    "entry": "kern_dspark_gate_up_silu_fp8_m64_sm120",
+                    "params": _fp8_lm_head_params,
+                    "grid": [ceil_div(DSPARK_INTER, 8), 1, 1],
+                    "block": [256, 1, 1],
+                    "pdl": True,
+                    "args": _p7,
+                    "when": {"var": "tokens", "min": 33},
+                },
+            ]
+        },
+    }
 
     # SM120 256-bit v8.b32 direct-register MMA/GEMV with PDL for DSpark & Markov projections
     _p6 = [{"param": j} for j in range(6)]
@@ -1444,6 +1611,15 @@ def register_ops(
         "dspark_fold_bias_fp64",
         ["in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32"],
         [ceil_div(VOCAB_PADDED, 8), 1, 1],
+        256,
+    )
+    _cuda_op(
+        ops,
+        "dspark_quant_lm_head_fp8",
+        "dspark_derive",
+        "dspark_quant_lm_head_fp8",
+        ["in buffer<bf16>", "out buffer<fp8e4m3>", "out buffer<f32>", "i32", "i32", "i32"],
+        [1024, 1, 1],
         256,
     )
     _cuda_op(
@@ -1684,6 +1860,86 @@ def register_ops(
                         {"param": 5},
                         {"param": 6},
                         {"param": 12},
+                        _i32(220),
+                    ],
+                },
+            ]
+        },
+    }
+
+    ops["dspark_markov_fold_fp8_argmax"] = {
+        "params": [
+            "in buffer<bf16>",
+            "in buffer<fp8e4m3>",
+            "in buffer<f32>",
+            "in buffer<bf16>",
+            "in buffer<bf16>",
+            "out buffer<f32>",
+            "out buffer<i32>",
+            "out buffer<i64>",
+            "i32",
+            "i32",
+            "f32",
+            "i32",
+            "i32",
+            "i32",
+        ],
+        "impl": {
+            "launches": [
+                {
+                    "module": "spec_markov_rows",
+                    "entry": "kern_markov_fold_fp8_softcap_argmax_partial",
+                    "params": [
+                        "in buffer<bf16>",
+                        "in buffer<fp8e4m3>",
+                        "in buffer<f32>",
+                        "in buffer<bf16>",
+                        "in buffer<bf16>",
+                        "out buffer<f32>",
+                        "out buffer<i32>",
+                        "i32",
+                        "i32",
+                        "f32",
+                        "i32",
+                        "i32",
+                        "i32",
+                    ],
+                    "grid": [220, 1, 1],
+                    "block": [256, 1, 1],
+                    "args": [
+                        {"param": 0},
+                        {"param": 1},
+                        {"param": 2},
+                        {"param": 3},
+                        {"param": 4},
+                        {"param": 5},
+                        {"param": 6},
+                        {"param": 8},
+                        {"param": 9},
+                        {"param": 10},
+                        {"param": 11},
+                        {"param": 12},
+                        {"param": 13},
+                    ],
+                },
+                {
+                    "module": "spec_markov_rows",
+                    "entry": "kern_markov_argmax_final_pdl",
+                    "params": [
+                        "in buffer<f32>",
+                        "in buffer<i32>",
+                        "out buffer<i64>",
+                        "i32",
+                        "i32",
+                    ],
+                    "grid": ["seqs", 1, 1],
+                    "block": [256, 1, 1],
+                    "pdl": True,
+                    "args": [
+                        {"param": 5},
+                        {"param": 6},
+                        {"param": 7},
+                        {"param": 13},
                         _i32(220),
                     ],
                 },
@@ -2184,8 +2440,8 @@ def _call(op: str, *args, label: str | None = None) -> dict:
 
 
 def emit_derive_calls(m: dict, layout: DsparkTargetLayout) -> list[dict]:
-    """Emit calls for `derive` program: FP64 fold + fuse_alpha + split W_state/W_ctx + inv_freq."""
-    return [
+    """Emit calls for `derive` program: FP64 fold + FP8 DSpark weights + fuse_alpha + split W_state/W_ctx + inv_freq."""
+    calls = [
         _call(
             "dspark_fold_fp64",
             _b(layout.target_lm_head_buf),
@@ -2197,6 +2453,16 @@ def emit_derive_calls(m: dict, layout: DsparkTargetLayout) -> list[dict]:
             label="dspark.derive.fold_weight",
         ),
         _call(
+            "dspark_quant_lm_head_fp8",
+            _b("d.fold_weight"),
+            _b("d.fold_weight_fp8"),
+            _b("d.fold_weight_fp8_scale"),
+            _i32(VOCAB_PADDED),
+            _i32(VOCAB_UNPADDED),
+            _i32(DSPARK_MARKOV_RANK),
+            label="dspark.derive.quant_fold_weight_fp8",
+        ),
+        _call(
             "dspark_fold_bias_fp64",
             _b(layout.target_lm_head_buf),
             _b("d.hidden_out.bias"),
@@ -2204,6 +2470,16 @@ def emit_derive_calls(m: dict, layout: DsparkTargetLayout) -> list[dict]:
             _i32(VOCAB_PADDED),
             _i32(DSPARK_HIDDEN),
             label="dspark.derive.fold_bias",
+        ),
+        _call(
+            "dspark_quant_lm_head_fp8",
+            _b(layout.target_lm_head_buf),
+            _b("d.lm_head_fp8"),
+            _b("d.lm_head_fp8_scale"),
+            _i32(VOCAB_PADDED),
+            _i32(VOCAB_UNPADDED),
+            _i32(DSPARK_HIDDEN),
+            label="dspark.derive.quant_lm_head_fp8",
         ),
         _call(
             "dspark_prep_weights",
@@ -2225,6 +2501,51 @@ def emit_derive_calls(m: dict, layout: DsparkTargetLayout) -> list[dict]:
             label="dspark.derive.prep_weights",
         ),
     ]
+    for l in range(DSPARK_LAYERS):
+        p = f"layers.{l}."
+        calls += [
+            _call(
+                "dspark_quant_lm_head_fp8",
+                _b(f"d.{p}qkv.weight"),
+                _b(f"d.{p}qkv.fp8"),
+                _b(f"d.{p}qkv.scale"),
+                _i32(5120),
+                _i32(5120),
+                _i32(DSPARK_HIDDEN),
+                label=f"dspark.derive.l{l}.quant_qkv_fp8",
+            ),
+            _call(
+                "dspark_quant_lm_head_fp8",
+                _b(f"d.{p}self_attn.o_proj.weight"),
+                _b(f"d.{p}o_proj.fp8"),
+                _b(f"d.{p}o_proj.scale"),
+                _i32(DSPARK_HIDDEN),
+                _i32(DSPARK_HIDDEN),
+                _i32(3072),
+                label=f"dspark.derive.l{l}.quant_o_proj_fp8",
+            ),
+            _call(
+                "dspark_quant_lm_head_fp8",
+                _b(f"d.{p}gate_up.weight"),
+                _b(f"d.{p}gate_up.fp8"),
+                _b(f"d.{p}gate_up.scale"),
+                _i32(2 * DSPARK_INTER),
+                _i32(2 * DSPARK_INTER),
+                _i32(DSPARK_HIDDEN),
+                label=f"dspark.derive.l{l}.quant_gate_up_fp8",
+            ),
+            _call(
+                "dspark_quant_lm_head_fp8",
+                _b(f"d.{p}mlp.down_proj.weight"),
+                _b(f"d.{p}down_proj.fp8"),
+                _b(f"d.{p}down_proj.scale"),
+                _i32(DSPARK_HIDDEN),
+                _i32(DSPARK_HIDDEN),
+                _i32(DSPARK_INTER),
+                label=f"dspark.derive.l{l}.quant_down_proj_fp8",
+            ),
+        ]
+    return calls
 
 
 def _emit_context_store_calls(
@@ -2511,9 +2832,10 @@ def emit_round_program(
             )
         calls += [
             _call(
-                "dspark_proj_bf16",
+                "dspark_proj_fp8",
                 _b("d.x"),
-                _b(f"d.{p}qkv.weight"),
+                _b(f"d.{p}qkv.fp8"),
+                _b(f"d.{p}qkv.scale"),
                 _b("d.qkv"),
                 _var("tokens"),
                 _i32(5120),
@@ -2654,9 +2976,10 @@ def emit_round_program(
 
         calls += [
             _call(
-                "dspark_proj_bf16",
+                "dspark_proj_fp8",
                 _b("d.attn"),
-                _b(f"d.{p}self_attn.o_proj.weight"),
+                _b(f"d.{p}o_proj.fp8"),
+                _b(f"d.{p}o_proj.scale"),
                 _b("d.branch"),
                 _var("tokens"),
                 _i32(DSPARK_HIDDEN),
@@ -2672,9 +2995,10 @@ def emit_round_program(
                 label=f"dspark.l{l}.post_norm",
             ),
             _call(
-                "dspark_gate_up_silu",
+                "dspark_gate_up_silu_fp8",
                 _b("d.x"),
-                _b(f"d.{p}gate_up.weight"),
+                _b(f"d.{p}gate_up.fp8"),
+                _b(f"d.{p}gate_up.scale"),
                 _b("d.act"),
                 _var("tokens"),
                 _i32(DSPARK_INTER),
@@ -2682,9 +3006,10 @@ def emit_round_program(
                 label=f"dspark.l{l}.gate_up_silu",
             ),
             _call(
-                "dspark_proj_bf16",
+                "dspark_proj_fp8",
                 _b("d.act"),
-                _b(f"d.{p}mlp.down_proj.weight"),
+                _b(f"d.{p}down_proj.fp8"),
+                _b(f"d.{p}down_proj.scale"),
                 _b("d.branch"),
                 _var("tokens"),
                 _i32(DSPARK_HIDDEN),
@@ -2708,9 +3033,10 @@ def emit_round_program(
     calls += [
         _call("dspark_skip_anchor", _b("d.x"), _b("d.step_hidden"), label="markov.skip_anchor"),
         _call(
-            "dspark_gemm_bf16",
+            "dspark_lm_head_fp8",
             _b("d.step_hidden"),
-            _b(layout.target_lm_head_buf),
+            _b("d.lm_head_fp8"),
+            _b("d.lm_head_fp8_scale"),
             _b("d.base_logits"),
             _expr(_mul("seqs", DSPARK_NUM_SPEC)),
             _i32(VOCAB_PADDED),
@@ -2779,9 +3105,10 @@ def emit_round_program(
                 label=f"markov.s{step}.gate",
             ),
             _call(
-                "dspark_markov_fold_argmax",
+                "dspark_markov_fold_fp8_argmax",
                 _b("d.markov_latent"),
-                _b("d.fold_weight"),
+                _b("d.fold_weight_fp8"),
+                _b("d.fold_weight_fp8_scale"),
                 _b("d.fold_bias"),
                 _b("d.base_logits"),
                 _b("d.argmax_pmax"),
